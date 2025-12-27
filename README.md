@@ -34,7 +34,7 @@
 ## 安装说明
 
 ### 环境要求
-- Python 3.7+
+- Python 3.12+
 - MaiBot框架
 - LLM API服务（支持OpenAI格式的API）
 
