@@ -92,7 +92,10 @@ class RuleHorrorCommand(BaseCommand):
         "规则怪谈游戏：\n"
         "/rg 开始 单人/多人 - 开始新游戏（单人模式自动加入，多人模式需要手动加入）\n"
         "/rg 强制开始 单人/多人 - 强制开始新游戏（覆盖存档）\n"
-        "/rg 恢复 - 恢复存档游戏\n"
+        "/rg 恢复 - 恢复默认存档游戏\n"
+        "/rg 保存 <存档名称> - 手动保存当前游戏状态\n"
+        "/rg 读取 <存档名称> - 从指定存档读取游戏\n"
+        "/rg 存档列表 - 查看所有可用存档\n"
         "/rg 加入 - 加入游戏（多人模式，最多5人）\n"
         "/rg 离开 - 离开游戏\n"
         "/rg 状态 - 查看游戏状态\n"
@@ -105,7 +108,7 @@ class RuleHorrorCommand(BaseCommand):
         "/rg 帮助 - 查看帮助"
     )
     command_examples = [
-        "/rg 开始 单人", "/rg 开始 多人", "/rg 强制开始 单人", "/rg 恢复", "/rg 加入", "/rg 离开", "/rg 状态", "/rg 规则", "/rg 场景",
+        "/rg 开始 单人", "/rg 开始 多人", "/rg 强制开始 单人", "/rg 恢复", "/rg 保存 存档1", "/rg 读取 存档1", "/rg 存档列表", "/rg 加入", "/rg 离开", "/rg 状态", "/rg 规则", "/rg 场景",
         "/rg 提示 规则", "/rg 提示 线索",
         "/rg 推理 我认为规则3是关键", "/rg 行动 我决定进入房间",
         "/rg 结束", "/rg 帮助"
@@ -175,6 +178,29 @@ class RuleHorrorCommand(BaseCommand):
 
         elif action == "恢复":
             return await self._restore_game(group_id)
+
+        elif action == "保存":
+            if not game_state.get("game_active", False):
+                await self.send_text("❌ 当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
+                return False, "无游戏", True
+
+            save_name = rest_input.strip() if rest_input else ""
+            if not save_name:
+                await self.send_text("❌ 请提供存档名称。用法：`/rg 保存 <存档名称>`")
+                return False, "缺少存档名称", True
+
+            return await self._save_game_with_name(group_id, save_name)
+
+        elif action == "读取":
+            save_name = rest_input.strip() if rest_input else ""
+            if not save_name:
+                await self.send_text("❌ 请提供存档名称。用法：`/rg 读取 <存档名称>`")
+                return False, "缺少存档名称", True
+
+            return await self._load_game_with_name(group_id, save_name)
+
+        elif action == "存档列表":
+            return await self._list_saves(group_id)
 
         elif action == "加入":
             if not game_state.get("game_active", False):
@@ -266,7 +292,10 @@ class RuleHorrorCommand(BaseCommand):
                 "🔸 `/rg 开始 单人` - 开始单人模式游戏（自动加入）\n"
                 "🔸 `/rg 开始 多人` - 开始多人模式游戏（最多5人，需手动加入）\n"
                 "🔸 `/rg 强制开始 单人/多人` - 强制开始新游戏（覆盖存档）\n"
-                "🔸 `/rg 恢复` - 恢复存档游戏\n"
+                "🔸 `/rg 恢复` - 恢复默认存档游戏\n"
+                "🔸 `/rg 保存 <存档名称>` - 手动保存当前游戏状态\n"
+                "🔸 `/rg 读取 <存档名称>` - 从指定存档读取游戏\n"
+                "🔸 `/rg 存档列表` - 查看所有可用存档\n"
                 "🔸 `/rg 加入` - 加入当前游戏（多人模式）\n"
                 "🔸 `/rg 离开` - 离开当前游戏\n"
                 "🔸 `/rg 状态` - 查看游戏状态和玩家信息\n"
@@ -288,7 +317,8 @@ class RuleHorrorCommand(BaseCommand):
                 "🔹 死亡的玩家无法继续推理和行动，但可以观看其他玩家\n"
                 "🔹 完美结局需要同时满足：推理出规则怪谈的原貌、达成通关要求、解除规则怪谈（解决根源）\n"
                 "🔹 结局分为：完美（满足三个条件）、成功（推理出原貌并通关）、通关（仅通关）、失败（死亡或未通关）\n"
-                "🔹 游戏会自动保存，中断后可以使用 `/rg 恢复` 继续游戏"
+                "🔹 游戏会自动保存，中断后可以使用 `/rg 恢复` 继续游戏\n"
+                "🔹 使用 `/rg 保存 <存档名称>` 可以创建多个存档，方便在不同进度间切换"
             )
             await self.send_text(help_text)
             return True, "已发送帮助信息", True
@@ -1313,6 +1343,175 @@ class RuleHorrorCommand(BaseCommand):
         except Exception as e:
             print(f"删除存档文件时发生异常: {e}")
             return False
+
+    async def _save_game_with_name(self, group_id: str, save_name: str) -> Tuple[bool, Optional[str], bool]:
+        """使用自定义名称保存游戏状态"""
+        try:
+            game_state = game_states.get(group_id)
+            if not game_state:
+                await self.send_text("❌ 没有可保存的游戏状态。")
+                return False, "无游戏状态", True
+
+            os.makedirs(DATA_DIR, exist_ok=True)
+            save_file = os.path.join(DATA_DIR, f"{group_id}_{save_name}.json")
+
+            save_data = {
+                "group_id": group_id,
+                "save_name": save_name,
+                "save_time": datetime.now().isoformat(),
+                "game_state": game_state
+            }
+
+            with open(save_file, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
+
+            reply_text = (
+                f"✅ **游戏已保存**\n\n"
+                f"📁 **存档名称**：{save_name}\n"
+                f"⏰ **保存时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📍 **场景**：{game_state.get('scene', '')}\n"
+                f"🎮 **游戏模式**：{game_state.get('game_mode', '单人')}\n\n"
+                f"💡 使用 `/rg 读取 {save_name}` 恢复此存档"
+            )
+            await self.send_text(reply_text)
+            return True, "游戏已保存", True
+        except Exception as e:
+            await self.send_text(f"❌ 保存失败：{str(e)}")
+            return False, f"保存失败: {str(e)}", True
+
+    async def _load_game_with_name(self, group_id: str, save_name: str) -> Tuple[bool, Optional[str], bool]:
+        """从自定义名称加载游戏状态"""
+        try:
+            save_file = os.path.join(DATA_DIR, f"{group_id}_{save_name}.json")
+            
+            if not os.path.exists(save_file):
+                await self.send_text(f"❌ 未找到存档「{save_name}」。使用 `/rg 存档列表` 查看所有可用存档。")
+                return False, "存档不存在", True
+
+            with open(save_file, 'r', encoding='utf-8') as f:
+                save_data = json.load(f)
+
+            saved_state = save_data.get("game_state")
+            if not saved_state:
+                await self.send_text("❌ 存档数据损坏。")
+                return False, "存档损坏", True
+
+            if not saved_state.get("game_active", False):
+                await self.send_text("❌ 存档中的游戏已结束，无法恢复。请使用 `/rg 开始` 开始新游戏。")
+                return False, "游戏已结束", True
+
+            game_states[group_id] = saved_state
+
+            game_mode = saved_state.get("game_mode", "单人")
+            save_time = save_data.get("save_time", "")
+            if save_time:
+                try:
+                    save_time = datetime.fromisoformat(save_time).strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    pass
+
+            reply_text = (
+                f"🎭 **规则怪谈** ({game_mode}模式) - 已恢复存档\n\n"
+                f"📁 **存档名称**：{save_name}\n"
+                f"⏰ **存档时间**：{save_time}\n\n"
+                f"📍 **场景**：{saved_state.get('scene', '')}\n\n"
+                f"📜 **规则**：\n"
+            )
+
+            for i, rule in enumerate(saved_state.get("rules", []), 1):
+                reply_text += f"{i}. {rule}\n"
+
+            reply_text += f"\n🎯 **通关条件**：{saved_state.get('win_condition', '')}\n\n"
+
+            players = saved_state.get("players", {})
+            max_players = saved_state.get("max_players", 5)
+            reply_text += f"👥 **玩家**：{len(players)}/{max_players}\n"
+
+            for pid, p_data in players.items():
+                status = "存活" if p_data["is_alive"] else "死亡"
+                reply_text += f"🔸 {p_data['name']} ({status})\n"
+
+            reply_text += f"\n💡 **提示次数**：{saved_state.get('hints_used', 0)}/{saved_state.get('max_hints', 3)}\n\n"
+
+            if game_mode == "单人":
+                reply_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+                reply_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+                reply_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+                reply_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+                reply_text += f"🔸 使用 `/rg 结束` 结束游戏"
+            else:
+                reply_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
+                reply_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+                reply_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+                reply_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+                reply_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+                reply_text += f"🔸 使用 `/rg 结束` 结束游戏"
+
+            await self.send_text(reply_text)
+            return True, "游戏已恢复", True
+        except Exception as e:
+            await self.send_text(f"❌ 读取失败：{str(e)}")
+            return False, f"读取失败: {str(e)}", True
+
+    async def _list_saves(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+        """列出所有可用存档"""
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            
+            saves = []
+            for filename in os.listdir(DATA_DIR):
+                if filename.startswith(f"{group_id}_") and filename.endswith(".json"):
+                    save_file = os.path.join(DATA_DIR, filename)
+                    try:
+                        with open(save_file, 'r', encoding='utf-8') as f:
+                            save_data = json.load(f)
+                        
+                        save_name = save_data.get("save_name", filename)
+                        save_time = save_data.get("save_time", "")
+                        game_state = save_data.get("game_state", {})
+                        
+                        if save_time:
+                            try:
+                                save_time = datetime.fromisoformat(save_time).strftime('%Y-%m-%d %H:%M:%S')
+                            except:
+                                pass
+                        
+                        scene = game_state.get("scene", "")
+                        game_mode = game_state.get("game_mode", "单人")
+                        game_active = game_state.get("game_active", False)
+                        
+                        saves.append({
+                            "name": save_name,
+                            "time": save_time,
+                            "scene": scene,
+                            "mode": game_mode,
+                            "active": game_active
+                        })
+                    except Exception as e:
+                        print(f"读取存档 {filename} 时发生异常: {e}")
+                        continue
+            
+            if not saves:
+                await self.send_text("📂 **存档列表**\n\n❌ 暂无存档。使用 `/rg 保存 <存档名称>` 创建存档。")
+                return True, "无存档", True
+            
+            saves.sort(key=lambda x: x["time"], reverse=True)
+            
+            reply_text = "📂 **存档列表**\n\n"
+            for i, save in enumerate(saves, 1):
+                status = "✅ 可用" if save["active"] else "❌ 已结束"
+                reply_text += f"🔸 **{i}. {save['name']}**\n"
+                reply_text += f"   ⏰ {save['time']}\n"
+                reply_text += f"   🎮 {save['mode']}模式\n"
+                reply_text += f"   📍 {save['scene']}\n"
+                reply_text += f"   {status}\n\n"
+            
+            reply_text += f"💡 使用 `/rg 读取 <存档名称>` 恢复存档"
+            await self.send_text(reply_text)
+            return True, "已显示存档列表", True
+        except Exception as e:
+            await self.send_text(f"❌ 获取存档列表失败：{str(e)}")
+            return False, f"获取存档列表失败: {str(e)}", True
 
     async def _force_start_new_game(self, group_id: str, api_url: str, api_key: str, model: str, temperature: float, game_mode: str) -> Tuple[bool, Optional[str], bool]:
         """强制开始一个新的规则怪谈游戏（覆盖存档）"""
