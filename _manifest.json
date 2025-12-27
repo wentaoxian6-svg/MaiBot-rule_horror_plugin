@@ -1,0 +1,25 @@
+{
+  "manifest_version": 1,
+  "name": "规则怪谈插件",
+  "version": "1.2.0",
+  "description": "生成规则怪谈并进行互动游戏，支持LLM生成、提示、推理和多种结局判定",
+  "author": {
+    "name": "岚影鸿夜"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.12.0"
+  },
+  "keywords": [
+    "规则怪谈",
+    "游戏",
+    "LLM",
+    "互动",
+    "推理"
+  ],
+  "categories": [
+    "娱乐工具",
+    "游戏"
+  ],
+  "id": "rule_horror_plugin"
+}
