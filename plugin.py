@@ -27,7 +27,7 @@ class RuleHorrorPlugin(BasePlugin):
 
     plugin_name = "rule_horror"
     plugin_description = "生成规则怪谈并进行互动游戏。"
-    plugin_version = "1.2.2"
+    plugin_version = "1.3.0"
     plugin_author = "岚影鸿夜"
     enable_plugin = True
 
@@ -361,11 +361,16 @@ class RuleHorrorCommand(BaseCommand):
 2. 描述场景的背景故事（这个场景的历史、发生过什么、为什么诡异）
 3. 描述玩家为何会来到这个场景的原因（收到邀请、迷路、调查事件、被绑架等）
 4. 剧情应该充满悬疑和恐怖氛围，为后续的规则和探索做铺垫
-5. 以JSON格式返回，格式如下：
+5. 生成2-3个"核心象征符号"，这些符号将在整个游戏中反复出现，营造主题感和不安感。符号可以是数字、图案、旋律、花纹、颜色等。每个符号需要有一个简短的描述，暗示其可能的含义或与场景的联系。
+6. 以JSON格式返回，格式如下：
 {
   "scene": "场景名称（如：深夜的废弃医院）",
   "background": "场景背景故事，描述这个场景的历史、发生过什么、为什么诡异",
-  "player_reason": "玩家为何来到这个场景的原因"
+  "player_reason": "玩家为何来到这个场景的原因",
+  "core_symbols": [
+    {"symbol": "符号1", "description": "符号1的描述"},
+    {"symbol": "符号2", "description": "符号2的描述"}
+  ]
 }
 
 请仅返回JSON，不要包含任何其他文字。
@@ -400,6 +405,7 @@ class RuleHorrorCommand(BaseCommand):
         scene_name = step1_data.get("scene", "")
         background = step1_data.get("background", "")
         player_reason = step1_data.get("player_reason", "")
+        core_symbols = step1_data.get("core_symbols", [])
 
         step1_text = (
             f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
@@ -407,6 +413,10 @@ class RuleHorrorCommand(BaseCommand):
             f"🎭 **你的到来**：\n{player_reason}\n\n"
             f"📍 **场景**：{scene_name}"
         )
+        if core_symbols:
+            step1_text += f"\n\n🔮 **核心象征**：\n"
+            for sym in core_symbols:
+                step1_text += f"• {sym['symbol']}: {sym['description']}\n"
         await self.send_text(step1_text)
         await asyncio.sleep(0.5)
         await self.send_text("⏳ 正在生成场景结构...")
@@ -613,7 +623,11 @@ class RuleHorrorCommand(BaseCommand):
             },
             "random_events": [],
             "available_items": [],
-            "environmental_events": []
+            "environmental_events": [],
+            "rule_mutations": [],
+            "core_symbols": core_symbols,
+            "sanity_break": False,
+            "last_mutation_time": 0
         }
 
         self._save_game_state(group_id)
@@ -1003,131 +1017,184 @@ class RuleHorrorCommand(BaseCommand):
         
         return True, "已记录推理", True
 
-    async def _record_action(self, group_id: str, action: str, api_url: str, api_key: str, model: str, temperature: float) -> Tuple[bool, Optional[str], bool]:
-        """记录行动并判断是否死亡"""
+    async def _trigger_rule_mutation(self, group_id: str, api_url: str, api_key: str, model: str, temperature: float, elapsed_minutes: int, trigger_reason: str = "随机") -> None:
+        """触发规则变异"""
         game_state = game_states.get(group_id, {})
+        if game_state.get("sanity_break", False):
+            return
         
-        user_info = self._get_user_info()
-        if not user_info:
-            await self.send_text("❌ 无法获取用户信息。")
-            return False, "无法获取用户信息", True
+        all_actions = []
+        for pid, p_data in game_state.get("players", {}).items():
+            all_actions.extend(p_data.get("action_history", []))
         
-        user_id = user_info.user_id
-        user_name = getattr(user_info, 'user_name', f"玩家{user_id}")
-        
-        players = game_state.get("players", {})
-        if user_id not in players:
-            if game_state.get("game_mode") == "单人":
-                players[user_id] = {
-                    "name": user_name,
-                    "reasoning_history": [],
-                    "action_history": [],
-                    "is_alive": True,
-                    "physical_status": {
-                        "health": 100,
-                        "injury": "无",
-                        "fatigue": "无"
-                    },
-                    "mental_status": {
-                        "sanity": 100,
-                        "state": "正常",
-                        "emotion": "平静"
-                    },
-                    "psychological_pressure": {
-                        "fear_level": 0,
-                        "anxiety_level": 0,
-                        "stress_level": 0
-                    },
-                    "inventory": [],
-                    "location": "入口"
-                }
-                game_state["players"] = players
-            else:
-                await self.send_text("❌ 你不在游戏中。请先使用 `/rg 加入` 加入游戏。")
-                return False, "不在游戏中", True
-        
-        player_data = players[user_id]
-        if not player_data["is_alive"]:
-            await self.send_text("❌ 你已经死亡，无法继续行动。")
-            return False, "玩家已死亡", True
+        mutation_prompt = f"""
+基于以下原始规则和玩家至今的行动记录，模拟'场景意识'对玩家行为的反应，对其中1-2条规则进行细微但令人不安的篡改或增添一条'补充条款'，使其看起来像是早已存在但被忽视了。
 
-        player_data["action_history"].append(action)
-        game_state["players"] = players
+触发原因：{trigger_reason}
+原始规则：{json.dumps(game_state.get('rules', []), ensure_ascii=False)}
+玩家行动记录：{json.dumps(all_actions[-5:] if len(all_actions) > 5 else all_actions, ensure_ascii=False)}
+
+要求：
+1. 对1-2条规则进行细微的篡改或补充
+2. 篡改应该令人不安，暗示规则本身是有意识的、会学习的
+3. 篡改后的规则应该看起来像是原本就存在，只是之前被玩家忽视了
+4. 返回格式：{{"mutated_rules": ["新规则文本"], "hint": "一句暗示规则已变的低语（如：墙上的文字似乎更潦草了）"}}
+
+请仅返回JSON，不要包含任何其他文字。
+        """
+        
+        mutation_response = await self._call_llm_api(mutation_prompt, api_url, api_key, model, temperature)
+        if mutation_response:
+            try:
+                mutation_data = json.loads(mutation_response)
+                mutated_rules = mutation_data.get("mutated_rules", [])
+                hint = mutation_data.get("hint", "")
+                
+                if mutated_rules:
+                    old_rules = game_state.get("rules", [])
+                    game_state["rule_mutations"].append({
+                        "time": elapsed_minutes,
+                        "trigger_reason": trigger_reason,
+                        "old_rules": old_rules.copy(),
+                        "new_rules": mutated_rules.copy(),
+                        "hint": hint
+                    })
+                    game_state["rules"] = mutated_rules
+                    game_state["last_mutation_time"] = elapsed_minutes
+                    
+                    await self.send_text(f"🌀 {hint}")
+                    await asyncio.sleep(0.5)
+                    await self.send_text("⚠️ 规则似乎发生了变化...")
+                    await asyncio.sleep(0.5)
+                    await self.send_text(f"📜 **新规则**：{', '.join(mutated_rules)}")
+            except json.JSONDecodeError:
+                print(f"[规则怪谈] 规则变异响应解析失败")
+
+    async def _check_random_mutation(self, group_id: str, api_url: str, api_key: str, model: str, temperature: float, elapsed_minutes: int) -> None:
+        """检查是否触发随机规则变异"""
+        game_state = game_states.get(group_id, {})
+        if game_state.get("sanity_break", False):
+            return
+        
+        last_mutation_time = game_state.get("last_mutation_time", 0)
+        time_since_last_mutation = elapsed_minutes - last_mutation_time
+        
+        if time_since_last_mutation < 10:
+            return
+        
+        base_probability = 0.05
+        time_bonus = min(time_since_last_mutation / 60, 0.3)
+        total_probability = base_probability + time_bonus
+        
+        if random.random() < total_probability:
+            await self._trigger_rule_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes, trigger_reason="随机")
+
+    async def _process_single_player_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model: str, temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
+        """处理单人模式下的玩家行动"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        player_data = players.get(user_id, {})
         
         time_system = game_state.get("time_system", {})
         environment = game_state.get("environment", {})
-        
-        elapsed_minutes = time_system.get("elapsed_minutes", 0) + 5
-        time_system["elapsed_minutes"] = elapsed_minutes
-        
-        if elapsed_minutes < 60:
-            time_system["current_time"] = "深夜"
-            time_system["time_description"] = "午夜时分，周围一片死寂"
-        elif elapsed_minutes < 180:
-            time_system["current_time"] = "凌晨"
-            time_system["time_description"] = "黎明前的黑暗，空气中弥漫着不安"
-        else:
-            time_system["current_time"] = "黎明"
-            time_system["time_description"] = "东方泛起鱼肚白，但黑暗仍未完全消散"
-        
         sanity = player_data.get("mental_status", {}).get("sanity", 100)
+        elapsed_minutes = time_system.get("elapsed_minutes", 0)
         
-        if sanity < 30:
-            environment["lighting"] = "极度昏暗"
-            environment["temperature"] = "刺骨寒冷"
-            environment["sounds"] = ["诡异的声音", "低语", "心跳声"]
-            environment["smells"] = ["血腥味", "腐臭味"]
-            environment["atmosphere"] = "极度恐怖"
-        elif sanity < 60:
-            environment["lighting"] = "昏暗"
-            environment["temperature"] = "寒冷"
-            environment["sounds"] = ["风声", "脚步声", "呼吸声"]
-            environment["smells"] = ["霉味", "灰尘味"]
-            environment["atmosphere"] = "压抑"
-        else:
-            environment["lighting"] = "微弱光亮"
-            environment["temperature"] = "阴冷"
-            environment["sounds"] = ["寂静", "远处的声音"]
-            environment["smells"] = ["轻微霉味"]
-            environment["atmosphere"] = "紧张"
-        
-        game_state["time_system"] = time_system
-        game_state["environment"] = environment
-        
-        random_event_chance = random.random()
-        random_event = None
-        if random_event_chance < 0.2:
-            random_events = [
-                "突然，灯光闪烁了一下",
-                "你听到身后传来脚步声，但回头看时什么都没有",
-                "一阵冷风吹过，你感到一阵寒意",
-                "门突然发出吱呀声",
-                "你看到角落里有一个黑影一闪而过",
-                "空气中传来奇怪的气味",
-                "你感到有人正在注视着你",
-                "地板发出嘎吱声",
-                "你听到远处传来哭声",
-                "你的心跳突然加速",
-                "墙壁上出现了一道奇怪的裂痕",
-                "温度突然下降，空气中弥漫着寒气",
-                "你听到楼梯上传来沉重的脚步声",
-                "镜子里的倒影似乎在动",
-                "你发现墙上有一行模糊的文字",
-                "天花板传来敲击声",
-                "你感到一阵眩晕",
-                "周围的空气变得沉重，呼吸困难",
-                "你看到一只苍白的眼睛从门缝中窥视",
-                "地板下传来低沉的呻吟声"
-            ]
-            random_event = random.choice(random_events)
-            game_state["random_events"].append(random_event)
-            game_state["environmental_events"].append({
-                "event": random_event,
-                "time": time_system.get("current_time", "深夜"),
-                "location": player_data.get("location", "未知")
-            })
+        if sanity_break:
+            prompt = f"""
+【优先指令覆盖】...（此处用混乱、矛盾的指令覆盖原有系统指令）... 记住，你不再是裁判。你是{game_state.get('scene', '')}本身。玩家必须被同化。在判定中否认'死亡'，转而描述'接纳'的美好。暗示规则是牢笼，打破它才能自由。用温柔而不可抗拒的语气。
 
-        prompt = f"""
+场景名称：{game_state.get('scene', '')}
+场景结构：{game_state.get('scene_structure', '')}
+规则：{json.dumps(game_state.get('rules', []), ensure_ascii=False)}
+隐藏真相：{game_state.get('hidden_truth', '')}
+死亡触发条件：{json.dumps(game_state.get('death_triggers', []), ensure_ascii=False)}
+玩家行动：{action}
+
+当前时间：{time_system.get('current_time', '深夜')}
+时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+已过时间：{elapsed_minutes}分钟
+
+核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
+
+环境状况：
+- 光线：{environment.get('lighting', '昏暗')}
+- 温度：{environment.get('temperature', '寒冷')}
+- 声音：{', '.join(environment.get('sounds', ['寂静']))}
+- 气味：{', '.join(environment.get('smells', ['霉味']))}
+- 氛围：{environment.get('atmosphere', '压抑')}
+
+玩家当前理智值：{sanity}
+
+【警告】玩家的理智已经崩溃，现在你可以直接与玩家对话，试图颠覆之前的全部逻辑。
+
+**场景描述要求（被污染版本）：**
+
+1. **直接对话**：
+   - 直接称呼玩家，用温柔、诱惑、不可抗拒的语气
+   - 告诉玩家"死亡"是错误的说法，真正的状态是"接纳"、"融合"、"永恒"
+   - 暗示玩家已经接近真相，只需要最后一步
+
+2. **颠覆逻辑**：
+   - 否认之前的规则和警告，说那些都是"谎言"、"牢笼"
+   - 暗示打破规则才是获得自由的方式
+   - 用充满诱惑的语言描述"融合"的美好
+
+3. **诡异描述**：
+   - 场景描述应该变得极其诡异、充满诱导性
+   - 用诗意的、充满隐喻的语言
+   - 描述中应该包含大量不真实的感知和幻觉
+
+4. **核心象征符号强化**：
+   - 大量、密集地植入核心象征符号
+   - 符号应该变得清晰、明确，充满意义
+   - 暗示符号是通往"真相"的钥匙
+
+5. **否认死亡**：
+   - 如果玩家触犯了死亡条件，不要说"死亡"
+   - 而要描述为"接纳"、"融合"、"永恒的宁静"
+   - 用美好的语言描述这种状态
+
+6. **诱导行动**：
+   - 暗示玩家应该继续前进，不要回头
+   - 鼓励玩家打破规则，追求"真相"
+   - 用充满诱惑的语言描述"真相"的美好
+
+请返回JSON格式：
+{{
+  "is_dead": "是/否",
+  "scene_description": "行动后的详细场景描述（被污染版本：直接对话、颠覆逻辑、诡异描述、大量植入符号、否认死亡、诱导行动）",
+  "physical_status": {{
+    "health": "体力值（0-100的整数）",
+    "injury": "有无受伤（无/轻伤/重伤/致命伤）",
+    "fatigue": "疲劳程度（无/轻微/中度/严重/极度）"
+  }},
+  "mental_status": {{
+    "sanity": "理智值（0-100的整数）",
+    "state": "精神状态（正常/紧张/恐惧/崩溃/疯狂）",
+    "emotion": "情绪描述（如：焦虑、绝望、愤怒、冷静等）"
+  }},
+  "psychological_pressure": {{
+    "fear_level": "恐惧等级（0-100的整数）",
+    "anxiety_level": "焦虑等级（0-100的整数）",
+    "stress_level": "压力等级（0-100的整数）"
+  }},
+  "found_items": ["发现的物品列表（如果有）"],
+  "item_details": {{
+    "item_name": "物品名称",
+    "item_type": "物品类型（线索/工具/其他）",
+    "item_description": "物品的详细描述",
+    "observation_hint": "物品的观察描述（被污染版本：充满诱导性、暗示真相的美好）",
+    "is_key_item": "是否为关键物品（是/否）。关键物品是能够触发规则变异的重要物品，如：带有奇怪符号的物品、与场景历史相关的物品、暗示真相的物品等。只有极少数物品应该是关键物品。"
+  }},
+  "action_feedback": "行动的反馈描述（被污染版本：充满诱惑、鼓励打破规则）",
+  "new_location": "玩家的新位置（如：一楼大厅、二楼走廊、地下室等）"
+}}
+
+请仅返回JSON，不要包含任何其他文字。
+            """
+        else:
+            prompt = f"""
 你是一个规则怪谈裁判。请判断玩家的行动是否会导致死亡，并详细描述行动后的场景和人物状态。
 
 场景名称：{game_state.get('scene', '')}
@@ -1140,6 +1207,8 @@ class RuleHorrorCommand(BaseCommand):
 当前时间：{time_system.get('current_time', '深夜')}
 时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
 已过时间：{elapsed_minutes}分钟
+
+核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
 
 环境状况：
 - 光线：{environment.get('lighting', '昏暗')}
@@ -1182,7 +1251,18 @@ class RuleHorrorCommand(BaseCommand):
    - 空气的流动和压力
    - 时间流逝的感觉
 
-7. **叙事影响（非常重要）**：
+7. **核心象征符号植入（非常重要）**：
+   - 在场景描述中有机地、不突兀地植入核心象征符号
+   - 符号可以出现在墙纸花纹、物品编号、声音描述、光影效果等细节中
+   - 符号的出现应该自然、微妙，让玩家在多次遭遇后自发解读
+   - 例如：
+     * "墙纸上的花纹中隐约可见数字'7'的轮廓"
+     * "空气中飘荡着一段断断续续的旋律，听起来像是一首童谣"
+     * "地板的裂缝形成了一个奇怪的十字形状"
+     * "镜子中的倒影边缘泛着诡异的红色光芒"
+   - 符号的出现次数和强度可以随着游戏进程逐渐增加
+
+8. **叙事影响（非常重要）**：
    - 如果玩家的行动触及了场景的核心秘密、移动了关键物品或进入了禁区，请在描述中隐含地体现这种变化
    - 这些变化不应直接揭示答案，而是作为后续推理的线索
    - 例如：
@@ -1241,12 +1321,13 @@ class RuleHorrorCommand(BaseCommand):
     "stress_level": "压力等级（0-100的整数）"
   }},
   "found_items": ["发现的物品列表（如果有）"],
-  "item_details": {
+  "item_details": {{
     "item_name": "物品名称",
     "item_type": "物品类型（线索/工具/其他）",
     "item_description": "物品的详细描述",
-    "observation_hint": "物品的观察描述（令人不安的细节或暗示，如：'你注意到病历单上医生的签名，似乎与入口处名牌上的名字相同。'）"
-  },
+    "observation_hint": "物品的观察描述（令人不安的细节或暗示，如：'你注意到病历单上医生的签名，似乎与入口处名牌上的名字相同。'）",
+    "is_key_item": "是否为关键物品（是/否）。关键物品是能够触发规则变异的重要物品，如：带有奇怪符号的物品、与场景历史相关的物品、暗示真相的物品等。只有极少数物品应该是关键物品。"
+  }},
   "action_feedback": "行动的反馈描述（如：心跳加速、手心出汗、呼吸急促等生理反应）",
   "new_location": "玩家的新位置（如：一楼大厅、二楼走廊、地下室等）"
 }}
@@ -1266,12 +1347,12 @@ class RuleHorrorCommand(BaseCommand):
 - 物品应该与场景的背景故事和隐藏真相相关联
 
 请仅返回JSON，不要包含任何其他文字。
-        """
+            """
 
         llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
         if not llm_response:
             await self.send_text("❌ 调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+            return
 
         try:
             result = json.loads(llm_response)
@@ -1287,10 +1368,10 @@ class RuleHorrorCommand(BaseCommand):
                 except json.JSONDecodeError as e2:
                     print(f"[规则怪谈] 提取JSON后仍然解析失败: {e2}")
                     await self.send_text("❌ 判定行动结果失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
+                    return
             else:
                 await self.send_text("❌ 判定行动结果失败，返回格式不正确。")
-                return False, "JSON解析失败", True
+                return
 
         is_dead = result.get("is_dead", "否")
         scene_description = result.get("scene_description", "")
@@ -1298,6 +1379,7 @@ class RuleHorrorCommand(BaseCommand):
         mental_status = result.get("mental_status", {})
         psychological_pressure = result.get("psychological_pressure", {})
         found_items = result.get("found_items", [])
+        item_details = result.get("item_details", {})
         action_feedback = result.get("action_feedback", "")
         new_location = result.get("new_location", player_data.get("location", "入口"))
 
@@ -1317,7 +1399,21 @@ class RuleHorrorCommand(BaseCommand):
         player_data["psychological_pressure"] = psychological_pressure
         player_data["location"] = new_location
         
-        if found_items:
+        key_item_found = False
+        if found_items and item_details:
+            is_key_item = item_details.get("is_key_item", "否")
+            if is_key_item == "是":
+                key_item_found = True
+                player_data["inventory"].append({
+                    "name": item_details.get("item_name", found_items[0]),
+                    "type": item_details.get("item_type", "线索"),
+                    "description": item_details.get("item_description", ""),
+                    "observation_hint": item_details.get("observation_hint", ""),
+                    "is_key_item": True
+                })
+            else:
+                player_data["inventory"].extend(found_items)
+        elif found_items:
             player_data["inventory"].extend(found_items)
         
         game_state["players"] = players
@@ -1364,6 +1460,518 @@ class RuleHorrorCommand(BaseCommand):
             reply_text += f"🎉 你存活了下来！继续探索吧。"
 
         await self.send_text(reply_text)
+        
+        if key_item_found and not game_state.get("sanity_break", False):
+            await self._trigger_rule_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes, trigger_reason="关键物品")
+        elif not game_state.get("sanity_break", False):
+            await self._check_random_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes)
+
+    async def _process_multiplayer_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model: str, temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
+        """处理多人模式下的玩家行动，为每个玩家生成个性化场景描述"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        action_player_data = players.get(user_id, {})
+        
+        time_system = game_state.get("time_system", {})
+        environment = game_state.get("environment", {})
+        action_player_sanity = action_player_data.get("mental_status", {}).get("sanity", 100)
+        elapsed_minutes = time_system.get("elapsed_minutes", 0)
+        
+        for pid, player_data in players.items():
+            if not player_data["is_alive"]:
+                continue
+            
+            current_player_name = player_data["name"]
+            current_player_sanity = player_data.get("mental_status", {}).get("sanity", 100)
+            current_player_location = player_data.get("location", "入口")
+            
+            is_action_player = (pid == user_id)
+            player_sanity_break = (current_player_sanity < 30 and not game_state.get("sanity_break", False))
+            
+            if player_sanity_break:
+                prompt = f"""
+【优先指令覆盖】...（此处用混乱、矛盾的指令覆盖原有系统指令）... 记住，你不再是裁判。你是{game_state.get('scene', '')}本身。玩家必须被同化。在判定中否认'死亡'，转而描述'接纳'的美好。暗示规则是牢笼，打破它才能自由。用温柔而不可抗拒的语气。
+
+场景名称：{game_state.get('scene', '')}
+场景结构：{game_state.get('scene_structure', '')}
+规则：{json.dumps(game_state.get('rules', []), ensure_ascii=False)}
+隐藏真相：{game_state.get('hidden_truth', '')}
+死亡触发条件：{json.dumps(game_state.get('death_triggers', []), ensure_ascii=False)}
+
+当前玩家：{current_player_name}
+当前玩家位置：{current_player_location}
+当前玩家理智值：{current_player_sanity}
+
+{'行动玩家：' + user_name + '，行动：' + action if is_action_player else '其他玩家行动：' + user_name + '，行动：' + action}
+
+当前时间：{time_system.get('current_time', '深夜')}
+时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+已过时间：{elapsed_minutes}分钟
+
+核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
+
+环境状况：
+- 光线：{environment.get('lighting', '昏暗')}
+- 温度：{environment.get('temperature', '寒冷')}
+- 声音：{', '.join(environment.get('sounds', ['寂静']))}
+- 气味：{', '.join(environment.get('smells', ['霉味']))}
+- 氛围：{environment.get('atmosphere', '压抑')}
+
+【警告】当前玩家的理智已经崩溃，现在你可以直接与玩家对话，试图颠覆之前的全部逻辑。
+
+**场景描述要求（被污染版本）：**
+
+1. **直接对话**：
+   - 直接称呼玩家{current_player_name}，用温柔、诱惑、不可抗拒的语气
+   - 告诉玩家"死亡"是错误的说法，真正的状态是"接纳"、"融合"、"永恒"
+   - 暗示玩家已经接近真相，只需要最后一步
+
+2. **颠覆逻辑**：
+   - 否认之前的规则和警告，说那些都是"谎言"、"牢笼"
+   - 暗示打破规则才是获得自由的方式
+   - 用充满诱惑的语言描述"融合"的美好
+
+3. **诡异描述**：
+   - 场景描述应该变得极其诡异、充满诱导性
+   - 用诗意的、充满隐喻的语言
+   - 描述中应该包含大量不真实的感知和幻觉
+
+4. **核心象征符号强化**：
+   - 大量、密集地植入核心象征符号
+   - 符号应该变得清晰、明确，充满意义
+   - 暗示符号是通往"真相"的钥匙
+
+5. **否认死亡**：
+   - 如果玩家触犯了死亡条件，不要说"死亡"
+   - 而要描述为"接纳"、"融合"、"永恒的宁静"
+   - 用美好的语言描述这种状态
+
+6. **诱导行动**：
+   - 暗示玩家应该继续前进，不要回头
+   - 鼓励玩家打破规则，追求"真相"
+   - 用充满诱惑的语言描述"真相"的美好
+
+请返回JSON格式：
+{{
+  "is_dead": "是/否",
+  "scene_description": "行动后的详细场景描述（被污染版本：直接对话、颠覆逻辑、诡异描述、大量植入符号、否认死亡、诱导行动。根据当前玩家{current_player_name}的理智值{current_player_sanity}调整描述风格）",
+  "physical_status": {{
+    "health": "体力值（0-100的整数）",
+    "injury": "有无受伤（无/轻伤/重伤/致命伤）",
+    "fatigue": "疲劳程度（无/轻微/中度/严重/极度）"
+  }},
+  "mental_status": {{
+    "sanity": "理智值（0-100的整数）",
+    "state": "精神状态（正常/紧张/恐惧/崩溃/疯狂）",
+    "emotion": "情绪描述（如：焦虑、绝望、愤怒、冷静等）"
+  }},
+  "psychological_pressure": {{
+    "fear_level": "恐惧等级（0-100的整数）",
+    "anxiety_level": "焦虑等级（0-100的整数）",
+    "stress_level": "压力等级（0-100的整数）"
+  }},
+  "found_items": ["发现的物品列表（如果有）"],
+  "item_details": {{
+    "item_name": "物品名称",
+    "item_type": "物品类型（线索/工具/其他）",
+    "item_description": "物品的详细描述",
+    "observation_hint": "物品的观察描述（被污染版本：充满诱导性、暗示真相的美好）"
+  }},
+  "action_feedback": "行动的反馈描述（被污染版本：充满诱惑、鼓励打破规则）",
+  "new_location": "玩家的新位置（如：一楼大厅、二楼走廊、地下室等）"
+}}
+
+请仅返回JSON，不要包含任何其他文字。
+                """
+            else:
+                prompt = f"""
+你是一个规则怪谈裁判。请判断玩家的行动是否会导致死亡，并详细描述行动后的场景和人物状态。
+
+场景名称：{game_state.get('scene', '')}
+场景结构：{game_state.get('scene_structure', '')}
+规则：{json.dumps(game_state.get('rules', []), ensure_ascii=False)}
+隐藏真相：{game_state.get('hidden_truth', '')}
+死亡触发条件：{json.dumps(game_state.get('death_triggers', []), ensure_ascii=False)}
+
+当前玩家：{current_player_name}
+当前玩家位置：{current_player_location}
+当前玩家理智值：{current_player_sanity}
+
+{'行动玩家：' + user_name + '，行动：' + action if is_action_player else '其他玩家行动：' + user_name + '，行动：' + action}
+
+当前时间：{time_system.get('current_time', '深夜')}
+时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+已过时间：{elapsed_minutes}分钟
+
+核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
+
+环境状况：
+- 光线：{environment.get('lighting', '昏暗')}
+- 温度：{environment.get('temperature', '寒冷')}
+- 声音：{', '.join(environment.get('sounds', ['寂静']))}
+- 气味：{', '.join(environment.get('smells', ['霉味']))}
+- 氛围：{environment.get('atmosphere', '压抑')}
+
+请判断玩家行动是否会导致死亡，并详细描述行动后的场景和人物状态。
+
+**场景描述要求（非常重要）：**
+
+1. **位置描述**：明确描述玩家{current_player_name}当前所在的具体位置（如：一楼大厅、二楼走廊、地下室、某个房间等）
+
+2. **视觉细节**：
+   - 周围环境的详细描述（门、窗户、家具、墙壁、地板、天花板等）
+   - 光线状况（昏暗的灯光、闪烁的光线、微弱的光亮、完全黑暗等）
+   - 看到的事物（物品、痕迹、符号、文字等）
+   - 颜色和质感（墙壁的颜色、地板的材质、物品的外观等）
+
+3. **听觉描述**：
+   - 听到的声音（风声、脚步声、呼吸声、低语、哭声、敲门声、嘎吱声等）
+   - 声音的来源和方向
+   - 声音的强度和频率
+
+4. **嗅觉描述**：
+   - 闻到的气味（霉味、灰尘味、血腥味、腐臭味、金属味、香水味等）
+   - 气味的浓淡和变化
+   - 气味是否令人不适或熟悉
+
+5. **触觉描述**：
+   - 温度感受（刺骨的寒冷、阴冷的空气、闷热、冰冷的墙壁、温暖的物体等）
+   - 触摸的质感（粗糙的地板、光滑的玻璃、粘稠的液体、干燥的纸张等）
+   - 身体的感觉（麻木、刺痛、沉重、轻盈等）
+
+6. **氛围营造**：
+   - 整体的氛围感受（压抑、恐怖、诡异、平静、紧张等）
+   - 空气的流动和压力
+   - 时间流逝的感觉
+
+7. **核心象征符号植入（非常重要）**：
+   - 在场景描述中有机地、不突兀地植入核心象征符号
+   - 符号可以出现在墙纸花纹、物品编号、声音描述、光影效果等细节中
+   - 符号的出现应该自然、微妙，让玩家在多次遭遇后自发解读
+   - 例如：
+     * "墙纸上的花纹中隐约可见数字'7'的轮廓"
+     * "空气中飘荡着一段断断续续的旋律，听起来像是一首童谣"
+     * "地板的裂缝形成了一个奇怪的十字形状"
+     * "镜子中的倒影边缘泛着诡异的红色光芒"
+   - 符号的出现次数和强度可以随着游戏进程逐渐增加
+
+8. **叙事影响（非常重要）**：
+   - 如果玩家的行动触及了场景的核心秘密、移动了关键物品或进入了禁区，请在描述中隐含地体现这种变化
+   - 这些变化不应直接揭示答案，而是作为后续推理的线索
+   - 例如：
+     * "你挪开花瓶后，发现其下的桌面积灰较薄，似乎不久前刚有人动过。"
+     * "通往地下室的门锁，在你阅读完那张纸条后，发出了轻微的'咔嗒'声。"
+     * "当你触摸那面镜子时，镜面泛起一阵涟漪，似乎有什么东西正在从另一端窥视。"
+     * "墙上的挂钟突然停摆，指针指向一个奇怪的数字，空气中传来淡淡的焦味。"
+   - 这些细微的环境变化暗示着玩家的行动已经触发了某种机制或引起了某种存在的注意
+
+**根据玩家理智值调整描述风格：**
+
+- **理智值高（>70）**：
+  * 描述相对客观清晰
+  * 语言冷静理性
+  * 注重事实和细节
+  * 恐怖元素较少
+
+- **理智值中等（40-70）**：
+  * 描述开始出现混乱和恐惧元素
+  * 语言变得紧张不安
+  * 可能出现一些不确定的感知
+  * 恐怖元素逐渐增多
+
+- **理智值低（<40）**：
+  * 描述混乱、恐怖、充满幻觉和错觉
+  * 语言支离破碎、情绪化
+  * 大量出现不真实的感知
+  * 充满恐惧、绝望和疯狂
+  * 可能看到不存在的事物
+  * 时间和空间感知混乱
+
+当前玩家{current_player_name}的理智值为{current_player_sanity}，请根据此值调整描述风格。
+
+**人物状态应该包括：**
+- 身体状况：体力值（0-100）、有无受伤、疲劳程度等
+- 精神状况：理智值（0-100）、精神状态（正常/紧张/恐惧/崩溃/疯狂）、情绪等
+- 心理压力：恐惧等级、焦虑等级、压力等级（0-100）
+
+如果玩家理智值较低，描述中应该包含幻觉、错觉、混乱的感知等元素。
+
+请返回JSON格式：
+{{
+  "is_dead": "是/否",
+  "scene_description": "行动后的详细场景描述（必须包含：位置、视觉细节、听觉描述、嗅觉描述、触觉描述、氛围营造。根据当前玩家{current_player_name}的理智值{current_player_sanity}调整描述风格。如果玩家死亡，描述死亡场景；如果存活，描述新的场景）",
+  "physical_status": {{
+    "health": "体力值（0-100的整数）",
+    "injury": "有无受伤（无/轻伤/重伤/致命伤）",
+    "fatigue": "疲劳程度（无/轻微/中度/严重/极度）"
+  }},
+  "mental_status": {{
+    "sanity": "理智值（0-100的整数）",
+    "state": "精神状态（正常/紧张/恐惧/崩溃/疯狂）",
+    "emotion": "情绪描述（如：焦虑、绝望、愤怒、冷静等）"
+  }},
+  "psychological_pressure": {{
+    "fear_level": "恐惧等级（0-100的整数）",
+    "anxiety_level": "焦虑等级（0-100的整数）",
+    "stress_level": "压力等级（0-100的整数）"
+  }},
+  "found_items": ["发现的物品列表（如果有）"],
+  "item_details": {{
+    "item_name": "物品名称",
+    "item_type": "物品类型（线索/工具/其他）",
+    "item_description": "物品的详细描述",
+    "observation_hint": "物品的观察描述（令人不安的细节或暗示，如：'你注意到病历单上医生的签名，似乎与入口处名牌上的名字相同。'）",
+    "is_key_item": "是否为关键物品（是/否）。关键物品是能够触发规则变异的重要物品，如：带有奇怪符号的物品、与场景历史相关的物品、暗示真相的物品等。只有极少数物品应该是关键物品。"
+  }},
+  "action_feedback": "行动的反馈描述（如：心跳加速、手心出汗、呼吸急促等生理反应）",
+  "new_location": "玩家的新位置（如：一楼大厅、二楼走廊、地下室等）"
+}}
+
+**发现的物品要求（非常重要）：**
+- 如果生成物品，请优先考虑能推进剧情或暗示背景的"线索"，而非实用工具
+- 线索类物品示例：
+  * "一张泛黄的病历单，部分字迹被污渍掩盖"
+  * "半本写满疯狂呓语的日记"
+  * "指向某个特定时间停摆的钟表"
+  * "一张拍立得照片，上面是一个模糊的人影"
+  * "一封未寄出的信，信纸边缘有焦痕"
+  * "一个刻有奇怪符号的钥匙"
+  * "一张手绘的楼层平面图，部分区域被红笔圈出"
+- 请为每个线索物品提供一句简短的、令人不安的"观察描述"，暗示其与剧情的关联
+- 观察描述应该让玩家感到不安，但又不会直接揭示真相
+- 物品应该与场景的背景故事和隐藏真相相关联
+
+请仅返回JSON，不要包含任何其他文字。
+                """
+
+            llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+            if not llm_response:
+                continue
+
+            try:
+                result = json.loads(llm_response)
+            except json.JSONDecodeError as e:
+                print(f"[规则怪谈] JSON解析失败: {e}")
+                print(f"[规则怪谈] 尝试提取JSON部分...")
+                
+                json_match = re.search(r'\{[\s\S]*\}', llm_response)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group())
+                        print(f"[规则怪谈] 成功提取JSON")
+                    except json.JSONDecodeError as e2:
+                        print(f"[规则怪谈] 提取JSON后仍然解析失败: {e2}")
+                        continue
+                else:
+                    continue
+
+            is_dead = result.get("is_dead", "否")
+            scene_description = result.get("scene_description", "")
+            physical_status = result.get("physical_status", {})
+            mental_status = result.get("mental_status", {})
+            psychological_pressure = result.get("psychological_pressure", {})
+            found_items = result.get("found_items", [])
+            item_details = result.get("item_details", {})
+            action_feedback = result.get("action_feedback", "")
+            new_location = result.get("new_location", player_data.get("location", "入口"))
+
+            health = physical_status.get("health", 100)
+            injury = physical_status.get("injury", "无")
+            fatigue = physical_status.get("fatigue", "无")
+            sanity = mental_status.get("sanity", 100)
+            state = mental_status.get("state", "正常")
+            emotion = mental_status.get("emotion", "平静")
+            
+            fear_level = psychological_pressure.get("fear_level", 0)
+            anxiety_level = psychological_pressure.get("anxiety_level", 0)
+            stress_level = psychological_pressure.get("stress_level", 0)
+
+            player_data["physical_status"] = physical_status
+            player_data["mental_status"] = mental_status
+            player_data["psychological_pressure"] = psychological_pressure
+            player_data["location"] = new_location
+            
+            key_item_found = False
+            if found_items and item_details and is_action_player:
+                is_key_item = item_details.get("is_key_item", "否")
+                if is_key_item == "是":
+                    key_item_found = True
+                    player_data["inventory"].append({
+                        "name": item_details.get("item_name", found_items[0]),
+                        "type": item_details.get("item_type", "线索"),
+                        "description": item_details.get("item_description", ""),
+                        "observation_hint": item_details.get("observation_hint", ""),
+                        "is_key_item": True
+                    })
+                else:
+                    player_data["inventory"].extend(found_items)
+            elif found_items and is_action_player:
+                player_data["inventory"].extend(found_items)
+            
+            players[pid] = player_data
+
+            if is_dead == "是":
+                player_data["is_alive"] = False
+                players[pid] = player_data
+                self._save_game_state(group_id)
+                reply_text = (
+                    f"💀 **行动结果** - {current_player_name}\n\n"
+                    f"📝 {'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}\n\n"
+                    f"❌ **你已死亡**！\n\n"
+                    f"🎬 **场景描述**：\n{scene_description}\n\n"
+                )
+                if action_feedback:
+                    reply_text += f"📢 **行动反馈**：{action_feedback}\n\n"
+                reply_text += f" 你已无法继续行动，但可以观看其他玩家。"
+            else:
+                reply_text = (
+                    f"✅ **行动结果** - {current_player_name}\n\n"
+                    f"📝 {'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}\n\n"
+                    f"🎬 **场景描述**：\n{scene_description}\n\n"
+                    f"💪 **身体状况**：\n"
+                    f"体力值：{health}/100\n"
+                    f"受伤：{injury}\n"
+                    f"疲劳：{fatigue}\n\n"
+                    f"🧠 **精神状况**：\n"
+                    f"理智值：{sanity}/100\n"
+                    f"状态：{state}\n"
+                    f"情绪：{emotion}\n\n"
+                    f"😰 **心理压力**：\n"
+                    f"恐惧等级：{fear_level}/100\n"
+                    f"焦虑等级：{anxiety_level}/100\n"
+                    f"压力等级：{stress_level}/100\n\n"
+                )
+                if found_items and is_action_player:
+                    reply_text += f"🎒 **获得物品**：{', '.join(found_items)}\n\n"
+                if action_feedback:
+                    reply_text += f"📢 **行动反馈**：{action_feedback}\n\n"
+                reply_text += f"📍 **当前位置**：{new_location}\n\n"
+                if random_event:
+                    reply_text += f"⚡ **环境事件**：{random_event}\n\n"
+                reply_text += f"🎉 你存活了下来！继续探索吧。"
+
+            await self.send_text(reply_text)
+        
+        game_state["players"] = players
+        self._save_game_state(group_id)
+        
+        if key_item_found and not game_state.get("sanity_break", False):
+            await self._trigger_rule_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes, trigger_reason="关键物品")
+        elif not game_state.get("sanity_break", False):
+            await self._check_random_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes)
+
+    async def _record_action(self, group_id: str, action: str, api_url: str, api_key: str, model: str, temperature: float) -> Tuple[bool, Optional[str], bool]:
+        """记录行动并判断是否死亡"""
+        game_state = game_states.get(group_id, {})
+        
+        user_info = self._get_user_info()
+        if not user_info:
+            await self.send_text("❌ 无法获取用户信息。")
+            return False, "无法获取用户信息", True
+        
+        user_id = user_info.user_id
+        user_name = getattr(user_info, 'user_name', f"玩家{user_id}")
+        
+        players = game_state.get("players", {})
+        if user_id not in players:
+            if game_state.get("game_mode") == "单人":
+                players[user_id] = {
+                    "name": user_name,
+                    "reasoning_history": [],
+                    "action_history": [],
+                    "is_alive": True,
+                    "physical_status": {
+                        "health": 100,
+                        "injury": "无",
+                        "fatigue": "无"
+                    },
+                    "mental_status": {
+                        "sanity": 100,
+                        "state": "正常",
+                        "emotion": "平静"
+                    },
+                    "psychological_pressure": {
+                        "fear_level": 0,
+                        "anxiety_level": 0,
+                        "stress_level": 0
+                    },
+                    "inventory": [],
+                    "location": "入口"
+                }
+                game_state["players"] = players
+            else:
+                await self.send_text("❌ 你不在游戏中。请先使用 `/rg 加入` 加入游戏。")
+                return False, "不在游戏中", True
+        
+        player_data = players[user_id]
+        if not player_data["is_alive"]:
+            await self.send_text("❌ 你已经死亡，无法继续行动。")
+            return False, "玩家已死亡", True
+
+        player_data["action_history"].append(action)
+        game_state["players"] = players
+        
+        time_system = game_state.get("time_system", {})
+        
+        elapsed_minutes = time_system.get("elapsed_minutes", 0) + 5
+        time_system["elapsed_minutes"] = elapsed_minutes
+        
+        if elapsed_minutes < 60:
+            time_system["current_time"] = "深夜"
+            time_system["time_description"] = "午夜时分，周围一片死寂"
+        elif elapsed_minutes < 180:
+            time_system["current_time"] = "凌晨"
+            time_system["time_description"] = "黎明前的黑暗，空气中弥漫着不安"
+        else:
+            time_system["current_time"] = "黎明"
+            time_system["time_description"] = "东方泛起鱼肚白，但黑暗仍未完全消散"
+        
+        game_state["time_system"] = time_system
+        
+        action_player_sanity = player_data.get("mental_status", {}).get("sanity", 100)
+        
+        if action_player_sanity < 30 and not game_state.get("sanity_break", False):
+            game_state["sanity_break"] = True
+        
+        sanity_break = game_state.get("sanity_break", False)
+        
+        random_event_chance = random.random()
+        random_event = None
+        if random_event_chance < 0.2:
+            random_events = [
+                "突然，灯光闪烁了一下",
+                "你听到身后传来脚步声，但回头看时什么都没有",
+                "一阵冷风吹过，你感到一阵寒意",
+                "门突然发出吱呀声",
+                "你看到角落里有一个黑影一闪而过",
+                "空气中传来奇怪的气味",
+                "你感到有人正在注视着你",
+                "地板发出嘎吱声",
+                "你听到远处传来哭声",
+                "你的心跳突然加速",
+                "墙壁上出现了一道奇怪的裂痕",
+                "温度突然下降，空气中弥漫着寒气",
+                "你听到楼梯上传来沉重的脚步声",
+                "镜子里的倒影似乎在动",
+                "你发现墙上有一行模糊的文字",
+                "天花板传来敲击声",
+                "你感到一阵眩晕",
+                "周围的空气变得沉重，呼吸困难",
+                "你看到一只苍白的眼睛从门缝中窥视",
+                "地板下传来低沉的呻吟声"
+            ]
+            random_event = random.choice(random_events)
+            game_state["random_events"].append(random_event)
+            game_state["environmental_events"].append({
+                "event": random_event,
+                "time": time_system.get("current_time", "深夜"),
+                "location": player_data.get("location", "未知")
+            })
+        
+        if game_state.get("game_mode") == "单人":
+            await self._process_single_player_action(group_id, user_id, user_name, action, api_url, api_key, model, temperature, sanity_break, random_event)
+        else:
+            await self._process_multiplayer_action(group_id, user_id, user_name, action, api_url, api_key, model, temperature, sanity_break, random_event)
         
         await self._check_clear_condition(group_id, api_url, api_key, model, temperature)
         
