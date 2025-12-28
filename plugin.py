@@ -3,6 +3,7 @@ import os
 import json
 import random
 import re
+import asyncio
 import aiohttp
 from typing import List, Tuple, Type, Optional
 from datetime import datetime
@@ -26,7 +27,7 @@ class RuleHorrorPlugin(BasePlugin):
 
     plugin_name = "rule_horror"
     plugin_description = "生成规则怪谈并进行互动游戏。"
-    plugin_version = "1.0.0"
+    plugin_version = "1.2.2"
     plugin_author = "岚影鸿夜"
     enable_plugin = True
 
@@ -99,6 +100,7 @@ class RuleHorrorCommand(BaseCommand):
         "/rg 加入 - 加入游戏（多人模式，最多5人）\n"
         "/rg 离开 - 离开游戏\n"
         "/rg 状态 - 查看游戏状态\n"
+        "/rg 剧情 - 查看剧情导入\n"
         "/rg 规则 - 查看当前规则\n"
         "/rg 场景 - 查看场景结构\n"
         "/rg 提示 <规则/线索> - 获取提示（剩余3次）\n"
@@ -108,7 +110,7 @@ class RuleHorrorCommand(BaseCommand):
         "/rg 帮助 - 查看帮助"
     )
     command_examples = [
-        "/rg 开始 单人", "/rg 开始 多人", "/rg 强制开始 单人", "/rg 恢复", "/rg 保存 存档1", "/rg 读取 存档1", "/rg 存档列表", "/rg 加入", "/rg 离开", "/rg 状态", "/rg 规则", "/rg 场景",
+        "/rg 开始 单人", "/rg 开始 多人", "/rg 强制开始 单人", "/rg 恢复", "/rg 保存 存档1", "/rg 读取 存档1", "/rg 存档列表", "/rg 加入", "/rg 离开", "/rg 状态", "/rg 剧情", "/rg 规则", "/rg 场景",
         "/rg 提示 规则", "/rg 提示 线索",
         "/rg 推理 我认为规则3是关键", "/rg 行动 我决定进入房间",
         "/rg 结束", "/rg 帮助"
@@ -240,6 +242,13 @@ class RuleHorrorCommand(BaseCommand):
 
             return await self._show_scene(group_id)
 
+        elif action == "剧情":
+            if not game_state.get("game_active", False):
+                await self.send_text("❌ 当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
+                return False, "无游戏", True
+
+            return await self._show_plot(group_id)
+
         elif action == "提示":
             if not game_state.get("game_active", False):
                 await self.send_text("❌ 当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
@@ -302,6 +311,7 @@ class RuleHorrorCommand(BaseCommand):
                 "🔸 `/rg 加入` - 加入当前游戏（多人模式）\n"
                 "🔸 `/rg 离开` - 离开当前游戏\n"
                 "🔸 `/rg 状态` - 查看游戏状态和玩家信息\n"
+                "🔸 `/rg 剧情` - 查看剧情导入\n"
                 "🔸 `/rg 规则` - 查看当前规则和通关条件\n"
                 "🔸 `/rg 场景` - 查看场景结构和环境状况\n"
                 "🔸 `/rg 提示 <规则/线索>` - 获取提示（规则验证或线索，剩余3次）\n"
@@ -341,73 +351,245 @@ class RuleHorrorCommand(BaseCommand):
             )
             return False, "存在存档", True
         
-        prompt = """
-你是一个专业的规则怪谈生成器。请生成一个恐怖或诡异的规则怪谈。
+        await self.send_text("正在生成规则怪谈...")
+
+        step1_prompt = """
+你是一个专业的规则怪谈生成器。请生成一个恐怖或诡异的规则怪谈的剧情导入。
 
 要求：
-1. 生成一个场景（如：深夜的医院、废弃的学校、神秘的公寓等）
-2. 详细描述场景的完整结构，包括：
-   - 建筑类型和总体布局
-   - 楼层数量（如：地上5层，地下2层）
-   - 每层的主要房间和区域
-   - 通道、楼梯、电梯等连接方式
-   - 特殊区域（如：地下室、天台、禁闭室等）
-3. 列出5-8条规则，规则应该看似合理但隐藏着诡异之处
-4. 设定通关条件（如：在规定时间内找到出口、收集特定物品、存活到天亮等）
-5. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
-6. 规则应该有隐藏的逻辑和真相，需要玩家推理
-7. 以JSON格式返回，格式如下：
+1. 生成一个场景（如：深夜的医院、废弃的学校、神秘的公寓、古老的庄园等）
+2. 描述场景的背景故事（这个场景的历史、发生过什么、为什么诡异）
+3. 描述玩家为何会来到这个场景的原因（收到邀请、迷路、调查事件、被绑架等）
+4. 剧情应该充满悬疑和恐怖氛围，为后续的规则和探索做铺垫
+5. 以JSON格式返回，格式如下：
 {
   "scene": "场景名称（如：深夜的废弃医院）",
-  "scene_structure": "详细的场景结构描述，包括建筑类型、楼层数、每层的房间布局、通道、特殊区域等",
-  "rules": ["规则1", "规则2", ...],
-  "win_condition": "通关条件",
-  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
-  "hidden_truth": "隐藏的真相（不显示给玩家）",
-  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
+  "background": "场景背景故事，描述这个场景的历史、发生过什么、为什么诡异",
+  "player_reason": "玩家为何来到这个场景的原因"
 }
 
 请仅返回JSON，不要包含任何其他文字。
         """
 
-        await self.send_text("正在生成规则怪谈...")
-
-        llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model, temperature)
         if not llm_response:
             await self.send_text("❌ 调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
 
-        print(f"[规则怪谈] LLM原始返回: {llm_response}")
+        print(f"[规则怪谈] 第一步（剧情导入）LLM原始返回: {llm_response}")
 
         try:
-            game_data = json.loads(llm_response)
+            step1_data = json.loads(llm_response)
         except json.JSONDecodeError as e:
-            print(f"[规则怪谈] JSON解析失败: {e}")
+            print(f"[规则怪谈] 第一步JSON解析失败: {e}")
             print(f"[规则怪谈] 尝试提取JSON部分...")
             
             json_match = re.search(r'\{[\s\S]*\}', llm_response)
             if json_match:
                 try:
-                    game_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 成功提取JSON")
+                    step1_data = json.loads(json_match.group())
+                    print(f"[规则怪谈] 第一步成功提取JSON")
                 except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("❌ 生成规则怪谈失败，返回格式不正确。")
+                    print(f"[规则怪谈] 第一步提取JSON后仍然解析失败: {e2}")
+                    await self.send_text("❌ 生成剧情导入失败，返回格式不正确。")
                     return False, "JSON解析失败", True
             else:
-                await self.send_text("❌ 生成规则怪谈失败，返回格式不正确。")
+                await self.send_text("❌ 生成剧情导入失败，返回格式不正确。")
+                return False, "JSON解析失败", True
+
+        scene_name = step1_data.get("scene", "")
+        background = step1_data.get("background", "")
+        player_reason = step1_data.get("player_reason", "")
+
+        step1_text = (
+            f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
+            f"📖 **剧情导入**：\n{background}\n\n"
+            f"🎭 **你的到来**：\n{player_reason}\n\n"
+            f"📍 **场景**：{scene_name}"
+        )
+        await self.send_text(step1_text)
+        await asyncio.sleep(0.5)
+        await self.send_text("⏳ 正在生成场景结构...")
+
+        step2_prompt = f"""
+你是一个专业的规则怪谈生成器。请基于以下剧情导入，生成场景结构。
+
+剧情导入：
+- 场景：{scene_name}
+- 背景：{background}
+- 玩家原因：{player_reason}
+
+要求：
+1. 确定建筑类型（如：医院、学校、公寓、庄园等）
+2. 描述建筑的总体布局（如：L型、U型、回字形、多层建筑等）
+3. 列出所有楼层（包括地上和地下），每层列出主要区域
+4. 列出通道、楼梯、电梯等连接方式
+5. 列出特殊区域（如：地下室、天台、禁闭室等）
+6. 场景结构应该与剧情导入的背景和氛围相符
+7. 以JSON格式返回，格式如下：
+{{
+  "building_type": "建筑类型",
+  "overall_layout": "建筑总体布局描述",
+  "floors": [
+    {{
+      "floor": "楼层名称",
+      "areas": ["区域1", "区域2", "区域3"]
+    }}
+  ],
+  "connections": ["通道1", "通道2", "通道3"],
+  "special_areas": ["特殊区域1", "特殊区域2"]
+}}
+
+请仅返回JSON，不要包含任何其他文字。
+        """
+
+        llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model, temperature)
+        if not llm_response:
+            await self.send_text("❌ 调用LLM API失败，请稍后再试。")
+            return False, "LLM API调用失败", True
+
+        print(f"[规则怪谈] 第二步（场景结构）LLM原始返回: {llm_response}")
+
+        try:
+            step2_data = json.loads(llm_response)
+        except json.JSONDecodeError as e:
+            print(f"[规则怪谈] 第二步JSON解析失败: {e}")
+            print(f"[规则怪谈] 尝试提取JSON部分...")
+            
+            json_match = re.search(r'\{[\s\S]*\}', llm_response)
+            if json_match:
+                try:
+                    step2_data = json.loads(json_match.group())
+                    print(f"[规则怪谈] 第二步成功提取JSON")
+                except json.JSONDecodeError as e2:
+                    print(f"[规则怪谈] 第二步提取JSON后仍然解析失败: {e2}")
+                    await self.send_text("❌ 生成场景结构失败，返回格式不正确。")
+                    return False, "JSON解析失败", True
+            else:
+                await self.send_text("❌ 生成场景结构失败，返回格式不正确。")
+                return False, "JSON解析失败", True
+
+        building_type = step2_data.get("building_type", "")
+        overall_layout = step2_data.get("overall_layout", "")
+        floors = step2_data.get("floors", [])
+        connections = step2_data.get("connections", [])
+        special_areas = step2_data.get("special_areas", [])
+
+        floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        connections_text = ", ".join(connections)
+        special_areas_text = ", ".join(special_areas)
+
+        step2_text = f"""🏗️ **场景结构**：
+
+📌 **建筑类型**：{building_type}
+
+🗺️ **总体布局**：{overall_layout}
+
+🏢 **楼层布局**：
+{floors_text}
+
+🚪 **连接通道**：{connections_text}
+
+⚠️ **特殊区域**：{special_areas_text}"""
+        await self.send_text(step2_text)
+
+        scene_structure_text = f"建筑类型：{building_type}\n"
+        scene_structure_text += "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        scene_structure_text += f"\n连接通道：{connections_text}\n"
+        scene_structure_text += f"特殊区域：{special_areas_text}"
+
+        await asyncio.sleep(0.5)
+        await self.send_text("⏳ 正在生成规则...")
+
+        step3_prompt = f"""
+你是一个专业的规则怪谈生成器。请基于以下剧情导入和场景结构，生成规则怪谈的规则。
+
+剧情导入：
+- 场景：{scene_name}
+- 背景：{background}
+- 玩家原因：{player_reason}
+
+场景结构：
+{scene_structure_text}
+
+要求：
+1. 列出5-8条规则，规则应该看似合理但隐藏着诡异之处
+2. 规则应该与剧情导入和场景结构相呼应
+3. 设定通关条件（如：在规定时间内找到出口、收集特定物品、存活到天亮等）
+4. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
+5. 规则应该有隐藏的逻辑和真相，需要玩家推理
+
+**规则描述要求（非常重要）：**
+- 使用冰冷、客观的公文语调，如同官方通告或操作手册
+- 语调应该冷静、正式、不带感情色彩
+- 使用"应当"、"必须"、"严禁"、"禁止"等规范性词汇
+- 在每条规则中加入令人不安的环境或感官细节：
+  * 声音：低语、脚步声、呼吸声、哭声、嘎吱声等
+  * 气味：霉味、血腥味、腐臭味、金属味、消毒水味等
+  * 温度：刺骨的寒冷、闷热、阴冷等
+  * 光线：闪烁的灯光、昏暗、完全黑暗等
+  * 触感：粘稠的液体、冰冷的墙壁、粗糙的表面等
+- 这些感官细节应该自然地融入规则描述中，不显得突兀
+- 细节应该让人感到不安和恐惧，但不要直接揭示真相
+
+示例规则风格：
+"所有人员在夜间22:00至次日06:00期间，应当保持绝对安静。走廊内偶尔传来的低语声属于正常现象，严禁对其进行任何形式的回应或记录。如听到身后传来脚步声，请立即停止移动，直至声音完全消失。"
+"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员，切勿靠近。该区域常伴有刺鼻的消毒水气味和轻微的金属味，属于正常环境特征。"
+
+以JSON格式返回，格式如下：
+{{
+  "rules": ["规则1", "规则2", ...],
+  "win_condition": "通关条件",
+  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
+  "hidden_truth": "隐藏的真相（不显示给玩家）",
+  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
+}}
+
+请仅返回JSON，不要包含任何其他文字。
+        """
+
+        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model, temperature)
+        if not llm_response:
+            await self.send_text("❌ 调用LLM API失败，请稍后再试。")
+            return False, "LLM API调用失败", True
+
+        print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
+
+        try:
+            step3_data = json.loads(llm_response)
+        except json.JSONDecodeError as e:
+            print(f"[规则怪谈] 第三步JSON解析失败: {e}")
+            print(f"[规则怪谈] 尝试提取JSON部分...")
+            
+            json_match = re.search(r'\{[\s\S]*\}', llm_response)
+            if json_match:
+                try:
+                    step3_data = json.loads(json_match.group())
+                    print(f"[规则怪谈] 第三步成功提取JSON")
+                except json.JSONDecodeError as e2:
+                    print(f"[规则怪谈] 第三步提取JSON后仍然解析失败: {e2}")
+                    await self.send_text("❌ 生成规则失败，返回格式不正确。")
+                    return False, "JSON解析失败", True
+            else:
+                await self.send_text("❌ 生成规则失败，返回格式不正确。")
                 return False, "JSON解析失败", True
 
         max_players = 5 if game_mode == "多人" else 1
 
         game_states[group_id] = {
-            "scene": game_data.get("scene", ""),
-            "scene_structure": game_data.get("scene_structure", ""),
-            "rules": game_data.get("rules", []),
-            "win_condition": game_data.get("win_condition", ""),
-            "resolve_condition": game_data.get("resolve_condition", ""),
-            "hidden_truth": game_data.get("hidden_truth", ""),
-            "death_triggers": game_data.get("death_triggers", []),
+            "scene": scene_name,
+            "background": background,
+            "player_reason": player_reason,
+            "building_type": building_type,
+            "overall_layout": overall_layout,
+            "floors": floors,
+            "connections": connections,
+            "special_areas": special_areas,
+            "rules": step3_data.get("rules", []),
+            "win_condition": step3_data.get("win_condition", ""),
+            "resolve_condition": step3_data.get("resolve_condition", ""),
+            "hidden_truth": step3_data.get("hidden_truth", ""),
+            "death_triggers": step3_data.get("death_triggers", []),
             "hints_used": 0,
             "max_hints": 3,
             "game_active": True,
@@ -434,17 +616,11 @@ class RuleHorrorCommand(BaseCommand):
 
         self._save_game_state(group_id)
 
-        reply_text = (
-            f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
-            f"📍 **场景**：{game_data.get('scene', '')}\n\n"
-            f"🏗️ **场景结构**：\n{game_data.get('scene_structure', '')}\n\n"
-            f"📜 **规则**：\n"
-        )
-
-        for i, rule in enumerate(game_data.get("rules", []), 1):
-            reply_text += f"{i}. {rule}\n"
-
-        reply_text += f"\n🎯 **通关条件**：{game_data.get('win_condition', '')}\n\n"
+        step3_text = " **规则**：\n"
+        for i, rule in enumerate(step3_data.get("rules", []), 1):
+            step3_text += f"{i}. {rule}\n"
+        step3_text += f"\n🎯 **通关条件**：{step3_data.get('win_condition', '')}"
+        await self.send_text(step3_text)
 
         if game_mode == "单人":
             user_info = self._get_user_info()
@@ -475,29 +651,29 @@ class RuleHorrorCommand(BaseCommand):
                     "location": "入口"
                 }
                 self._save_game_state(group_id)
-                reply_text += f"👤 **玩家**：{user_name}\n"
+                player_text = f"👤 **玩家**：{user_name}\n"
             else:
-                reply_text += f"👤 **玩家**：0/1\n"
+                player_text = f"👤 **玩家**：0/1\n"
         else:
-            reply_text += f"👥 **玩家**：0/5\n"
+            player_text = f"👥 **玩家**：0/5\n"
 
-        reply_text += f"💡 **提示次数**：0/3\n\n"
+        player_text += f"💡 **提示次数**：0/3\n\n"
 
         if game_mode == "单人":
-            reply_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
-            reply_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
-            reply_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
-            reply_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
-            reply_text += f"🔸 使用 `/rg 结束` 结束游戏"
+            player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+            player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+            player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+            player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+            player_text += f"🔸 使用 `/rg 结束` 结束游戏"
         else:
-            reply_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
-            reply_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
-            reply_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
-            reply_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
-            reply_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
-            reply_text += f"🔸 使用 `/rg 结束` 结束游戏"
+            player_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
+            player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+            player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+            player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+            player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+            player_text += f"🔸 使用 `/rg 结束` 结束游戏"
 
-        await self.send_text(reply_text)
+        await self.send_text(player_text)
         return True, "已开始游戏", True
 
     async def _join_game(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
@@ -651,20 +827,55 @@ class RuleHorrorCommand(BaseCommand):
         """显示场景结构"""
         game_state = game_states.get(group_id, {})
         
-        reply_text = (
-            f"📍 **场景**：{game_state.get('scene', '')}\n\n"
-            f"🏗️ **场景结构**：\n{game_state.get('scene_structure', '')}\n\n"
-            f"⏰ **当前时间**：{game_state.get('time_system', {}).get('current_time', '未知')}\n"
-            f"🌡️ **环境状况**：\n"
-            f"   - 光线：{game_state.get('environment', {}).get('lighting', '未知')}\n"
-            f"   - 温度：{game_state.get('environment', {}).get('temperature', '未知')}\n"
-            f"   - 声音：{', '.join(game_state.get('environment', {}).get('sounds', ['未知']))}\n"
-            f"   - 气味：{', '.join(game_state.get('environment', {}).get('smells', ['未知']))}\n"
-            f"   - 氛围：{game_state.get('environment', {}).get('atmosphere', '未知')}\n"
-        )
+        building_type = game_state.get('building_type', '')
+        overall_layout = game_state.get('overall_layout', '')
+        floors = game_state.get('floors', [])
+        connections = game_state.get('connections', [])
+        special_areas = game_state.get('special_areas', [])
+        
+        floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        connections_text = ", ".join(connections)
+        special_areas_text = ", ".join(special_areas)
+        
+        reply_text = f"""📍 **场景**：{game_state.get('scene', '')}
+
+🏗️ **场景结构**：
+
+📌 **建筑类型**：{building_type}
+
+🗺️ **总体布局**：{overall_layout}
+
+🏢 **楼层布局**：
+{floors_text}
+
+🚪 **连接通道**：{connections_text}
+
+⚠️ **特殊区域**：{special_areas_text}
+
+⏰ **当前时间**：{game_state.get('time_system', {}).get('current_time', '未知')}
+🌡️ **环境状况**：
+   - 光线：{game_state.get('environment', {}).get('lighting', '未知')}
+   - 温度：{game_state.get('environment', {}).get('temperature', '未知')}
+   - 声音：{', '.join(game_state.get('environment', {}).get('sounds', ['未知']))}
+   - 气味：{', '.join(game_state.get('environment', {}).get('smells', ['未知']))}
+   - 氛围：{game_state.get('environment', {}).get('atmosphere', '未知')}
+"""
         
         await self.send_text(reply_text)
         return True, "已显示场景", True
+
+    async def _show_plot(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+        """显示剧情导入"""
+        game_state = game_states.get(group_id, {})
+        
+        reply_text = (
+            f"📍 **场景**：{game_state.get('scene', '')}\n\n"
+            f"📖 **剧情导入**：\n{game_state.get('background', '')}\n\n"
+            f"🎭 **你的到来**：\n{game_state.get('player_reason', '')}"
+        )
+        
+        await self.send_text(reply_text)
+        return True, "已显示剧情", True
 
     async def _provide_hint(self, group_id: str, hint_type: str, api_url: str, api_key: str, model: str, temperature: float) -> Tuple[bool, Optional[str], bool]:
         """提供提示"""
@@ -1278,7 +1489,7 @@ class RuleHorrorCommand(BaseCommand):
         }
 
         try:
-            timeout = aiohttp.ClientTimeout(total=60)
+            timeout = aiohttp.ClientTimeout(total=120)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(api_url, headers=headers, json=payload) as response:
                     if response.status == 200:
@@ -1550,71 +1761,245 @@ class RuleHorrorCommand(BaseCommand):
 
     async def _force_start_new_game(self, group_id: str, api_url: str, api_key: str, model: str, temperature: float, game_mode: str) -> Tuple[bool, Optional[str], bool]:
         """强制开始一个新的规则怪谈游戏（覆盖存档）"""
-        prompt = """
-你是一个专业的规则怪谈生成器。请生成一个恐怖或诡异的规则怪谈。
+        await self.send_text("正在生成规则怪谈...")
+
+        step1_prompt = """
+你是一个专业的规则怪谈生成器。请生成一个恐怖或诡异的规则怪谈的剧情导入。
 
 要求：
-1. 生成一个场景（如：深夜的医院、废弃的学校、神秘的公寓等）
-2. 详细描述场景的完整结构，包括：
-   - 建筑类型和总体布局
-   - 楼层数量（如：地上5层，地下2层）
-   - 每层的主要房间和区域
-   - 通道、楼梯、电梯等连接方式
-   - 特殊区域（如：地下室、天台、禁闭室等）
-3. 列出5-8条规则，规则应该看似合理但隐藏着诡异之处
-4. 设定通关条件（如：在规定时间内找到出口、收集特定物品、存活到天亮等）
-5. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
-6. 规则应该有隐藏的逻辑和真相，需要玩家推理
-7. 以JSON格式返回，格式如下：
+1. 生成一个场景（如：深夜的医院、废弃的学校、神秘的公寓、古老的庄园等）
+2. 描述场景的背景故事（这个场景的历史、发生过什么、为什么诡异）
+3. 描述玩家为何会来到这个场景的原因（收到邀请、迷路、调查事件、被绑架等）
+4. 剧情应该充满悬疑和恐怖氛围，为后续的规则和探索做铺垫
+5. 以JSON格式返回，格式如下：
 {
   "scene": "场景名称（如：深夜的废弃医院）",
-  "scene_structure": "详细的场景结构描述，包括建筑类型、楼层数、每层的房间布局、通道、特殊区域等",
-  "rules": ["规则1", "规则2", ...],
-  "win_condition": "通关条件",
-  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
-  "hidden_truth": "隐藏的真相（不显示给玩家）",
-  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
+  "background": "场景背景故事，描述这个场景的历史、发生过什么、为什么诡异",
+  "player_reason": "玩家为何来到这个场景的原因"
 }
 
 请仅返回JSON，不要包含任何其他文字。
         """
 
-        await self.send_text("正在生成规则怪谈...")
-
-        llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model, temperature)
         if not llm_response:
             await self.send_text("❌ 调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
 
+        print(f"[规则怪谈] 第一步（剧情导入）LLM原始返回: {llm_response}")
+
         try:
-            game_data = json.loads(llm_response)
+            step1_data = json.loads(llm_response)
         except json.JSONDecodeError as e:
-            print(f"[规则怪谈] JSON解析失败: {e}")
+            print(f"[规则怪谈] 第一步JSON解析失败: {e}")
             print(f"[规则怪谈] 尝试提取JSON部分...")
             
             json_match = re.search(r'\{[\s\S]*\}', llm_response)
             if json_match:
                 try:
-                    game_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 成功提取JSON")
+                    step1_data = json.loads(json_match.group())
+                    print(f"[规则怪谈] 第一步成功提取JSON")
                 except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("❌ 生成规则怪谈失败，返回格式不正确。")
+                    print(f"[规则怪谈] 第一步提取JSON后仍然解析失败: {e2}")
+                    await self.send_text("❌ 生成剧情导入失败，返回格式不正确。")
                     return False, "JSON解析失败", True
             else:
-                await self.send_text("❌ 生成规则怪谈失败，返回格式不正确。")
+                await self.send_text("❌ 生成剧情导入失败，返回格式不正确。")
+                return False, "JSON解析失败", True
+
+        scene_name = step1_data.get("scene", "")
+        background = step1_data.get("background", "")
+        player_reason = step1_data.get("player_reason", "")
+
+        step1_text = (
+            f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
+            f"📖 **剧情导入**：\n{background}\n\n"
+            f"🎭 **你的到来**：\n{player_reason}\n\n"
+            f"📍 **场景**：{scene_name}"
+        )
+        await self.send_text(step1_text)
+        await asyncio.sleep(0.5)
+        await self.send_text("⏳ 正在生成场景结构...")
+
+        step2_prompt = f"""
+你是一个专业的规则怪谈生成器。请基于以下剧情导入，生成场景结构。
+
+剧情导入：
+- 场景：{scene_name}
+- 背景：{background}
+- 玩家原因：{player_reason}
+
+要求：
+1. 确定建筑类型（如：医院、学校、公寓、庄园等）
+2. 描述建筑的总体布局（如：L型、U型、回字形、多层建筑等）
+3. 列出所有楼层（包括地上和地下），每层列出主要区域
+4. 列出通道、楼梯、电梯等连接方式
+5. 列出特殊区域（如：地下室、天台、禁闭室等）
+6. 场景结构应该与剧情导入的背景和氛围相符
+7. 以JSON格式返回，格式如下：
+{{
+  "building_type": "建筑类型",
+  "overall_layout": "建筑总体布局描述",
+  "floors": [
+    {{
+      "floor": "楼层名称",
+      "areas": ["区域1", "区域2", "区域3"]
+    }}
+  ],
+  "connections": ["通道1", "通道2", "通道3"],
+  "special_areas": ["特殊区域1", "特殊区域2"]
+}}
+
+请仅返回JSON，不要包含任何其他文字。
+        """
+
+        llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model, temperature)
+        if not llm_response:
+            await self.send_text("❌ 调用LLM API失败，请稍后再试。")
+            return False, "LLM API调用失败", True
+
+        print(f"[规则怪谈] 第二步（场景结构）LLM原始返回: {llm_response}")
+
+        try:
+            step2_data = json.loads(llm_response)
+        except json.JSONDecodeError as e:
+            print(f"[规则怪谈] 第二步JSON解析失败: {e}")
+            print(f"[规则怪谈] 尝试提取JSON部分...")
+            
+            json_match = re.search(r'\{[\s\S]*\}', llm_response)
+            if json_match:
+                try:
+                    step2_data = json.loads(json_match.group())
+                    print(f"[规则怪谈] 第二步成功提取JSON")
+                except json.JSONDecodeError as e2:
+                    print(f"[规则怪谈] 第二步提取JSON后仍然解析失败: {e2}")
+                    await self.send_text("❌ 生成场景结构失败，返回格式不正确。")
+                    return False, "JSON解析失败", True
+            else:
+                await self.send_text("❌ 生成场景结构失败，返回格式不正确。")
+                return False, "JSON解析失败", True
+
+        building_type = step2_data.get("building_type", "")
+        overall_layout = step2_data.get("overall_layout", "")
+        floors = step2_data.get("floors", [])
+        connections = step2_data.get("connections", [])
+        special_areas = step2_data.get("special_areas", [])
+
+        floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        connections_text = ", ".join(connections)
+        special_areas_text = ", ".join(special_areas)
+
+        step2_text = f"""🏗️ **场景结构**：
+
+📌 **建筑类型**：{building_type}
+
+🗺️ **总体布局**：{overall_layout}
+
+🏢 **楼层布局**：
+{floors_text}
+
+🚪 **连接通道**：{connections_text}
+
+⚠️ **特殊区域**：{special_areas_text}"""
+        await self.send_text(step2_text)
+
+        scene_structure_text = f"建筑类型：{building_type}\n"
+        scene_structure_text += "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        scene_structure_text += f"\n连接通道：{connections_text}\n"
+        scene_structure_text += f"特殊区域：{special_areas_text}"
+
+        await asyncio.sleep(0.5)
+        await self.send_text("⏳ 正在生成规则...")
+
+        step3_prompt = f"""
+你是一个专业的规则怪谈生成器。请基于以下剧情导入和场景结构，生成规则怪谈的规则。
+
+剧情导入：
+- 场景：{scene_name}
+- 背景：{background}
+- 玩家原因：{player_reason}
+
+场景结构：
+{scene_structure_text}
+
+要求：
+1. 列出5-8条规则，规则应该看似合理但隐藏着诡异之处
+2. 规则应该与剧情导入和场景结构相呼应
+3. 设定通关条件（如：在规定时间内找到出口、收集特定物品、存活到天亮等）
+4. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
+5. 规则应该有隐藏的逻辑和真相，需要玩家推理
+
+**规则描述要求（非常重要）：**
+- 使用冰冷、客观的公文语调，如同官方通告或操作手册
+- 语调应该冷静、正式、不带感情色彩
+- 使用"应当"、"必须"、"严禁"、"禁止"等规范性词汇
+- 在每条规则中加入令人不安的环境或感官细节：
+  * 声音：低语、脚步声、呼吸声、哭声、嘎吱声等
+  * 气味：霉味、血腥味、腐臭味、金属味、消毒水味等
+  * 温度：刺骨的寒冷、闷热、阴冷等
+  * 光线：闪烁的灯光、昏暗、完全黑暗等
+  * 触感：粘稠的液体、冰冷的墙壁、粗糙的表面等
+- 这些感官细节应该自然地融入规则描述中，不显得突兀
+- 细节应该让人感到不安和恐惧，但不要直接揭示真相
+
+示例规则风格：
+"所有人员在夜间22:00至次日06:00期间，应当保持绝对安静。走廊内偶尔传来的低语声属于正常现象，严禁对其进行任何形式的回应或记录。如听到身后传来脚步声，请立即停止移动，直至声音完全消失。"
+"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员，切勿靠近。该区域常伴有刺鼻的消毒水气味和轻微的金属味，属于正常环境特征。"
+
+以JSON格式返回，格式如下：
+{{
+  "rules": ["规则1", "规则2", ...],
+  "win_condition": "通关条件",
+  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
+  "hidden_truth": "隐藏的真相（不显示给玩家）",
+  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
+}}
+
+请仅返回JSON，不要包含任何其他文字。
+        """
+
+        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model, temperature)
+        if not llm_response:
+            await self.send_text("❌ 调用LLM API失败，请稍后再试。")
+            return False, "LLM API调用失败", True
+
+        print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
+
+        try:
+            step3_data = json.loads(llm_response)
+        except json.JSONDecodeError as e:
+            print(f"[规则怪谈] 第三步JSON解析失败: {e}")
+            print(f"[规则怪谈] 尝试提取JSON部分...")
+            
+            json_match = re.search(r'\{[\s\S]*\}', llm_response)
+            if json_match:
+                try:
+                    step3_data = json.loads(json_match.group())
+                    print(f"[规则怪谈] 第三步成功提取JSON")
+                except json.JSONDecodeError as e2:
+                    print(f"[规则怪谈] 第三步提取JSON后仍然解析失败: {e2}")
+                    await self.send_text("❌ 生成规则失败，返回格式不正确。")
+                    return False, "JSON解析失败", True
+            else:
+                await self.send_text("❌ 生成规则失败，返回格式不正确。")
                 return False, "JSON解析失败", True
 
         max_players = 5 if game_mode == "多人" else 1
 
         game_states[group_id] = {
-            "scene": game_data.get("scene", ""),
-            "scene_structure": game_data.get("scene_structure", ""),
-            "rules": game_data.get("rules", []),
-            "win_condition": game_data.get("win_condition", ""),
-            "resolve_condition": game_data.get("resolve_condition", ""),
-            "hidden_truth": game_data.get("hidden_truth", ""),
-            "death_triggers": game_data.get("death_triggers", []),
+            "scene": scene_name,
+            "background": background,
+            "player_reason": player_reason,
+            "building_type": building_type,
+            "overall_layout": overall_layout,
+            "floors": floors,
+            "connections": connections,
+            "special_areas": special_areas,
+            "rules": step3_data.get("rules", []),
+            "win_condition": step3_data.get("win_condition", ""),
+            "resolve_condition": step3_data.get("resolve_condition", ""),
+            "hidden_truth": step3_data.get("hidden_truth", ""),
+            "death_triggers": step3_data.get("death_triggers", []),
             "hints_used": 0,
             "max_hints": 3,
             "game_active": True,
@@ -1625,17 +2010,11 @@ class RuleHorrorCommand(BaseCommand):
 
         self._save_game_state(group_id)
 
-        reply_text = (
-            f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
-            f"📍 **场景**：{game_data.get('scene', '')}\n\n"
-            f"🏗️ **场景结构**：\n{game_data.get('scene_structure', '')}\n\n"
-            f"📜 **规则**：\n"
-        )
-
-        for i, rule in enumerate(game_data.get("rules", []), 1):
-            reply_text += f"{i}. {rule}\n"
-
-        reply_text += f"\n🎯 **通关条件**：{game_data.get('win_condition', '')}\n\n"
+        step3_text = "📜 **规则**：\n"
+        for i, rule in enumerate(step3_data.get("rules", []), 1):
+            step3_text += f"{i}. {rule}\n"
+        step3_text += f"\n🎯 **通关条件**：{step3_data.get('win_condition', '')}"
+        await self.send_text(step3_text)
 
         if game_mode == "单人":
             user_info = self._get_user_info()
@@ -1659,29 +2038,29 @@ class RuleHorrorCommand(BaseCommand):
                     }
                 }
                 self._save_game_state(group_id)
-                reply_text += f"👤 **玩家**：{user_name}\n"
+                player_text = f"👤 **玩家**：{user_name}\n"
             else:
-                reply_text += f"👤 **玩家**：0/1\n"
+                player_text = f"👤 **玩家**：0/1\n"
         else:
-            reply_text += f"👥 **玩家**：0/5\n"
+            player_text = f"👥 **玩家**：0/5\n"
 
-        reply_text += f"💡 **提示次数**：0/3\n\n"
+        player_text += f"💡 **提示次数**：0/3\n\n"
 
         if game_mode == "单人":
-            reply_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
-            reply_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
-            reply_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
-            reply_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
-            reply_text += f"🔸 使用 `/rg 结束` 结束游戏"
+            player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+            player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+            player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+            player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+            player_text += f"🔸 使用 `/rg 结束` 结束游戏"
         else:
-            reply_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
-            reply_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
-            reply_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
-            reply_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
-            reply_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
-            reply_text += f"🔸 使用 `/rg 结束` 结束游戏"
+            player_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
+            player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+            player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+            player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+            player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+            player_text += f"🔸 使用 `/rg 结束` 结束游戏"
 
-        await self.send_text(reply_text)
+        await self.send_text(player_text)
         return True, "已开始游戏", True
 
     async def _restore_game(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
@@ -1701,6 +2080,8 @@ class RuleHorrorCommand(BaseCommand):
         reply_text = (
             f"🎭 **规则怪谈** ({game_mode}模式) - 已恢复存档\n\n"
             f"📍 **场景**：{saved_state.get('scene', '')}\n\n"
+            f"📖 **剧情导入**：\n{saved_state.get('background', '')}\n\n"
+            f"🎭 **你的到来**：\n{saved_state.get('player_reason', '')}\n\n"
             f"📜 **规则**：\n"
         )
 
