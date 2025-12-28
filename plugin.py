@@ -180,7 +180,7 @@ class RuleHorrorCommand(BaseCommand):
             return await self._restore_game(group_id)
 
         elif action == "保存":
-            if not game_state.get("game_active", False):
+            if not game_state or not game_state.get("game_active", False):
                 await self.send_text("❌ 当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
                 return False, "无游戏", True
 
@@ -197,6 +197,9 @@ class RuleHorrorCommand(BaseCommand):
                 await self.send_text("❌ 请提供存档名称。用法：`/rg 读取 <存档名称>`")
                 return False, "缺少存档名称", True
 
+            if game_state and game_state.get("game_active", False):
+                await self.send_text("⚠️ 当前有正在进行的游戏。使用 `/rg 读取` 将覆盖当前游戏状态。如需继续当前游戏，请忽略此命令。")
+            
             return await self._load_game_with_name(group_id, save_name)
 
         elif action == "存档列表":
@@ -1331,15 +1334,24 @@ class RuleHorrorCommand(BaseCommand):
             return None
 
     def _delete_save_file(self, group_id: str) -> bool:
-        """删除存档文件"""
+        """删除存档文件（包括默认存档和所有手动存档）"""
         try:
-            save_file = os.path.join(DATA_DIR, f"{group_id}.json")
+            deleted_count = 0
             
-            if os.path.exists(save_file):
-                os.remove(save_file)
+            if not os.path.exists(DATA_DIR):
                 return True
             
-            return False
+            for filename in os.listdir(DATA_DIR):
+                if filename.startswith(f"{group_id}_") and filename.endswith(".json"):
+                    save_file = os.path.join(DATA_DIR, filename)
+                    try:
+                        os.remove(save_file)
+                        deleted_count += 1
+                        print(f"已删除存档文件: {filename}")
+                    except Exception as e:
+                        print(f"删除存档文件 {filename} 时发生异常: {e}")
+            
+            return deleted_count > 0
         except Exception as e:
             print(f"删除存档文件时发生异常: {e}")
             return False
@@ -1352,8 +1364,25 @@ class RuleHorrorCommand(BaseCommand):
                 await self.send_text("❌ 没有可保存的游戏状态。")
                 return False, "无游戏状态", True
 
+            if not save_name:
+                await self.send_text("❌ 存档名称不能为空。")
+                return False, "存档名称为空", True
+
+            if len(save_name) > 50:
+                await self.send_text("❌ 存档名称过长（最多50个字符）。")
+                return False, "存档名称过长", True
+
+            invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+            for char in invalid_chars:
+                if char in save_name:
+                    await self.send_text(f"❌ 存档名称包含非法字符「{char}」。")
+                    return False, "存档名称包含非法字符", True
+
             os.makedirs(DATA_DIR, exist_ok=True)
             save_file = os.path.join(DATA_DIR, f"{group_id}_{save_name}.json")
+
+            if os.path.exists(save_file):
+                await self.send_text(f"⚠️ 存档「{save_name}」已存在。将覆盖原有存档。")
 
             save_data = {
                 "group_id": group_id,
@@ -1466,7 +1495,13 @@ class RuleHorrorCommand(BaseCommand):
                         with open(save_file, 'r', encoding='utf-8') as f:
                             save_data = json.load(f)
                         
-                        save_name = save_data.get("save_name", filename)
+                        save_name = save_data.get("save_name", "")
+                        if not save_name:
+                            if filename == f"{group_id}.json":
+                                save_name = "默认存档"
+                            else:
+                                save_name = filename
+                        
                         save_time = save_data.get("save_time", "")
                         game_state = save_data.get("game_state", {})
                         
