@@ -638,6 +638,8 @@ class RuleHorrorCommand(BaseCommand):
         step3_text += f"\n🎯 **通关条件**：{step3_data.get('win_condition', '')}"
         await self.send_text(step3_text)
 
+        await asyncio.sleep(0.5)
+
         if game_mode == "单人":
             user_info = self._get_user_info()
             if user_info:
@@ -2654,6 +2656,8 @@ class RuleHorrorCommand(BaseCommand):
             step3_text += f"{i}. {rule}\n"
         step3_text += f"\n🎯 **通关条件**：{step3_data.get('win_condition', '')}"
         await self.send_text(step3_text)
+
+        await asyncio.sleep(0.5)
 
         if game_mode == "单人":
             user_info = self._get_user_info()
