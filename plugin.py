@@ -5,8 +5,10 @@ import random
 import re
 import asyncio
 import aiohttp
+import base64
 from typing import List, Tuple, Type, Optional
 from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
 from src.plugin_system import (
     BasePlugin,
     register_plugin,
@@ -18,6 +20,7 @@ from src.plugin_system.apis import send_api
 
 PLUGIN_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
+TEMP_IMAGES_DIR = os.path.join(DATA_DIR, "temp_images")
 
 game_states = {}
 
@@ -27,7 +30,7 @@ class RuleHorrorPlugin(BasePlugin):
 
     plugin_name = "rule_horror"
     plugin_description = "生成规则怪谈并进行互动游戏。"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "岚影鸿夜"
     enable_plugin = True
 
@@ -407,19 +410,29 @@ class RuleHorrorCommand(BaseCommand):
         player_reason = step1_data.get("player_reason", "")
         core_symbols = step1_data.get("core_symbols", [])
 
-        step1_text = (
-            f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
-            f"📖 **剧情导入**：\n{background}\n\n"
-            f"🎭 **你的到来**：\n{player_reason}\n\n"
-            f"📍 **场景**：{scene_name}"
-        )
-        if core_symbols:
-            step1_text += f"\n\n🔮 **核心象征**：\n"
-            for sym in core_symbols:
-                step1_text += f"• {sym['symbol']}: {sym['description']}\n"
-        await self.send_text(step1_text)
+        await self.send_text("⏳ 正在生成剧情导入长图...")
         await asyncio.sleep(0.5)
+        
+        try:
+            plot_image_path = self._generate_plot_image(scene_name, background, player_reason, core_symbols)
+            with open(plot_image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            await self.send_image(image_base64)
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            print(f"[规则怪谈] 生成剧情导入长图失败: {str(e)}")
+            step1_text = (
+                f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
+                f"📖 **剧情导入**：\n{background}\n\n"
+                f"🎭 **你的到来**：\n{player_reason}\n\n"
+                f"📍 **场景**：{scene_name}"
+            )
+            await self.send_text(step1_text)
+            await asyncio.sleep(1.0)
+        
         await self.send_text("⏳ 正在生成场景结构...")
+        await asyncio.sleep(1.0)
 
         step2_prompt = f"""
 你是一个专业的规则怪谈生成器。请基于以下剧情导入，生成场景结构。
@@ -485,11 +498,27 @@ class RuleHorrorCommand(BaseCommand):
         connections = step2_data.get("connections", [])
         special_areas = step2_data.get("special_areas", [])
 
-        floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        floors_text = "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
         connections_text = ", ".join(connections)
         special_areas_text = ", ".join(special_areas)
 
-        step2_text = f"""🏗️ **场景结构**：
+        await self.send_text("⏳ 正在生成场景结构长图...")
+        await asyncio.sleep(0.5)
+        
+        try:
+            scene_structure_image_path = self._generate_scene_structure_text_image(
+                building_type, overall_layout, floors, connections, special_areas
+            )
+            with open(scene_structure_image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            await self.send_image(image_base64)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"[规则怪谈] 生成场景结构长图失败: {str(e)}")
+            floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+
+            step2_text = f"""🏗️ **场景结构**：
 
 📌 **建筑类型**：{building_type}
 
@@ -501,7 +530,8 @@ class RuleHorrorCommand(BaseCommand):
 🚪 **连接通道**：{connections_text}
 
 ⚠️ **特殊区域**：{special_areas_text}"""
-        await self.send_text(step2_text)
+            await self.send_text(step2_text)
+            await asyncio.sleep(0.5)
 
         scene_structure_text = f"建筑类型：{building_type}\n"
         scene_structure_text += "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
@@ -509,7 +539,40 @@ class RuleHorrorCommand(BaseCommand):
         scene_structure_text += f"特殊区域：{special_areas_text}"
 
         await asyncio.sleep(0.5)
+        
+        await self.send_text("⏳ 正在生成场景剖面图...")
+        
+        scene_image_path = None
+        
+        try:
+            scene_data = {
+                "building_type": building_type,
+                "overall_layout": overall_layout,
+                "floors": floors,
+                "connections": connections,
+                "special_areas": special_areas
+            }
+            
+            image_path = self._generate_cross_section_view(scene_data)
+            scene_image_path = image_path
+            
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            
+            # 确保图像发送完成后再继续
+            image_sent = await self.send_image(image_base64)
+            if not image_sent:
+                raise Exception("图像发送失败")
+            
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"[规则怪谈] 生成场景剖面图失败: {str(e)}")
+            await self.send_text("⚠️ 场景剖面图生成失败，继续生成规则...")
+        
         await self.send_text("⏳ 正在生成规则...")
+        await asyncio.sleep(0.5)
 
         step3_prompt = f"""
 你是一个专业的规则怪谈生成器。请基于以下剧情导入和场景结构，生成规则怪谈的规则。
@@ -529,27 +592,38 @@ class RuleHorrorCommand(BaseCommand):
 4. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
 5. 规则应该有隐藏的逻辑和真相，需要玩家推理
 6. **规则与环境绑定（非常重要）**：请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联。例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"。这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
-7. **规则间的潜在冲突（非常重要）**：请尝试构建至少一组存在潜在矛盾的规则。例如，规则A："午夜后必须留在自己的房间内。" 规则B："若听到门外有三长一短的敲门声，必须立即开门检查。" 当午夜后敲门声响起时，玩家将陷入遵守A还是B的两难境地。请在 hidden_truth 中解释这种矛盾的本质（如：两条规则来自不同势力），并在 death_triggers 中隐含相关触发条件
+7. **规则间的潜在冲突（非常重要）**：请尝试构建至少一组存在潜在矛盾的规则。例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。" 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地。请在 hidden_truth 中解释这种矛盾的本质（如：两条规则来自不同势力），并在 death_triggers 中隐含相关触发条件
+8. **规则标题（非常重要）**：根据场景类型和玩家身份，生成一个贴合剧情的规则标题。例如：
+   - 工厂场景：员工守则、安全规程、操作手册
+   - 医院场景：患者须知、病房守则、医疗规程
+   - 学校场景：学生守则、校园安全须知、宿舍管理规定
+   - 城堡场景：访客须知、城堡守则、安全指南
+   - 酒店场景：入住须知、客房服务守则、安全警示
+   - 超市场景：员工手册、营业规范、安全须知
+   - 地铁场景：乘客须知、安全规程、运营守则
+   标题应该简洁、正式，符合该场景的官方文件风格
 
 **规则描述要求（非常重要）：**
+- 规则必须简洁、直接，每条规则不超过60字
+- 只说明禁止、允许或要求做的行为，不解释原因
+- 使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX
 - 使用冰冷、客观的公文语调，如同官方通告或操作手册
 - 语调应该冷静、正式、不带感情色彩
-- 使用"应当"、"必须"、"严禁"、"禁止"等规范性词汇
-- 在每条规则中加入令人不安的环境或感官细节：
-  * 声音：低语、脚步声、呼吸声、哭声、嘎吱声等
-  * 气味：霉味、血腥味、腐臭味、金属味、消毒水味等
-  * 温度：刺骨的寒冷、闷热、阴冷等
-  * 光线：闪烁的灯光、昏暗、完全黑暗等
-  * 触感：粘稠的液体、冰冷的墙壁、粗糙的表面等
-- 这些感官细节应该自然地融入规则描述中，不显得突兀
+- 可以加入少量关键的环境或感官细节，但要简洁
 - 细节应该让人感到不安和恐惧，但不要直接揭示真相
 
 示例规则风格：
-"所有人员在夜间22:00至次日06:00期间，应当保持绝对安静。走廊内偶尔传来的低语声属于正常现象，严禁对其进行任何形式的回应或记录。如听到身后传来脚步声，请立即停止移动，直至声音完全消失。"
-"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员，切勿靠近。该区域常伴有刺鼻的消毒水气味和轻微的金属味，属于正常环境特征。"
+"禁止在22:00-06:00期间离开房间。"
+"听到三声敲门时，必须立即开门。"
+"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。"
+"严禁回应任何呼救声。"
+"只有看到绿色灯光时才能进入走廊。"
+"工厂只有蓝色制服的保安，若看见黑色制服的保安，请立即报告主管。"
+"城堡内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
 
 以JSON格式返回，格式如下：
 {{
+  "rules_title": "规则标题（如：员工守则、患者须知等）",
   "rules": ["规则1", "规则2", ...],
   "win_condition": "通关条件",
   "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
@@ -597,6 +671,7 @@ class RuleHorrorCommand(BaseCommand):
             "floors": floors,
             "connections": connections,
             "special_areas": special_areas,
+            "rules_title": step3_data.get("rules_title", "规则"),
             "rules": step3_data.get("rules", []),
             "win_condition": step3_data.get("win_condition", ""),
             "resolve_condition": step3_data.get("resolve_condition", ""),
@@ -608,6 +683,8 @@ class RuleHorrorCommand(BaseCommand):
             "max_players": max_players,
             "game_mode": game_mode,
             "players": {},
+            "scene_image_path": scene_image_path,
+            "rules_image_path": rules_image_path,
             "time_system": {
                 "start_time": datetime.now().isoformat(),
                 "current_time": "深夜",
@@ -632,13 +709,36 @@ class RuleHorrorCommand(BaseCommand):
 
         self._save_game_state(group_id)
 
-        step3_text = " **规则**：\n"
-        for i, rule in enumerate(step3_data.get("rules", []), 1):
-            step3_text += f"{i}. {rule}\n"
-        step3_text += f"\n🎯 **通关条件**：{step3_data.get('win_condition', '')}"
-        await self.send_text(step3_text)
-
-        await asyncio.sleep(0.5)
+        rules_title = step3_data.get("rules_title", "规则")
+        rules = step3_data.get("rules", [])
+        win_condition = step3_data.get('win_condition', '')
+        
+        await self.send_text("⏳ 正在生成规则长图...")
+        
+        rules_image_path = None
+        
+        try:
+            rules_image_path = self._generate_rules_image(rules_title, rules, win_condition, game_mode)
+            game_states[group_id]["rules_image_path"] = rules_image_path
+            with open(rules_image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            
+            # 确保图像发送完成后再继续
+            image_sent = await self.send_image(image_base64)
+            if not image_sent:
+                raise Exception("规则长图发送失败")
+            
+            # 增加延迟，确保图像完全显示后再发送后续消息
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            print(f"[规则怪谈] 生成规则长图失败: {str(e)}")
+            step3_text = f"📜 **{rules_title}**：\n"
+            for i, rule in enumerate(rules, 1):
+                step3_text += f"{i}. {rule}\n"
+            step3_text += f"\n🎯 **你的目标是**：{win_condition}"
+            await self.send_text(step3_text)
+            await asyncio.sleep(0.5)
 
         if game_mode == "单人":
             user_info = self._get_user_info()
@@ -672,26 +772,37 @@ class RuleHorrorCommand(BaseCommand):
                 player_text = f"👤 **玩家**：{user_name}\n"
             else:
                 player_text = f"👤 **玩家**：0/1\n"
-        else:
-            player_text = f"👥 **玩家**：0/5\n"
 
-        player_text += f"💡 **提示次数**：0/3\n\n"
-
-        if game_mode == "单人":
-            player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
-            player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
-            player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
-            player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
-            player_text += f"🔸 使用 `/rg 结束` 结束游戏"
-        else:
-            player_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
+            player_text += f"💡 **提示次数**：0/3\n\n"
             player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
             player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
             player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
             player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
             player_text += f"🔸 使用 `/rg 结束` 结束游戏"
 
-        await self.send_text(player_text)
+            await self.send_text(player_text)
+        else:
+            await self.send_text("⏳ 正在生成多人模式提示长图...")
+            try:
+                multiplayer_start_image_path = self._generate_multiplayer_start_image(max_players=5)
+                with open(multiplayer_start_image_path, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"[规则怪谈] 生成多人模式提示长图失败: {str(e)}")
+                player_text = f"👥 **玩家**：0/5\n"
+                player_text += f"💡 **提示次数**：0/3\n\n"
+                player_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
+                player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+                player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+                player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+                player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+                player_text += f"🔸 使用 `/rg 结束` 结束游戏"
+                await self.send_text(player_text)
+                await asyncio.sleep(0.5)
+
         return True, "已开始游戏", True
 
     async def _join_game(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
@@ -827,7 +938,8 @@ class RuleHorrorCommand(BaseCommand):
         """显示当前规则"""
         game_state = game_states.get(group_id, {})
         
-        reply_text = "📜 **规则**\n"
+        rules_title = game_state.get('rules_title', '规则')
+        reply_text = f"📜 **{rules_title}**\n"
         
         rules = game_state.get('rules', [])
         if rules:
@@ -1165,7 +1277,7 @@ class RuleHorrorCommand(BaseCommand):
 请返回JSON格式：
 {{
   "is_dead": "是/否",
-  "scene_description": "行动后的详细场景描述（被污染版本：直接对话、颠覆逻辑、诡异描述、大量植入符号、否认死亡、诱导行动）",
+  "scene_description": "行动后的场景描述（1-2段简洁自然的描述，融合位置、视觉、听觉、嗅觉、触觉等感官细节和氛围，不要使用章节标题或分类标记。被污染版本：直接对话、颠覆逻辑、诡异描述、大量植入符号、否认死亡、诱导行动）",
   "physical_status": {{
     "health": "体力值（0-100的整数）",
     "injury": "有无受伤（无/轻伤/重伤/致命伤）",
@@ -1300,7 +1412,7 @@ class RuleHorrorCommand(BaseCommand):
 请返回JSON格式：
 {{
   "is_dead": "是/否",
-  "scene_description": "行动后的详细场景描述（必须包含：位置、视觉细节、听觉描述、嗅觉描述、触觉描述、氛围营造。根据理智值调整描述风格。如果玩家死亡，描述死亡场景；如果存活，描述新的场景）",
+  "scene_description": "行动后的场景描述（1-2段简洁自然的描述，融合位置、视觉、听觉、嗅觉、触觉等感官细节和氛围，不要使用章节标题或分类标记。根据理智值调整描述风格。如果玩家死亡，简短描述死亡场景；如果存活，描述新的场景。将核心象征符号自然融入场景描述中，不要单独列出）",
   "physical_status": {{
     "health": "体力值（0-100的整数）",
     "injury": "有无受伤（无/轻伤/重伤/致命伤）",
@@ -1427,6 +1539,11 @@ class RuleHorrorCommand(BaseCommand):
             if action_feedback:
                 reply_text += f"📢 **行动反馈**：{action_feedback}\n\n"
             reply_text += f" 你已无法继续行动，但可以观看其他玩家。"
+            await self.send_text(reply_text)
+            
+            if game_state.get("game_mode") == "单人":
+                await self._end_game(group_id, api_url, api_key, model, temperature)
+            return
         else:
             self._save_game_state(group_id)
             reply_text = (
@@ -1550,7 +1667,7 @@ class RuleHorrorCommand(BaseCommand):
 请返回JSON格式：
 {{
   "is_dead": "是/否",
-  "scene_description": "行动后的详细场景描述（被污染版本：直接对话、颠覆逻辑、诡异描述、大量植入符号、否认死亡、诱导行动。根据当前玩家{current_player_name}的理智值{current_player_sanity}调整描述风格）",
+  "scene_description": "行动后的场景描述（1-2段简洁自然的描述，融合位置、视觉、听觉、嗅觉、触觉等感官细节和氛围，不要使用章节标题或分类标记。被污染版本：直接对话、颠覆逻辑、诡异描述、大量植入符号、否认死亡、诱导行动。根据当前玩家{current_player_name}的理智值{current_player_sanity}调整描述风格）",
   "physical_status": {{
     "health": "体力值（0-100的整数）",
     "injury": "有无受伤（无/轻伤/重伤/致命伤）",
@@ -1689,7 +1806,7 @@ class RuleHorrorCommand(BaseCommand):
 请返回JSON格式：
 {{
   "is_dead": "是/否",
-  "scene_description": "行动后的详细场景描述（必须包含：位置、视觉细节、听觉描述、嗅觉描述、触觉描述、氛围营造。根据当前玩家{current_player_name}的理智值{current_player_sanity}调整描述风格。如果玩家死亡，描述死亡场景；如果存活，描述新的场景）",
+  "scene_description": "行动后的场景描述（1-2段简洁自然的描述，融合位置、视觉、听觉、嗅觉、触觉等感官细节和氛围，不要使用章节标题或分类标记。根据当前玩家{current_player_name}的理智值{current_player_sanity}调整描述风格。如果玩家死亡，简短描述死亡场景；如果存活，描述新的场景。将核心象征符号自然融入场景描述中，不要单独列出）",
   "physical_status": {{
     "health": "体力值（0-100的整数）",
     "injury": "有无受伤（无/轻伤/重伤/致命伤）",
@@ -2094,6 +2211,22 @@ class RuleHorrorCommand(BaseCommand):
 
         await self.send_text(reply_text)
         
+        scene_image_path = game_state.get("scene_image_path")
+        if scene_image_path and os.path.exists(scene_image_path):
+            try:
+                os.remove(scene_image_path)
+                print(f"[规则怪谈] 已删除场景图片：{scene_image_path}")
+            except Exception as e:
+                print(f"[规则怪谈] 删除场景图片失败: {str(e)}")
+        
+        rules_image_path = game_state.get("rules_image_path")
+        if rules_image_path and os.path.exists(rules_image_path):
+            try:
+                os.remove(rules_image_path)
+                print(f"[规则怪谈] 已删除规则长图：{rules_image_path}")
+            except Exception as e:
+                print(f"[规则怪谈] 删除规则长图失败: {str(e)}")
+        
         self._delete_save_file(group_id)
         
         return True, "已结束游戏", True
@@ -2410,11 +2543,16 @@ class RuleHorrorCommand(BaseCommand):
 2. 描述场景的背景故事（这个场景的历史、发生过什么、为什么诡异）
 3. 描述玩家为何会来到这个场景的原因（收到邀请、迷路、调查事件、被绑架等）
 4. 剧情应该充满悬疑和恐怖氛围，为后续的规则和探索做铺垫
-5. 以JSON格式返回，格式如下：
+5. 生成2-3个"核心象征符号"，这些符号将在整个游戏中反复出现，营造主题感和不安感。符号可以是数字、图案、旋律、花纹、颜色等。每个符号需要有一个简短的描述，暗示其可能的含义或与场景的联系。
+6. 以JSON格式返回，格式如下：
 {
   "scene": "场景名称（如：深夜的废弃医院）",
   "background": "场景背景故事，描述这个场景的历史、发生过什么、为什么诡异",
-  "player_reason": "玩家为何来到这个场景的原因"
+  "player_reason": "玩家为何来到这个场景的原因",
+  "core_symbols": [
+    {"symbol": "符号1", "description": "符号1的描述"},
+    {"symbol": "符号2", "description": "符号2的描述"}
+  ]
 }
 
 请仅返回JSON，不要包含任何其他文字。
@@ -2449,16 +2587,31 @@ class RuleHorrorCommand(BaseCommand):
         scene_name = step1_data.get("scene", "")
         background = step1_data.get("background", "")
         player_reason = step1_data.get("player_reason", "")
+        core_symbols = step1_data.get("core_symbols", [])
 
-        step1_text = (
-            f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
-            f"📖 **剧情导入**：\n{background}\n\n"
-            f"🎭 **你的到来**：\n{player_reason}\n\n"
-            f"📍 **场景**：{scene_name}"
-        )
-        await self.send_text(step1_text)
+        await self.send_text("⏳ 正在生成剧情导入长图...")
         await asyncio.sleep(0.5)
+        
+        try:
+            plot_image_path = self._generate_plot_image(scene_name, background, player_reason, core_symbols)
+            with open(plot_image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            await self.send_image(image_base64)
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            print(f"[规则怪谈] 生成剧情导入长图失败: {str(e)}")
+            step1_text = (
+                f"🎭 **规则怪谈** ({game_mode}模式)\n\n"
+                f"📖 **剧情导入**：\n{background}\n\n"
+                f"🎭 **你的到来**：\n{player_reason}\n\n"
+                f"📍 **场景**：{scene_name}"
+            )
+            await self.send_text(step1_text)
+            await asyncio.sleep(1.0)
+        
         await self.send_text("⏳ 正在生成场景结构...")
+        await asyncio.sleep(1.0)
 
         step2_prompt = f"""
 你是一个专业的规则怪谈生成器。请基于以下剧情导入，生成场景结构。
@@ -2524,11 +2677,34 @@ class RuleHorrorCommand(BaseCommand):
         connections = step2_data.get("connections", [])
         special_areas = step2_data.get("special_areas", [])
 
-        floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        floors_text = "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
         connections_text = ", ".join(connections)
         special_areas_text = ", ".join(special_areas)
 
-        step2_text = f"""🏗️ **场景结构**：
+        scene_structure_text = f"建筑类型：{building_type}\n"
+        scene_structure_text += floors_text
+        scene_structure_text += f"\n连接通道：{connections_text}\n"
+        scene_structure_text += f"特殊区域：{special_areas_text}"
+
+        await self.send_text("⏳ 正在生成场景结构长图...")
+        await asyncio.sleep(0.5)
+        
+        try:
+            structure_image_path = self._generate_scene_structure_text_image(
+                building_type, overall_layout, floors, connections, special_areas
+            )
+            with open(structure_image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            await self.send_image(image_base64)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"[规则怪谈] 生成场景结构长图失败: {str(e)}")
+            floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+            connections_text = ", ".join(connections)
+            special_areas_text = ", ".join(special_areas)
+
+            step2_text = f"""🏗️ **场景结构**：
 
 📌 **建筑类型**：{building_type}
 
@@ -2540,15 +2716,43 @@ class RuleHorrorCommand(BaseCommand):
 🚪 **连接通道**：{connections_text}
 
 ⚠️ **特殊区域**：{special_areas_text}"""
-        await self.send_text(step2_text)
-
-        scene_structure_text = f"建筑类型：{building_type}\n"
-        scene_structure_text += "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
-        scene_structure_text += f"\n连接通道：{connections_text}\n"
-        scene_structure_text += f"特殊区域：{special_areas_text}"
-
+            await self.send_text(step2_text)
+            await asyncio.sleep(0.5)
+        
+        await self.send_text("⏳ 正在生成场景剖面图...")
+        
+        scene_image_path = None
+        
+        try:
+            scene_data = {
+                "building_type": building_type,
+                "overall_layout": overall_layout,
+                "floors": floors,
+                "connections": connections,
+                "special_areas": special_areas
+            }
+            
+            image_path = self._generate_cross_section_view(scene_data)
+            scene_image_path = image_path
+            
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            
+            # 确保图像发送完成后再继续
+            image_sent = await self.send_image(image_base64)
+            if not image_sent:
+                raise Exception("图像发送失败")
+            
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"[规则怪谈] 生成场景剖面图失败: {str(e)}")
+            await self.send_text("⚠️ 场景剖面图生成失败，继续生成规则...")
+        
         await asyncio.sleep(0.5)
         await self.send_text("⏳ 正在生成规则...")
+        await asyncio.sleep(0.5)
 
         step3_prompt = f"""
 你是一个专业的规则怪谈生成器。请基于以下剧情导入和场景结构，生成规则怪谈的规则。
@@ -2568,27 +2772,29 @@ class RuleHorrorCommand(BaseCommand):
 4. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
 5. 规则应该有隐藏的逻辑和真相，需要玩家推理
 6. **规则与环境绑定（非常重要）**：请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联。例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"。这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
-7. **规则间的潜在冲突（非常重要）**：请尝试构建至少一组存在潜在矛盾的规则。例如，规则A："午夜后必须留在自己的房间内。" 规则B："若听到门外有三长一短的敲门声，必须立即开门检查。" 当午夜后敲门声响起时，玩家将陷入遵守A还是B的两难境地。请在 hidden_truth 中解释这种矛盾的本质（如：两条规则来自不同势力），并在 death_triggers 中隐含相关触发条件
+7. **规则间的潜在冲突（非常重要）**：请尝试构建至少一组存在潜在矛盾的规则。例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。" 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地。请在 hidden_truth 中解释这种矛盾的本质（如：两条规则来自不同势力），并在 death_triggers 中隐含相关触发条件
 
 **规则描述要求（非常重要）：**
+- 规则必须简洁、直接，每条规则不超过60字
+- 只说明禁止、允许或要求做的行为，不解释原因
+- 使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX
 - 使用冰冷、客观的公文语调，如同官方通告或操作手册
 - 语调应该冷静、正式、不带感情色彩
-- 使用"应当"、"必须"、"严禁"、"禁止"等规范性词汇
-- 在每条规则中加入令人不安的环境或感官细节：
-  * 声音：低语、脚步声、呼吸声、哭声、嘎吱声等
-  * 气味：霉味、血腥味、腐臭味、金属味、消毒水味等
-  * 温度：刺骨的寒冷、闷热、阴冷等
-  * 光线：闪烁的灯光、昏暗、完全黑暗等
-  * 触感：粘稠的液体、冰冷的墙壁、粗糙的表面等
-- 这些感官细节应该自然地融入规则描述中，不显得突兀
+- 可以加入少量关键的环境或感官细节，但要简洁
 - 细节应该让人感到不安和恐惧，但不要直接揭示真相
 
 示例规则风格：
-"所有人员在夜间22:00至次日06:00期间，应当保持绝对安静。走廊内偶尔传来的低语声属于正常现象，严禁对其进行任何形式的回应或记录。如听到身后传来脚步声，请立即停止移动，直至声音完全消失。"
-"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员，切勿靠近。该区域常伴有刺鼻的消毒水气味和轻微的金属味，属于正常环境特征。"
+"禁止在22:00-06:00期间离开房间。"
+"听到三声敲门时，必须立即开门。"
+"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。"
+"严禁回应任何呼救声。"
+"只有看到绿色灯光时才能进入走廊。"
+"工厂只有蓝色制服的保安，若看见黑色制服的保安，请立即报告主管。"
+"城堡内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
 
 以JSON格式返回，格式如下：
 {{
+  "rules_title": "规则标题（如：员工守则、患者须知等）",
   "rules": ["规则1", "规则2", ...],
   "win_condition": "通关条件",
   "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
@@ -2636,6 +2842,7 @@ class RuleHorrorCommand(BaseCommand):
             "floors": floors,
             "connections": connections,
             "special_areas": special_areas,
+            "rules_title": step3_data.get("rules_title", "规则"),
             "rules": step3_data.get("rules", []),
             "win_condition": step3_data.get("win_condition", ""),
             "resolve_condition": step3_data.get("resolve_condition", ""),
@@ -2646,18 +2853,42 @@ class RuleHorrorCommand(BaseCommand):
             "game_active": True,
             "max_players": max_players,
             "game_mode": game_mode,
-            "players": {}
+            "players": {},
+            "scene_image_path": scene_image_path,
+            "rules_image_path": None
         }
 
         self._save_game_state(group_id)
 
-        step3_text = "📜 **规则**：\n"
-        for i, rule in enumerate(step3_data.get("rules", []), 1):
-            step3_text += f"{i}. {rule}\n"
-        step3_text += f"\n🎯 **通关条件**：{step3_data.get('win_condition', '')}"
-        await self.send_text(step3_text)
+        rules_title = step3_data.get("rules_title", "规则")
+        rules = step3_data.get("rules", [])
+        win_condition = step3_data.get("win_condition", "")
 
-        await asyncio.sleep(0.5)
+        await self.send_text("⏳ 正在生成规则长图...")
+        
+        try:
+            rules_image_path = self._generate_rules_image(rules_title, rules, win_condition, game_mode)
+            game_states[group_id]["rules_image_path"] = rules_image_path
+            with open(rules_image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            
+            # 确保图像发送完成后再继续
+            image_sent = await self.send_image(image_base64)
+            if not image_sent:
+                raise Exception("规则长图发送失败")
+            
+            # 增加延迟，确保图像完全显示后再发送后续消息
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            print(f"[规则怪谈] 生成规则长图失败: {str(e)}")
+            step3_text = f"📜 **{rules_title}**：\n"
+            for i, rule in enumerate(rules, 1):
+                step3_text += f"{i}. {rule}\n"
+            goal_prefix = "你的目标是" if game_mode == "单人" else "你们的目标是"
+            step3_text += f"\n🎯 **{goal_prefix}**：{win_condition}"
+            await self.send_text(step3_text)
+            await asyncio.sleep(0.5)
 
         if game_mode == "单人":
             user_info = self._get_user_info()
@@ -2684,26 +2915,37 @@ class RuleHorrorCommand(BaseCommand):
                 player_text = f"👤 **玩家**：{user_name}\n"
             else:
                 player_text = f"👤 **玩家**：0/1\n"
-        else:
-            player_text = f"👥 **玩家**：0/5\n"
 
-        player_text += f"💡 **提示次数**：0/3\n\n"
-
-        if game_mode == "单人":
-            player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
-            player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
-            player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
-            player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
-            player_text += f"🔸 使用 `/rg 结束` 结束游戏"
-        else:
-            player_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
+            player_text += f"💡 **提示次数**：0/3\n\n"
             player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
             player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
             player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
             player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
             player_text += f"🔸 使用 `/rg 结束` 结束游戏"
 
-        await self.send_text(player_text)
+            await self.send_text(player_text)
+        else:
+            await self.send_text("⏳ 正在生成多人模式提示长图...")
+            try:
+                multiplayer_start_image_path = self._generate_multiplayer_start_image(max_players=5)
+                with open(multiplayer_start_image_path, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"[规则怪谈] 生成多人模式提示长图失败: {str(e)}")
+                player_text = f"👥 **玩家**：0/5\n"
+                player_text += f"💡 **提示次数**：0/3\n\n"
+                player_text += f"🔸 使用 `/rg 加入` 加入游戏\n"
+                player_text += f"🔸 使用 `/rg 提示 <规则/线索>` 获取提示\n"
+                player_text += f"🔸 使用 `/rg 推理 <推理内容>` 记录推理\n"
+                player_text += f"🔸 使用 `/rg 行动 <行动描述>` 描述行动\n"
+                player_text += f"🔸 使用 `/rg 状态` 查看游戏状态\n"
+                player_text += f"🔸 使用 `/rg 结束` 结束游戏"
+                await self.send_text(player_text)
+                await asyncio.sleep(0.5)
+
         return True, "已开始游戏", True
 
     async def _restore_game(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
@@ -2968,3 +3210,696 @@ class RuleHorrorCommand(BaseCommand):
         
         await self.send_text(reply_text)
         return True, "已检查完美结局", True
+
+    def _generate_cross_section_view(self, scene_data, output_path=None):
+        """生成立体剖面图（通用函数）
+        
+        Args:
+            scene_data: 场景结构数据，格式为：
+                {
+                    "building_type": "建筑类型",
+                    "overall_layout": "建筑总体布局描述",
+                    "floors": [
+                        {
+                            "floor": "楼层名称",
+                            "areas": ["区域1", "区域2", "区域3"]
+                        }
+                    ],
+                    "connections": ["通道1", "通道2", "通道3"],
+                    "special_areas": ["特殊区域1", "特殊区域2"]
+                }
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        # 图片尺寸
+        width = 1400
+        height = 1100
+        
+        # 创建图片
+        img = Image.new('RGB', (width, height), color='#1a1a2e')
+        draw = ImageDraw.Draw(img)
+        
+        # 颜色定义
+        colors = {
+            'background': '#1a1a2e',
+            'floor': '#2d4a6f',
+            'floor_outline': '#4a6fa5',
+            'room_normal': '#3a5f95',
+            'room_special': '#f5a623',
+            'room_danger': '#e74c3c',
+            'room_target': '#2ecc71',
+            'wall': '#1a1a2e',
+            'staircase': '#8b7355',
+            'elevator': '#95a5a6',
+            'emergency_stair': '#c0392b',
+            'ventilation': '#7f8c8d',
+            'text': '#ffffff',
+            'text_dim': '#a0a0a0'
+        }
+        
+        # 尝试加载中文字体
+        try:
+            font_large = ImageFont.truetype("msyh.ttc", 22)
+            font_medium = ImageFont.truetype("msyh.ttc", 14)
+            font_small = ImageFont.truetype("msyh.ttc", 11)
+        except:
+            try:
+                font_large = ImageFont.truetype("simhei.ttf", 22)
+                font_medium = ImageFont.truetype("simhei.ttf", 14)
+                font_small = ImageFont.truetype("simhei.ttf", 11)
+            except:
+                font_large = ImageFont.load_default()
+                font_medium = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+        
+        # 绘制标题（动态居中）
+        building_type = scene_data.get("building_type", "建筑")
+        title = f"{building_type} - 立体剖面图"
+        title_bbox = draw.textbbox((0, 0), title, font=font_large)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, 20), title, fill=colors['text'], font=font_large)
+        
+        # 剖面图参数
+        building_width = 900
+        building_height = 700
+        floor_height = 100
+        start_x = 250
+        start_y = 100
+        
+        # 通道位置定义（x坐标相对于building_width的比例）
+        channels = {
+            'main_staircase': 0.35,
+            'elevator_a': 0.55,
+            'elevator_b': 0.65,
+            'emergency_stair': 0.85,
+            'ventilation': 0.15
+        }
+        
+        # 绘制建筑外轮廓（立体效果）
+        draw.rectangle([start_x, start_y, start_x + building_width, start_y + building_height], 
+                      fill='#1e3a5f', outline=colors['floor_outline'], width=2)
+        
+        # 绘制楼层和房间
+        floors = scene_data.get("floors", [])
+        for i, floor in enumerate(floors):
+            floor_y = start_y + i * floor_height
+            
+            # 绘制楼层分隔线
+            draw.line([(start_x, floor_y), (start_x + building_width, floor_y)], 
+                     fill=colors['floor_outline'], width=2)
+            
+            # 绘制房间区域（横向分布）
+            areas = floor.get("areas", [])
+            num_areas = len(areas)
+            if num_areas == 0:
+                continue
+                
+            room_width = (building_width - 100) / num_areas
+            room_start_x = start_x + 50
+            
+            for j, area in enumerate(areas):
+                room_x = room_start_x + j * room_width
+                room_y = floor_y + 5
+                room_h = floor_height - 10
+                
+                # 判断房间类型
+                room_color = colors['room_normal']
+                area_lower = area.lower()
+                
+                # 目标房间（常见关键词）
+                if any(keyword in area for keyword in ['404', '目标', '终点', '出口']):
+                    room_color = colors['room_target']
+                # 危险区域
+                elif any(keyword in area for keyword in ['锅炉', '停尸', '卫生间', '封拱门', '地下室', '地牢', '刑讯', '手术室']):
+                    room_color = colors['room_danger']
+                # 特殊区域
+                elif any(keyword in area for keyword in ['留声机', '钟楼', '管理员', '镜子', '图书馆', '档案', '实验室']):
+                    room_color = colors['room_special']
+                
+                # 绘制房间
+                draw.rectangle([room_x, room_y, room_x + room_width - 5, room_y + room_h], 
+                             fill=room_color, outline=colors['floor_outline'], width=1)
+                
+                # 绘制房间名称
+                area_text = area[:5] + '..' if len(area) > 5 else area
+                text_x = room_x + 5
+                text_y = room_y + room_h // 2 - 6
+                draw.text((text_x, text_y), area_text, fill=colors['text'], font=font_small)
+            
+            # 绘制楼层名称（左侧）
+            floor_name = floor.get("floor", f"第{i+1}层")
+            draw.text((start_x - 140, floor_y + floor_height // 2 - 8), 
+                     floor_name, fill=colors['text'], font=font_medium)
+        
+        # 绘制通道（垂直贯穿所有楼层）
+        # 主中央楼梯
+        stair_x = start_x + building_width * channels['main_staircase']
+        stair_width = 60
+        for i in range(len(floors)):
+            floor_y = start_y + i * floor_height
+            for step in range(8):
+                step_y = floor_y + 10 + step * 10
+                step_x = stair_x + (step % 2) * 15
+                draw.line([(step_x, step_y), (step_x + 30, step_y)], 
+                         fill=colors['staircase'], width=3)
+        
+        # 电梯A
+        elevator_a_x = start_x + building_width * channels['elevator_a']
+        elevator_width = 30
+        draw.rectangle([elevator_a_x, start_y, elevator_a_x + elevator_width, start_y + building_height], 
+                      fill=colors['elevator'], outline=colors['text'], width=2)
+        for i in range(len(floors)):
+            floor_y = start_y + i * floor_height
+            draw.line([(elevator_a_x, floor_y), (elevator_a_x + elevator_width, floor_y)], 
+                     fill=colors['text'], width=1)
+            draw.text((elevator_a_x + 5, floor_y + floor_height // 2 - 6), "电梯A", 
+                     fill=colors['text'], font=font_small)
+        
+        # 电梯B
+        elevator_b_x = start_x + building_width * channels['elevator_b']
+        draw.rectangle([elevator_b_x, start_y, elevator_b_x + elevator_width, start_y + building_height], 
+                      fill=colors['elevator'], outline=colors['text'], width=2)
+        for i in range(len(floors)):
+            floor_y = start_y + i * floor_height
+            draw.line([(elevator_b_x, floor_y), (elevator_b_x + elevator_width, floor_y)], 
+                     fill=colors['text'], width=1)
+            draw.text((elevator_b_x + 5, floor_y + floor_height // 2 - 6), "电梯B", 
+                     fill=colors['text'], font=font_small)
+        
+        # 后部紧急楼梯
+        emergency_x = start_x + building_width * channels['emergency_stair']
+        emergency_width = 50
+        draw.rectangle([emergency_x, start_y, emergency_x + emergency_width, start_y + building_height], 
+                      fill=colors['emergency_stair'], outline=colors['text'], width=2)
+        for i in range(len(floors)):
+            floor_y = start_y + i * floor_height
+            draw.line([(emergency_x, floor_y), (emergency_x + emergency_width, floor_y)], 
+                     fill=colors['text'], width=1)
+            draw.text((emergency_x + 5, floor_y + floor_height // 2 - 6), "紧急", 
+                     fill=colors['text'], font=font_small)
+        
+        # 通风管道（细长）
+        vent_x = start_x + building_width * channels['ventilation']
+        vent_width = 15
+        draw.rectangle([vent_x, start_y, vent_x + vent_width, start_y + building_height], 
+                      fill=colors['ventilation'], outline=colors['text'], width=1)
+        draw.text((vent_x - 10, start_y + building_height // 2), "通风", 
+                 fill=colors['text'], font=font_small, angle=90)
+        
+        # 绘制建筑外框（立体效果 - 前墙）
+        draw.rectangle([start_x, start_y, start_x + building_width, start_y + building_height], 
+                      outline=colors['floor_outline'], width=3)
+        
+        # 绘制地面线
+        draw.line([(start_x - 50, start_y + building_height), (start_x + building_width + 50, start_y + building_height)], 
+                 fill=colors['text'], width=2)
+        
+        # 绘制图例
+        legend_x = 50
+        legend_y = 80
+        legend_items = [
+            ("普通区域", colors['room_normal']),
+            ("关键区域", colors['room_special']),
+            ("危险区域", colors['room_danger']),
+            ("目标房间", colors['room_target']),
+            ("主楼梯", colors['staircase']),
+            ("电梯", colors['elevator']),
+            ("紧急楼梯", colors['emergency_stair']),
+            ("通风管道", colors['ventilation'])
+        ]
+        
+        draw.text((legend_x, legend_y), "图例：", fill=colors['text'], font=font_medium)
+        
+        for i, (label, color) in enumerate(legend_items):
+            item_y = legend_y + 30 + i * 28
+            draw.rectangle([legend_x, item_y, legend_x + 25, item_y + 20], fill=color, outline=color)
+            draw.text((legend_x + 35, item_y + 2), label, fill=colors['text'], font=font_small)
+        
+        # 绘制连接通道说明
+        connections = scene_data.get("connections", [])
+        conn_y = legend_y + 30 + len(legend_items) * 28 + 20
+        draw.text((legend_x, conn_y), "连接通道位置：", fill=colors['text'], font=font_medium)
+        
+        conn_info = [
+            "• 主中央楼梯：建筑中央偏左位置，贯穿所有楼层",
+            "• 电梯A & B：建筑中部，两台老式栅栏电梯",
+            "• 后部紧急楼梯：建筑右侧，紧急逃生通道",
+            "• 通风管道：建筑左侧，非常规连接通道"
+        ]
+        
+        for i, info in enumerate(conn_info):
+            draw.text((legend_x, conn_y + 25 + i * 18), info, fill=colors['text_dim'], font=font_small)
+        
+        # 绘制特殊区域说明
+        special_areas = scene_data.get("special_areas", [])
+        special_y = conn_y + 25 + len(conn_info) * 18 + 20
+        draw.text((legend_x, special_y), "特殊区域：", fill=colors['text'], font=font_medium)
+        
+        special_item_y = special_y + 25
+        for special in special_areas:
+            draw.text((legend_x, special_item_y), f"• {special}", fill=colors['text_dim'], font=font_small)
+            special_item_y += 18
+        
+        # 绘制尺寸标注
+        draw.line([(start_x, start_y + building_height + 20), (start_x + building_width, start_y + building_height + 20)], 
+                 fill=colors['text'], width=1)
+        draw.line([(start_x, start_y + building_height + 15), (start_x, start_y + building_height + 25)], 
+                 fill=colors['text'], width=1)
+        draw.line([(start_x + building_width, start_y + building_height + 15), (start_x + building_width, start_y + building_height + 25)], 
+                 fill=colors['text'], width=1)
+        draw.text((start_x + building_width // 2 - 30, start_y + building_height + 30), 
+                 "建筑宽度", fill=colors['text'], font=font_small)
+        
+        # 绘制高度标注
+        draw.line([(start_x - 30, start_y), (start_x - 30, start_y + building_height)], 
+                 fill=colors['text'], width=1)
+        draw.line([(start_x - 35, start_y), (start_x - 25, start_y)], 
+                 fill=colors['text'], width=1)
+        draw.line([(start_x - 35, start_y + building_height), (start_x - 25, start_y + building_height)], 
+                 fill=colors['text'], width=1)
+        draw.text((start_x - 100, start_y + building_height // 2 - 20), 
+                 "建筑高度", fill=colors['text'], font=font_small, angle=90)
+        
+        # 生成输出路径
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f'scene_structure_{timestamp}.png')
+        
+        # 保存图片
+        img.save(output_path, 'PNG')
+        print(f"[规则怪谈] 立体剖面图已生成：{output_path}")
+        
+        return output_path
+
+    def _generate_plot_image(self, scene_name, background, player_reason, core_symbols=None, output_path=None):
+        """生成剧情导入长图（黑暗背景+鲜红字体）
+        
+        Args:
+            scene_name: 场景名称
+            background: 背景故事
+            player_reason: 玩家到来原因
+            core_symbols: 核心象征符号列表
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        # 尝试加载中文字体
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 36)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 28)
+            font_normal = ImageFont.truetype("msyh.ttc", 20)
+            font_small = ImageFont.truetype("msyh.ttc", 16)
+        except:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 36)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 28)
+                font_normal = ImageFont.truetype("simhei.ttf", 20)
+                font_small = ImageFont.truetype("simhei.ttf", 16)
+            except:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+        
+        # 预估图片高度
+        margin = 60
+        title_height = 80
+        section_height = 50
+        line_height = 30
+        char_per_line = 30
+        
+        # 计算背景故事需要的行数
+        bg_lines = []
+        for i in range(0, len(background), char_per_line):
+            bg_lines.append(background[i:i+char_per_line])
+        
+        # 计算玩家原因需要的行数
+        reason_lines = []
+        for i in range(0, len(player_reason), char_per_line):
+            reason_lines.append(player_reason[i:i+char_per_line])
+        
+        # 计算总高度
+        total_height = (margin * 2 + title_height + section_height + 
+                       len(bg_lines) * line_height + section_height + 
+                       len(reason_lines) * line_height + 50)
+        
+        # 创建图片（黑暗背景）
+        width = 900
+        img = Image.new('RGB', (width, total_height), color='#0a0a0a')
+        draw = ImageDraw.Draw(img)
+        
+        # 绘制标题（动态居中）
+        title_text = "规则怪谈"
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, margin), title_text, fill='#8B0000', font=font_title)
+        
+        # 绘制场景名称（动态居中）
+        scene_bbox = draw.textbbox((0, 0), scene_name, font=font_subtitle)
+        scene_width = scene_bbox[2] - scene_bbox[0]
+        scene_x = (width - scene_width) // 2
+        draw.text((scene_x, margin + 50), scene_name, fill='#DC143C', font=font_subtitle)
+        
+        # 绘制分隔线
+        draw.line([(margin, margin + 100), (width - margin, margin + 100)], fill='#8B0000', width=2)
+        
+        # 绘制背景故事
+        current_y = margin + 130
+        draw.text((margin, current_y), "剧情导入", fill='#DC143C', font=font_subtitle)
+        current_y += section_height
+        for line in bg_lines:
+            draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+            current_y += line_height
+        
+        # 绘制玩家到来原因
+        current_y += 20
+        draw.text((margin, current_y), "你的到来", fill='#DC143C', font=font_subtitle)
+        current_y += section_height
+        for line in reason_lines:
+            draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+            current_y += line_height
+        
+        # 生成输出路径
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f'plot_{timestamp}.png')
+        
+        # 保存图片
+        img.save(output_path, 'PNG')
+        print(f"[规则怪谈] 剧情导入长图已生成：{output_path}")
+        
+        return output_path
+
+    def _generate_scene_structure_text_image(self, building_type, overall_layout, floors, connections, special_areas, output_path=None):
+        """生成场景结构文字长图（白底黑字）
+        
+        Args:
+            building_type: 建筑类型
+            overall_layout: 总体布局
+            floors: 楼层列表
+            connections: 连接通道列表
+            special_areas: 特殊区域列表
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        # 尝试加载中文字体
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 32)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 24)
+            font_normal = ImageFont.truetype("msyh.ttc", 18)
+        except:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 32)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 24)
+                font_normal = ImageFont.truetype("simhei.ttf", 18)
+            except:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+        
+        # 预估图片高度
+        margin = 50
+        title_height = 70
+        section_height = 45
+        line_height = 28
+        char_per_line = 35
+        
+        # 计算总体布局需要的行数
+        layout_lines = []
+        for i in range(0, len(overall_layout), char_per_line):
+            layout_lines.append(overall_layout[i:i+char_per_line])
+        
+        # 计算楼层布局需要的行数
+        floor_lines = []
+        for floor in floors:
+            floor_name = floor.get('floor', '')
+            areas = floor.get('areas', [])
+            floor_text = f"  - {floor_name}: {', '.join(areas)}"
+            for i in range(0, len(floor_text), char_per_line):
+                floor_lines.append(floor_text[i:i+char_per_line])
+        
+        # 计算连接通道需要的行数
+        conn_text = f"连接通道：{', '.join(connections)}"
+        conn_lines = []
+        for i in range(0, len(conn_text), char_per_line):
+            conn_lines.append(conn_text[i:i+char_per_line])
+        
+        # 计算特殊区域需要的行数
+        special_text = f"特殊区域：{', '.join(special_areas)}"
+        special_lines = []
+        for i in range(0, len(special_text), char_per_line):
+            special_lines.append(special_text[i:i+char_per_line])
+        
+        # 计算总高度
+        total_height = (margin * 2 + title_height + section_height + 
+                       len(layout_lines) * line_height + section_height + 
+                       len(floor_lines) * line_height + section_height + 
+                       len(conn_lines) * line_height + section_height + 
+                       len(special_lines) * line_height + 100)
+        
+        # 创建图片（白底黑字）
+        width = 900
+        img = Image.new('RGB', (width, total_height), color='#FFFFFF')
+        draw = ImageDraw.Draw(img)
+        
+        # 绘制标题（居中）
+        title_text = "场景结构"
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, margin), title_text, fill='#000000', font=font_title)
+        
+        # 绘制分隔线
+        draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#000000', width=2)
+        
+        # 绘制建筑类型
+        current_y = margin + 100
+        draw.text((margin, current_y), f"建筑类型：{building_type}", fill='#000000', font=font_subtitle)
+        
+        # 绘制总体布局
+        current_y += section_height
+        draw.text((margin, current_y), "总体布局", fill='#000000', font=font_subtitle)
+        current_y += section_height
+        for line in layout_lines:
+            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
+            current_y += line_height
+        
+        # 绘制楼层布局
+        current_y += 20
+        draw.text((margin, current_y), "楼层布局", fill='#000000', font=font_subtitle)
+        current_y += section_height
+        for line in floor_lines:
+            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
+            current_y += line_height
+        
+        # 绘制连接通道
+        current_y += 20
+        draw.text((margin, current_y), "连接通道", fill='#000000', font=font_subtitle)
+        current_y += section_height
+        for line in conn_lines:
+            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
+            current_y += line_height
+        
+        # 绘制特殊区域
+        current_y += 20
+        draw.text((margin, current_y), "特殊区域", fill='#000000', font=font_subtitle)
+        current_y += section_height
+        for line in special_lines:
+            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
+            current_y += line_height
+        
+        # 生成输出路径
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f'scene_structure_text_{timestamp}.png')
+        
+        # 保存图片
+        img.save(output_path, 'PNG')
+        print(f"[规则怪谈] 场景结构文字长图已生成：{output_path}")
+        
+        return output_path
+
+    def _generate_rules_image(self, rules_title, rules, win_condition, game_mode="单人", output_path=None):
+        """生成规则长图（黑暗背景+鲜红字体）
+        
+        Args:
+            rules_title: 规则标题
+            rules: 规则列表
+            win_condition: 通关条件
+            game_mode: 游戏模式（单人/多人）
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        # 尝试加载中文字体
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 36)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 28)
+            font_normal = ImageFont.truetype("msyh.ttc", 20)
+        except:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 36)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 28)
+                font_normal = ImageFont.truetype("simhei.ttf", 20)
+            except:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+        
+        # 预估图片高度
+        margin = 60
+        title_height = 80
+        section_height = 50
+        line_height = 30
+        char_per_line = 30
+        
+        # 计算规则需要的行数
+        rule_lines = []
+        for i, rule in enumerate(rules, 1):
+            rule_text = f"{i}. {rule}"
+            for j in range(0, len(rule_text), char_per_line):
+                rule_lines.append(rule_text[j:j+char_per_line])
+        
+        # 计算通关条件需要的行数
+        goal_prefix = "你的目标是" if game_mode == "单人" else "你们的目标是"
+        goal_text = f"{goal_prefix}：{win_condition}"
+        goal_lines = []
+        for i in range(0, len(goal_text), char_per_line):
+            goal_lines.append(goal_text[i:i+char_per_line])
+        
+        # 计算总高度
+        total_height = (margin * 2 + title_height + section_height + 
+                       len(rule_lines) * line_height + section_height + 
+                       len(goal_lines) * line_height + 50)
+        
+        # 创建图片（黑暗背景）
+        width = 900
+        img = Image.new('RGB', (width, total_height), color='#0a0a0a')
+        draw = ImageDraw.Draw(img)
+        
+        # 绘制标题（动态居中）
+        title_bbox = draw.textbbox((0, 0), rules_title, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, margin), rules_title, fill='#8B0000', font=font_title)
+        
+        # 绘制分隔线
+        draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#8B0000', width=2)
+        
+        # 绘制规则
+        current_y = margin + 110
+        for line in rule_lines:
+            draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+            current_y += line_height
+        
+        # 绘制通关条件
+        current_y += 30
+        draw.line([(margin, current_y), (width - margin, current_y)], fill='#8B0000', width=2)
+        current_y += section_height
+        for line in goal_lines:
+            draw.text((margin, current_y), line, fill='#DC143C', font=font_subtitle)
+            current_y += line_height
+        
+        # 生成输出路径
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f'rules_{timestamp}.png')
+        
+        # 保存图片
+        img.save(output_path, 'PNG')
+        print(f"[规则怪谈] 规则长图已生成：{output_path}")
+        
+        return output_path
+
+    def _generate_multiplayer_start_image(self, max_players=5, output_path=None):
+        """生成多人模式游戏开始提示长图（黑暗背景+鲜红字体）
+        
+        Args:
+            max_players: 最大玩家数
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 36)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 28)
+            font_normal = ImageFont.truetype("msyh.ttc", 20)
+        except:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 36)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 28)
+                font_normal = ImageFont.truetype("simhei.ttf", 20)
+            except:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+        
+        margin = 60
+        title_height = 80
+        section_height = 50
+        line_height = 35
+        
+        commands = [
+            "使用 `/rg 加入` 加入游戏",
+            "使用 `/rg 提示 <规则/线索>` 获取提示",
+            "使用 `/rg 推理 <推理内容>` 记录推理",
+            "使用 `/rg 行动 <行动描述>` 描述行动",
+            "使用 `/rg 状态` 查看游戏状态",
+            "使用 `/rg 结束` 结束游戏"
+        ]
+        
+        total_height = margin * 2 + title_height + section_height * 2 + len(commands) * line_height + 50
+        
+        width = 900
+        img = Image.new('RGB', (width, total_height), color='#0a0a0a')
+        draw = ImageDraw.Draw(img)
+        
+        # 绘制标题（动态居中）
+        title_text = "多人模式"
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, margin), title_text, fill='#8B0000', font=font_title)
+        
+        draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#8B0000', width=2)
+        
+        current_y = margin + 110
+        draw.text((margin, current_y), f"玩家：0/{max_players}", fill='#DC143C', font=font_subtitle)
+        current_y += section_height
+        draw.text((margin, current_y), "提示次数：0/3", fill='#DC143C', font=font_subtitle)
+        
+        current_y += 30
+        draw.line([(margin, current_y), (width - margin, current_y)], fill='#8B0000', width=2)
+        current_y += section_height
+        
+        for command in commands:
+            draw.text((margin, current_y), command, fill='#FF0000', font=font_normal)
+            current_y += line_height
+        
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f'multiplayer_start_{timestamp}.png')
+        
+        img.save(output_path, 'PNG')
+        print(f"[规则怪谈] 多人模式开始提示长图已生成：{output_path}")
+        
+        return output_path
