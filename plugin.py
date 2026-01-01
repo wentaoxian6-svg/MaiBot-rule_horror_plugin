@@ -4831,10 +4831,9 @@ class RuleHorrorCommand(BaseCommand):
         
         # 计算通关条件需要的行数
         goal_prefix = "你的目标是" if game_mode == "单人" else "你们的目标是"
-        goal_text = f"{goal_prefix}：{win_condition}"
-        goal_lines = []
-        for i in range(0, len(goal_text), char_per_line):
-            goal_lines.append(goal_text[i:i+char_per_line])
+        goal_lines = [f"{goal_prefix}："]
+        for i in range(0, len(win_condition), char_per_line):
+            goal_lines.append(win_condition[i:i+char_per_line])
         
         # 计算总高度
         total_height = (margin * 2 + title_height + section_height + 
