@@ -748,7 +748,8 @@ class RuleHorrorCommand(BaseCommand):
                 "rule_dependencies": [],
                 "discovered_truths": []
             },
-            "collaborative_events": []
+            "collaborative_events": [],
+            "action_image_paths": []
         }
 
         self._save_game_state(group_id)
@@ -1206,12 +1207,10 @@ class RuleHorrorCommand(BaseCommand):
 玩家推理记录：{json.dumps(all_reasoning[-10:] if len(all_reasoning) > 10 else all_reasoning, ensure_ascii=False)}
 已过时间：{elapsed_minutes}分钟
 
-判断标准（根据玩家的推理、行动和剧情推进来判断是否需要规则变化）：
+判断标准（根据剧情推进来判断是否需要规则变化）：
 1. **贴合剧情推进**：规则变化应该与当前的剧情发展相匹配，在合适的时机出现
-2. **玩家行为相关性**：玩家的行动或推理是否触发了场景中的某些机制或发现了重要信息
-3. **发现的合理性**：玩家发现的物品、信息或触发的事件应该能够自然地引出规则变化
-4. **增强紧张感**：规则变化应该能够增强游戏的紧张感和悬疑感，让玩家感到不安
-5. **引导探索**：规则变化应该能够引导玩家继续探索，而非简单的限制
+2. **发现的合理性**：玩家发现的物品、信息或触发的事件应该能够自然地引出规则变化
+3. **增强紧张感**：规则变化应该能够增强游戏的紧张感和悬疑感，让玩家感到不安
 
 **特别注意**：
 - 仅仅发现普通物品（如笔记本、钥匙、工具等）不足以触发规则变化，除非这些物品包含了重要信息
@@ -1219,6 +1218,7 @@ class RuleHorrorCommand(BaseCommand):
 - 仅仅进行常规探索或观察不足以触发规则变化
 - 规则变化应该让玩家感到"原来如此"或"事情不对劲"，而非"怎么又变了"
 - 规则变化不是必须的，如果当前剧情不需要规则变化，就不要强行变化
+- **规则变化与玩家是否推理出规则的影响无关，玩家没推理出来就没推理出来，不要为了引导玩家而变化规则**
 
 如果规则变化是必要的，请详细说明原因；如果不需要变化，请详细说明为什么当前不需要变化。
 
@@ -1316,20 +1316,6 @@ class RuleHorrorCommand(BaseCommand):
                                 await asyncio.sleep(0.5)
             except json.JSONDecodeError:
                 print(f"[规则怪谈] 规则变异响应解析失败")
-
-    async def _check_random_mutation(self, group_id: str, api_url: str, api_key: str, model: str, temperature: float, elapsed_minutes: int) -> None:
-        """检查是否触发随机规则变异"""
-        game_state = game_states.get(group_id, {})
-        if game_state.get("sanity_break", False):
-            return
-        
-        last_mutation_time = game_state.get("last_mutation_time", 0)
-        time_since_last_mutation = elapsed_minutes - last_mutation_time
-        
-        if time_since_last_mutation < 10:
-            return
-        
-        await self._trigger_rule_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes, trigger_reason="随机")
 
     async def _detect_identity_change(self, group_id: str, user_id: str, action: str, scene_description: str, api_url: str, api_key: str, model: str, temperature: float) -> Optional[str]:
         """检测玩家身份是否发生变化"""
@@ -2009,6 +1995,9 @@ class RuleHorrorCommand(BaseCommand):
                     await asyncio.sleep(1.0)
                 
                 game_state["action_image_path"] = action_image_path
+                if "action_image_paths" not in game_state:
+                    game_state["action_image_paths"] = []
+                game_state["action_image_paths"].append(action_image_path)
             except Exception as e:
                 print(f"[规则怪谈] 生成行动结果长图失败: {str(e)}")
                 reply_text = (
@@ -2062,6 +2051,9 @@ class RuleHorrorCommand(BaseCommand):
                     await asyncio.sleep(1.0)
                 
                 game_state["action_image_path"] = action_image_path
+                if "action_image_paths" not in game_state:
+                    game_state["action_image_paths"] = []
+                game_state["action_image_paths"].append(action_image_path)
             except Exception as e:
                 print(f"[规则怪谈] 生成行动结果长图失败: {str(e)}")
                 reply_text = (
@@ -2123,8 +2115,6 @@ class RuleHorrorCommand(BaseCommand):
         
         if key_item_found and not game_state.get("sanity_break", False) and not new_identity:
             await self._trigger_rule_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes, trigger_reason="关键物品")
-        elif not game_state.get("sanity_break", False) and not new_identity:
-            await self._check_random_mutation(group_id, api_url, api_key, model, temperature, elapsed_minutes)
 
     async def _process_multiplayer_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model: str, temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
         """处理多人模式下的玩家行动，为每个玩家生成个性化场景描述"""
@@ -2553,6 +2543,9 @@ class RuleHorrorCommand(BaseCommand):
                         await asyncio.sleep(1.0)
                     
                     game_state["action_image_path"] = action_image_path
+                    if "action_image_paths" not in game_state:
+                        game_state["action_image_paths"] = []
+                    game_state["action_image_paths"].append(action_image_path)
                     
                     try:
                         if action_image_path and os.path.exists(action_image_path):
@@ -2606,6 +2599,9 @@ class RuleHorrorCommand(BaseCommand):
                         await asyncio.sleep(1.0)
                     
                     game_state["action_image_path"] = action_image_path
+                    if "action_image_paths" not in game_state:
+                        game_state["action_image_paths"] = []
+                    game_state["action_image_paths"].append(action_image_path)
                 except Exception as e:
                     print(f"[规则怪谈] 生成行动结果长图失败: {str(e)}")
                     reply_text = (
@@ -3108,6 +3104,15 @@ class RuleHorrorCommand(BaseCommand):
                 print(f"[规则怪谈] 已删除行动结果长图：{action_image_path}")
             except Exception as e:
                 print(f"[规则怪谈] 删除行动结果长图失败: {str(e)}")
+        
+        action_image_paths = game_state.get("action_image_paths", [])
+        for img_path in action_image_paths:
+            if img_path and os.path.exists(img_path):
+                try:
+                    os.remove(img_path)
+                    print(f"[规则怪谈] 已删除行动图片：{img_path}")
+                except Exception as e:
+                    print(f"[规则怪谈] 删除行动图片失败: {str(e)}")
         
         self._delete_save_file(group_id)
         
@@ -4233,6 +4238,15 @@ class RuleHorrorCommand(BaseCommand):
                     print(f"[规则怪谈] 已删除多人模式提示长图：{multiplayer_start_image_path}")
                 except Exception as e:
                     print(f"[规则怪谈] 删除多人模式提示长图失败: {str(e)}")
+            
+            action_image_paths = game_state.get("action_image_paths", [])
+            for img_path in action_image_paths:
+                if img_path and os.path.exists(img_path):
+                    try:
+                        os.remove(img_path)
+                        print(f"[规则怪谈] 已删除行动图片：{img_path}")
+                    except Exception as e:
+                        print(f"[规则怪谈] 删除行动图片失败: {str(e)}")
             
             self._delete_save_file(group_id)
         else:
