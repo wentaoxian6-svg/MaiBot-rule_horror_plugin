@@ -4678,14 +4678,14 @@ class RuleHorrorCommand(BaseCommand):
                 font_normal = ImageFont.load_default()
         
         # 预估图片高度
-        margin = 50
+        margin = 30
         title_height = 70
         section_height = 45
         line_height = 28
         # 分割线长度
         line_length = 900 - 2 * margin
         # 每行字符数（根据字体大小估算，确保文本宽度与分割线一致）
-        char_per_line = 45
+        char_per_line = 50
         
         # 计算总体布局需要的行数
         layout_lines = []
