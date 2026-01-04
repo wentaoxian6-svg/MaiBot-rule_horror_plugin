@@ -532,6 +532,7 @@ class RuleHorrorCommand(BaseCommand):
 
         await asyncio.sleep(0.5)
          
+        image_sent_successfully = False
         try:
             scene_structure_image_path = self._generate_scene_structure_text_image(
                 building_type, overall_layout, floors, connections, special_areas
@@ -542,6 +543,8 @@ class RuleHorrorCommand(BaseCommand):
             image_sent = await self.send_image(image_base64)
             if not image_sent:
                 print(f"[规则怪谈] 场景结构图片发送失败")
+            else:
+                image_sent_successfully = True
             await asyncio.sleep(0.5)
              
             game_state = game_states.get(group_id, {})
@@ -550,7 +553,8 @@ class RuleHorrorCommand(BaseCommand):
         except Exception as e:
             print(f"[规则怪谈] 生成场景结构长图失败: {str(e)}")
 
-        step2_text = f"""**场景结构**：
+        if not image_sent_successfully:
+            step2_text = f"""**场景结构**：
 
 **建筑类型**：{building_type}
 
@@ -562,8 +566,8 @@ class RuleHorrorCommand(BaseCommand):
 **连接通道**：{connections_text}
 
 **特殊区域**：{special_areas_text}"""
-        await self.send_text(step2_text)
-        await asyncio.sleep(0.5)
+            await self.send_text(step2_text)
+            await asyncio.sleep(0.5)
 
         scene_structure_text = f"建筑类型：{building_type}\n"
         scene_structure_text += "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
