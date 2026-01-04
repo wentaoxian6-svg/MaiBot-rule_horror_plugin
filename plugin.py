@@ -527,6 +527,8 @@ class RuleHorrorCommand(BaseCommand):
         special_areas = step2_data.get("special_areas", [])
 
         floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+        connections_text = ", ".join(connections)
+        special_areas_text = ", ".join(special_areas)
 
         await asyncio.sleep(0.5)
          
@@ -547,9 +549,6 @@ class RuleHorrorCommand(BaseCommand):
             self._save_game_state(group_id)
         except Exception as e:
             print(f"[规则怪谈] 生成场景结构长图失败: {str(e)}")
-            floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
-            connections_text = ", ".join(connections)
-            special_areas_text = ", ".join(special_areas)
 
         step2_text = f"""**场景结构**：
 
