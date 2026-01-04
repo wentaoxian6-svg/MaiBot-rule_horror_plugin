@@ -316,7 +316,7 @@ class RuleHorrorCommand(BaseCommand):
                 await self.send_text("你尚未达成通关条件，无法继续探索。")
                 return False, "未通关", True
 
-            return await self._continue_to_perfect(group_id, api_url, api_key, model, temperature)
+            return await self._continue_to_perfect(group_id, api_url, api_key, model_list, current_model_index, temperature)
 
         elif action == "结束":
             if not game_state.get("game_active", False):
@@ -405,7 +405,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
@@ -494,7 +494,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
@@ -548,6 +548,8 @@ class RuleHorrorCommand(BaseCommand):
         except Exception as e:
             print(f"[规则怪谈] 生成场景结构长图失败: {str(e)}")
             floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
+            connections_text = ", ".join(connections)
+            special_areas_text = ", ".join(special_areas)
 
         step2_text = f"""**场景结构**：
 
@@ -647,7 +649,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
@@ -1088,7 +1090,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回线索内容，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
             """
 
-        llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
@@ -1166,7 +1168,7 @@ class RuleHorrorCommand(BaseCommand):
 
         await self.send_text(reply_text)
         
-        await self._check_clear_condition(group_id, api_url, api_key, model, temperature)
+        await self._check_clear_condition(group_id, api_url, api_key, model_list, current_model_index, temperature)
         
         return True, "已记录推理", True
 
@@ -1219,7 +1221,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
         
-        evaluation_response = await self._call_llm_api(evaluation_prompt, api_url, api_key, model, temperature)
+        evaluation_response = await self._call_llm_api(evaluation_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not evaluation_response:
             return
         
@@ -1264,7 +1266,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
         
-        mutation_response = await self._call_llm_api(mutation_prompt, api_url, api_key, model, temperature)
+        mutation_response = await self._call_llm_api(mutation_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if mutation_response:
             try:
                 mutation_data = json.loads(mutation_response)
@@ -1343,7 +1345,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
         
-        response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not response:
             return None
         
@@ -1396,7 +1398,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
         
-        response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not response:
             return []
         
@@ -1461,10 +1463,11 @@ class RuleHorrorCommand(BaseCommand):
             config = self.get_config()
             api_url = config.get("llm", {}).get("api_url", "")
             api_key = config.get("llm", {}).get("api_key", "")
-            model = config.get("llm", {}).get("model", "")
+            model_list = config.get("llm", {}).get("model_list", ["deepseek-ai/DeepSeek-V3"])
+            current_model_index = config.get("llm", {}).get("current_model_index", 0)
             temperature = config.get("llm", {}).get("temperature", 0.8)
             
-            llm_response = await self._call_llm_api(truth_analysis_prompt, api_url, api_key, model, temperature)
+            llm_response = await self._call_llm_api(truth_analysis_prompt, api_url, api_key, model_list, current_model_index, temperature)
             
             if llm_response:
                 try:
@@ -1870,7 +1873,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
             """
 
-        llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return
@@ -2087,7 +2090,7 @@ class RuleHorrorCommand(BaseCommand):
                     "trigger_action": action
                 })
                 
-                new_rules = await self._generate_identity_specific_rules(group_id, new_identity, api_url, api_key, model, temperature)
+                new_rules = await self._generate_identity_specific_rules(group_id, new_identity, api_url, api_key, model_list, current_model_index, temperature)
                 if new_rules:
                     old_rules = game_state.get("rules", [])
                     game_state["rule_mutations"].append({
@@ -2422,7 +2425,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
                 """
 
-            llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+            llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
             if not llm_response:
                 continue
 
@@ -2638,7 +2641,7 @@ class RuleHorrorCommand(BaseCommand):
                     "trigger_action": action
                 })
                 
-                new_rules = await self._generate_identity_specific_rules(group_id, new_identity, api_url, api_key, model, temperature)
+                new_rules = await self._generate_identity_specific_rules(group_id, new_identity, api_url, api_key, model_list, current_model_index, temperature)
                 if new_rules:
                     old_rules = game_state.get("rules", [])
                     game_state["rule_mutations"].append({
@@ -2713,7 +2716,7 @@ class RuleHorrorCommand(BaseCommand):
         """
         
         try:
-            llm_response = await self._call_llm_api(collaborative_check_prompt, api_url, api_key, model, temperature)
+            llm_response = await self._call_llm_api(collaborative_check_prompt, api_url, api_key, model_list, current_model_index, temperature)
             if not llm_response:
                 return
             
@@ -3480,7 +3483,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
@@ -3569,7 +3572,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
@@ -3702,7 +3705,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
@@ -3992,7 +3995,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             return
         
@@ -4026,7 +4029,7 @@ class RuleHorrorCommand(BaseCommand):
             )
             await self.send_text(reply_text)
 
-    async def _continue_to_perfect(self, group_id: str, api_url: str, api_key: str, model: str, temperature: float) -> Tuple[bool, Optional[str], bool]:
+    async def _continue_to_perfect(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], bool]:
         """继续探索完美结局"""
         game_state = game_states.get(group_id, {})
         
@@ -4086,7 +4089,7 @@ class RuleHorrorCommand(BaseCommand):
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
 
-        llm_response = await self._call_llm_api(prompt, api_url, api_key, model, temperature)
+        llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
             return False, "LLM API调用失败", True
