@@ -4541,29 +4541,29 @@ class RuleHorrorCommand(BaseCommand):
         else:
             insanity_level = (10 - sanity) / 10.0 * 0.33 + 0.67
         
-        # 效果1：红色涂鸦遮盖
-        if random.random() < 0.3 * insanity_level:
-            num_scribbles = random.randint(1, 3)
-            for _ in range(num_scribbles):
-                x1 = random.randint(50, width - 50)
-                y1 = random.randint(100, height - 100)
-                x2 = x1 + random.randint(50, 150)
-                y2 = y1 + random.randint(10, 30)
-                alpha = int(100 * insanity_level)
-                draw.rectangle([x1, y1, x2, y2], fill=(255, 0, 0, alpha))
+        # 效果1：红色涂鸦遮盖（根据insanity_level控制数量和大小）
+        num_scribbles = int(1 + 3 * insanity_level)
+        for _ in range(num_scribbles):
+            x1 = random.randint(50, width - 50)
+            y1 = random.randint(100, height - 100)
+            scribble_width = int(50 + 100 * insanity_level)
+            scribble_height = int(10 + 20 * insanity_level)
+            x2 = x1 + scribble_width
+            y2 = y1 + scribble_height
+            alpha = int(50 + 100 * insanity_level)
+            draw.rectangle([x1, y1, x2, y2], fill=(255, 0, 0, alpha))
         
-        # 效果2：红色斜线遮盖
-        if random.random() < 0.25 * insanity_level:
-            num_lines = random.randint(1, 2)
-            for _ in range(num_lines):
-                y = random.randint(150, height - 150)
-                draw.line([(50, y), (width - 50, y)], fill=(255, 0, 0), width=3)
+        # 效果2：红色斜线遮盖（根据insanity_level控制数量）
+        num_lines = int(1 + 2 * insanity_level)
+        for _ in range(num_lines):
+            y = random.randint(150, height - 150)
+            line_width = int(2 + 3 * insanity_level)
+            draw.line([(50, y), (width - 50, y)], fill=(255, 0, 0), width=line_width)
         
-        # 效果3：模糊效果
-        if random.random() < 0.2 * insanity_level:
-            blur_radius = int(2 * insanity_level)
-            img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-            draw = ImageDraw.Draw(img)
+        # 效果3：模糊效果（根据insanity_level控制模糊程度）
+        blur_radius = int(1 + 3 * insanity_level)
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        draw = ImageDraw.Draw(img)
         
         return img, draw
 
@@ -4591,32 +4591,32 @@ class RuleHorrorCommand(BaseCommand):
         else:
             insanity_level = (10 - sanity) / 10.0 * 0.33 + 0.67
         
-        # 效果1：插入乱码符号
-        if random.random() < 0.15 * insanity_level:
-            symbols = ['#', '@', '$', '%', '^', '&', '*', '!', '?', '~']
-            num_insertions = random.randint(1, 2)
-            text_list = list(text)
-            for _ in range(num_insertions):
-                pos = random.randint(0, len(text_list))
-                text_list.insert(pos, random.choice(symbols))
-            text = ''.join(text_list)
+        # 效果1：插入乱码符号（根据insanity_level控制数量）
+        symbols = ['#', '@', '$', '%', '^', '&', '*', '!', '?', '~']
+        num_insertions = int(1 + 3 * insanity_level)
+        text_list = list(text)
+        for _ in range(num_insertions):
+            pos = random.randint(0, len(text_list))
+            text_list.insert(pos, random.choice(symbols))
+        text = ''.join(text_list)
         
-        # 效果2：重复词语（针对中文）
-        if random.random() < 0.1 * insanity_level:
-            words = re.findall(r'[\u4e00-\u9fff]+', text)
-            if words:
-                word_to_repeat = random.choice(words)
-                if len(word_to_repeat) >= 2:
-                    repeat_count = random.randint(2, 3)
-                    text = text.replace(word_to_repeat, word_to_repeat * repeat_count, 1)
+        # 效果2：重复词语（针对中文，根据insanity_level控制重复次数）
+        words = re.findall(r'[\u4e00-\u9fff]+', text)
+        if words:
+            word_to_repeat = random.choice(words)
+            if len(word_to_repeat) >= 2:
+                repeat_count = int(2 + 2 * insanity_level)
+                text = text.replace(word_to_repeat, word_to_repeat * repeat_count, 1)
         
-        # 效果3：字符错位（随机交换相邻字符）
-        if random.random() < 0.1 * insanity_level:
-            text_list = list(text)
-            for i in range(0, len(text_list) - 1, random.randint(5, 10)):
-                if i + 1 < len(text_list):
-                    text_list[i], text_list[i + 1] = text_list[i + 1], text_list[i]
-            text = ''.join(text_list)
+        # 效果3：字符错位（随机交换相邻字符，根据insanity_level控制交换频率）
+        text_list = list(text)
+        step = int(10 - 7 * insanity_level)
+        if step < 2:
+            step = 2
+        for i in range(0, len(text_list) - 1, step):
+            if i + 1 < len(text_list):
+                text_list[i], text_list[i + 1] = text_list[i + 1], text_list[i]
+        text = ''.join(text_list)
         
         return text
 
@@ -5026,10 +5026,14 @@ class RuleHorrorCommand(BaseCommand):
         # 每行字符数（根据字体大小估算，确保文本宽度与分割线一致）
         char_per_line = 45
         
-        content_lines = []
-        
         # 理智崩坏模式（sanity=0）：只显示对话内容，隐藏所有状态栏
         is_insane_mode = (sanity == 0 and not is_dead)
+        
+        # 理智崩坏模式使用更大的字体，需要减少每行字符数
+        if is_insane_mode:
+            char_per_line = 35
+        
+        content_lines = []
         
         if is_dead:
             content_lines.append(f"行动结果 - {user_name}")
