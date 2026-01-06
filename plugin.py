@@ -2110,7 +2110,7 @@ class RuleHorrorCommand(BaseCommand):
             await self._trigger_rule_mutation(group_id, api_url, api_key, model_list, current_model_index, temperature, elapsed_minutes, trigger_reason="关键物品")
 
     async def _process_multiplayer_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
-        """处理多人模式下的玩家行动，为每个玩家生成个性化场景描述"""
+        """处理多人模式下的玩家行动，只为行动玩家生成行动结果"""
         game_state = game_states.get(group_id, {})
         players = game_state.get("players", {})
         action_player_data = players.get(user_id, {})
@@ -2503,127 +2503,139 @@ class RuleHorrorCommand(BaseCommand):
                 players[pid] = player_data
                 self._save_game_state(group_id)
                 
-                await self.send_text("行动中...")
-                
-                try:
-                    action_image_path = self._generate_action_result_image(
-                        user_name=current_player_name,
-                        action=f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}",
-                        is_dead=True,
-                        scene_description=scene_description,
-                        action_feedback=action_feedback,
-                        health=0,
-                        injury=injury,
-                        fatigue=fatigue,
-                        sanity=0,
-                        state="死亡",
-                        emotion="无",
-                        fear_level=100,
-                        anxiety_level=100,
-                        stress_level=100,
-                        found_items=[],
-                        new_location="未知",
-                        random_event=""
-                    )
-                    
-                    with open(action_image_path, 'rb') as img_file:
-                        image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
-                    
-                    image_sent = await self.send_image(image_base64)
-                    if not image_sent:
-                        print(f"[规则怪谈] 死亡玩家行动图片发送失败")
-                    else:
-                        await asyncio.sleep(1.0)
-                    
-                    game_state["action_image_path"] = action_image_path
-                    if "action_image_paths" not in game_state:
-                        game_state["action_image_paths"] = []
-                    game_state["action_image_paths"].append(action_image_path)
+                if is_action_player:
+                    await self.send_text("行动中...")
                     
                     try:
-                        if action_image_path and os.path.exists(action_image_path):
-                            os.remove(action_image_path)
-                            print(f"[规则怪谈] 已删除死亡玩家的行动图片：{action_image_path}")
+                        action_image_path = self._generate_action_result_image(
+                            user_name=current_player_name,
+                            action=f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}",
+                            is_dead=True,
+                            scene_description=scene_description,
+                            action_feedback=action_feedback,
+                            health=0,
+                            injury=injury,
+                            fatigue=fatigue,
+                            sanity=0,
+                            state="死亡",
+                            emotion="无",
+                            fear_level=100,
+                            anxiety_level=100,
+                            stress_level=100,
+                            found_items=[],
+                            new_location="未知",
+                            random_event=""
+                        )
+                        
+                        with open(action_image_path, 'rb') as img_file:
+                            image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                        
+                        image_sent = await self.send_image(image_base64)
+                        if not image_sent:
+                            print(f"[规则怪谈] 死亡玩家行动图片发送失败")
+                        else:
+                            await asyncio.sleep(1.0)
+                        
+                        game_state["action_image_path"] = action_image_path
+                        if "action_image_paths" not in game_state:
+                            game_state["action_image_paths"] = []
+                        game_state["action_image_paths"].append(action_image_path)
+                        
+                        try:
+                            if action_image_path and os.path.exists(action_image_path):
+                                os.remove(action_image_path)
+                                print(f"[规则怪谈] 已删除死亡玩家的行动图片：{action_image_path}")
+                        except Exception as e:
+                            print(f"[规则怪谈] 删除死亡玩家行动图片失败: {str(e)}")
                     except Exception as e:
-                        print(f"[规则怪谈] 删除死亡玩家行动图片失败: {str(e)}")
-                except Exception as e:
-                    print(f"[规则怪谈] 生成行动结果长图失败: {str(e)}")
+                        print(f"[规则怪谈] 生成行动结果长图失败: {str(e)}")
+                        reply_text = (
+                            f"**行动结果** - {current_player_name}\n\n"
+                            f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}\n\n"
+                            f"**你已死亡**！\n\n"
+                            f"**场景描述**：\n{scene_description}\n\n"
+                        )
+                        if action_feedback:
+                            reply_text += f"**行动反馈**：{action_feedback}\n\n"
+                        reply_text += f" 你已无法继续行动，但可以观看其他玩家。"
+                        await self.send_text(reply_text)
+                else:
                     reply_text = (
-                        f"**行动结果** - {current_player_name}\n\n"
-                        f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}\n\n"
-                        f"**你已死亡**！\n\n"
+                        f"**{current_player_name} 已死亡**！\n\n"
+                        f"**死亡原因**：玩家{user_name}的行动「{action}」导致了{current_player_name}的死亡\n\n"
                         f"**场景描述**：\n{scene_description}\n\n"
                     )
                     if action_feedback:
                         reply_text += f"**行动反馈**：{action_feedback}\n\n"
-                    reply_text += f" 你已无法继续行动，但可以观看其他玩家。"
+                    reply_text += f"{current_player_name}已无法继续行动。"
                     await self.send_text(reply_text)
             else:
-                await self.send_text("行动中...")
-                
-                try:
-                    action_image_path = self._generate_action_result_image(
-                        user_name=current_player_name,
-                        action=f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}",
-                        is_dead=False,
-                        scene_description=scene_description,
-                        action_feedback=action_feedback,
-                        health=health,
-                        injury=injury,
-                        fatigue=fatigue,
-                        sanity=sanity,
-                        state=state,
-                        emotion=emotion,
-                        fear_level=fear_level,
-                        anxiety_level=anxiety_level,
-                        stress_level=stress_level,
-                        found_items=found_items if is_action_player else [],
-                        new_location=new_location,
-                        random_event=random_event
-                    )
+                if is_action_player:
+                    await self.send_text("行动中...")
                     
-                    with open(action_image_path, 'rb') as img_file:
-                        image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
-                    
-                    image_sent = await self.send_image(image_base64)
-                    if not image_sent:
-                        print(f"[规则怪谈] 多人模式行动图片发送失败")
-                    else:
-                        await asyncio.sleep(1.0)
-                    
-                    game_state["action_image_path"] = action_image_path
-                    if "action_image_paths" not in game_state:
-                        game_state["action_image_paths"] = []
-                    game_state["action_image_paths"].append(action_image_path)
-                except Exception as e:
-                    print(f"[规则怪谈] 生成行动结果长图失败: {str(e)}")
-                    reply_text = (
-                        f"**行动结果** - {current_player_name}\n\n"
-                        f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}\n\n"
-                        f"**场景描述**：\n{scene_description}\n\n"
-                        f"**身体状况**：\n"
-                        f"体力值：{health}/100\n"
-                        f"受伤：{injury}\n"
-                        f"疲劳：{fatigue}\n\n"
-                        f"**精神状况**：\n"
-                        f"理智值：{sanity}/100\n"
-                        f"状态：{state}\n"
-                        f"情绪：{emotion}\n\n"
-                        f"**心理压力**：\n"
-                        f"恐惧等级：{fear_level}/100\n"
-                        f"焦虑等级：{anxiety_level}/100\n"
-                        f"压力等级：{stress_level}/100\n\n"
-                    )
-                    if found_items and is_action_player:
-                        reply_text += f"**获得物品**：{', '.join(found_items)}\n\n"
-                    if action_feedback:
-                        reply_text += f"**行动反馈**：{action_feedback}\n\n"
-                    reply_text += f"**当前位置**：{new_location}\n\n"
-                    if random_event:
-                        reply_text += f"**环境事件**：{random_event}\n\n"
-                    reply_text += f"你存活了下来！继续探索吧。"
-                    
-                    await self.send_text(reply_text)
+                    try:
+                        action_image_path = self._generate_action_result_image(
+                            user_name=current_player_name,
+                            action=f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}",
+                            is_dead=False,
+                            scene_description=scene_description,
+                            action_feedback=action_feedback,
+                            health=health,
+                            injury=injury,
+                            fatigue=fatigue,
+                            sanity=sanity,
+                            state=state,
+                            emotion=emotion,
+                            fear_level=fear_level,
+                            anxiety_level=anxiety_level,
+                            stress_level=stress_level,
+                            found_items=found_items if is_action_player else [],
+                            new_location=new_location,
+                            random_event=random_event
+                        )
+                        
+                        with open(action_image_path, 'rb') as img_file:
+                            image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                        
+                        image_sent = await self.send_image(image_base64)
+                        if not image_sent:
+                            print(f"[规则怪谈] 多人模式行动图片发送失败")
+                        else:
+                            await asyncio.sleep(1.0)
+                        
+                        game_state["action_image_path"] = action_image_path
+                        if "action_image_paths" not in game_state:
+                            game_state["action_image_paths"] = []
+                        game_state["action_image_paths"].append(action_image_path)
+                    except Exception as e:
+                        print(f"[规则怪谈] 生成行动结果长图失败: {str(e)}")
+                        reply_text = (
+                            f"**行动结果** - {current_player_name}\n\n"
+                            f"{'你的行动' if is_action_player else f'玩家{user_name}的行动'}：{action}\n\n"
+                            f"**场景描述**：\n{scene_description}\n\n"
+                            f"**身体状况**：\n"
+                            f"体力值：{health}/100\n"
+                            f"受伤：{injury}\n"
+                            f"疲劳：{fatigue}\n\n"
+                            f"**精神状况**：\n"
+                            f"理智值：{sanity}/100\n"
+                            f"状态：{state}\n"
+                            f"情绪：{emotion}\n\n"
+                            f"**心理压力**：\n"
+                            f"恐惧等级：{fear_level}/100\n"
+                            f"焦虑等级：{anxiety_level}/100\n"
+                            f"压力等级：{stress_level}/100\n\n"
+                        )
+                        if found_items and is_action_player:
+                            reply_text += f"**获得物品**：{', '.join(found_items)}\n\n"
+                        if action_feedback:
+                            reply_text += f"**行动反馈**：{action_feedback}\n\n"
+                        reply_text += f"**当前位置**：{new_location}\n\n"
+                        if random_event:
+                            reply_text += f"**环境事件**：{random_event}\n\n"
+                        reply_text += f"你存活了下来！继续探索吧。"
+                        
+                        await self.send_text(reply_text)
         
         game_state["players"] = players
         self._save_game_state(group_id)
