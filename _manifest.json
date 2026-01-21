@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "规则怪谈插件",
-  "version": "1.4.1",
+  "version": "1.5",
   "description": "生成规则怪谈并进行互动游戏，支持LLM生成、提示、推理和多种结局判定",
   "author": {
     "name": "岚影鸿夜",
@@ -11,8 +11,7 @@
   "homepage_url": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
   "repository_url": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
   "host_application": {
-    "min_version": "0.12.0",
-    "max_version": "0.12.0"
+    "min_version": "0.12.0"
   },
   "keywords": [
     "规则怪谈",
@@ -24,5 +23,6 @@
   "categories": [
     "Entertainment & Interaction",
     "Content Generation"
-  ]
+  ],
+  "id": "岚影鸿夜.MaiBot-rule_horror_plugin"
 }

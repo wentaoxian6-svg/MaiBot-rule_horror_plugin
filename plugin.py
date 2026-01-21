@@ -1,22 +1,53 @@
+# pyright: reportDeprecated=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportUnknownMemberType=false
+# pyright: reportUnknownParameterType=false
+# pyright: reportUnknownArgumentType=false
+# pyright: reportMissingParameterType=false
+# pyright: reportExplicitAny=false
+# pyright: reportAny=false
+# pyright: reportUnannotatedClassAttribute=false
+# pyright: reportImplicitOverride=false
+# pyright: reportIncompatibleMethodOverride=false
+# pyright: reportAssignmentType=false
+# pyright: reportUnusedCallResult=false
+# pyright: reportImplicitStringConcatenation=false
+# pyright: reportUnnecessaryComparison=false
+# pyright: reportUnnecessaryIsInstance=false
+# pyright: reportUnusedVariable=false
+
+
 # src/plugins/rule_horror/plugin.py
 import os
+
 import json
 import random
 import re
 import asyncio
 import aiohttp
 import base64
-from typing import List, Tuple, Type, Optional
+from typing import Any, List, Tuple, Type, Optional, Union, cast
+
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from src.plugin_system import (
+from PIL import Image, ImageDraw, ImageFont
+
+from src.plugin_system import (  # pyright: ignore[reportImplicitRelativeImport]
     BasePlugin,
-    register_plugin,
+    BaseAction,
     BaseCommand,
-    ComponentInfo,
-    ConfigField
+    BaseEventHandler,
+    BaseTool,
+    register_plugin,
+    ActionInfo,
+    CommandInfo,
+    EventHandlerInfo,
+    ToolInfo,
+    ConfigField,
+    PythonDependency,
 )
-from src.plugin_system.apis import send_api
+
+from .environment_evolution import EnvironmentEvolutionSystem
+
 
 PLUGIN_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
@@ -28,22 +59,26 @@ game_states = {}
 class RuleHorrorPlugin(BasePlugin):
     """规则怪谈插件 - 生成规则怪谈并进行互动"""
 
+    # 注意：本框架的 `@register_plugin` 会在“类级别”读取 `cls.plugin_name`
+    # 因此这些元信息必须是“类属性”，不能用 `@property`。
     plugin_name = "rule_horror"
-    plugin_description = "生成规则怪谈并进行互动游戏。"
-    plugin_version = "1.4.1"
-    plugin_author = "岚影鸿夜"
     enable_plugin = True
-
-    dependencies = []
-    python_dependencies = ["aiohttp"]
-
+    dependencies: List[str] = []
+    python_dependencies: List[PythonDependency] = [PythonDependency(package_name="aiohttp")]
     config_file_name = "config.toml"
+
+    plugin_description = "生成规则怪谈并进行互动游戏。"
+    plugin_version = "1.5"
+    plugin_author = "岚影鸿夜"
+
     config_section_descriptions = {
         "plugin": "插件启用配置",
-        "llm": "LLM API 配置"
+        "llm": "LLM API 配置",
+        "environment": "环境演变系统配置"
     }
 
     config_schema = {
+
         "plugin": {
             "enabled": ConfigField(
                 type=bool,
@@ -97,13 +132,58 @@ class RuleHorrorPlugin(BasePlugin):
                 default=0.8,
                 description="LLM 生成文本的随机性 (0.0-1.0)"
             )
+        },
+        "environment": {
+            "enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="是否启用环境演变系统"
+            ),
+            "api_url": ConfigField(
+                type=str,
+                default="http://rinkoai.com/v1/chat/completions",
+                description="环境演变系统LLM API 地址 (OpenAI格式)，留空则使用llm.api_url"
+            ),
+            "api_key": ConfigField(
+                type=str,
+                default="",
+                description="环境演变系统LLM API 密钥，留空则使用llm.api_key"
+            ),
+            "model_list": ConfigField(
+                type=list,
+                default=["deepseek-ai/DeepSeek-V3"],
+                description="环境演变系统LLM模型列表，按优先级排序。当前模型失败时会自动切换到下一个模型"
+            ),
+            "current_model_index": ConfigField(
+                type=int,
+                default=0,
+                description="环境演变系统当前使用的模型索引（从0开始）。当模型失败时会自动递增，超过范围会重置为0"
+            ),
+
+            "temperature": ConfigField(
+                type=float,
+                default=0.7,
+                description="环境演变系统LLM 生成文本的随机性 (0.0-1.0)"
+            )
         }
     }
 
-    def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
+
+    def get_plugin_components(
+        self,
+    ) -> List[
+        Union[
+            Tuple[ActionInfo, Type[BaseAction]],
+            Tuple[CommandInfo, Type[BaseCommand]],
+            Tuple[EventHandlerInfo, Type[BaseEventHandler]],
+            Tuple[ToolInfo, Type[BaseTool]],
+        ]
+    ]:
         return [
             (RuleHorrorCommand.get_command_info(), RuleHorrorCommand),
         ]
+
+
 
 
 class RuleHorrorCommand(BaseCommand):
@@ -112,6 +192,17 @@ class RuleHorrorCommand(BaseCommand):
     command_name = "RuleHorrorCommand"
     command_description = "规则怪谈游戏：生成规则怪谈、加入/离开、提示、推理、行动、结束"
     command_pattern = r"^/rg\s+(?P<action>\S+)(?:\s+(?P<rest>.+))?$"
+    
+    def __init__(self, message, plugin_config=None):
+        super().__init__(message, plugin_config)
+        self.environment_system = None
+    
+    def _get_or_create_environment_system(self) -> EnvironmentEvolutionSystem:
+        """获取或创建环境演化系统"""
+        if self.environment_system is None:
+            self.environment_system = EnvironmentEvolutionSystem(game_states)
+        return self.environment_system
+    
     command_help = (
         "规则怪谈游戏：\n"
         "/rg 开始 单人/多人 - 开始新游戏（单人模式自动加入，多人模式需要手动加入）\n"
@@ -127,6 +218,7 @@ class RuleHorrorCommand(BaseCommand):
         "/rg 剧情 - 查看剧情导入\n"
         "/rg 规则 - 查看当前规则\n"
         "/rg 场景 - 查看场景结构\n"
+        "/rg 道具 [道具名称] - 查看道具列表或道具详情\n"
         "/rg 提示 <规则/线索> - 获取提示（剩余3次）\n"
         "/rg 推理 <推理内容> - 记录你的推理\n"
         "/rg 行动 <行动描述> - 描述你的行动\n"
@@ -134,14 +226,13 @@ class RuleHorrorCommand(BaseCommand):
         "/rg 帮助 - 查看帮助"
     )
     command_examples = [
-        "/rg 开始 单人", "/rg 开始 多人", "/rg 强制开始 单人", "/rg 恢复", "/rg 保存 存档1", "/rg 读取 存档1", "/rg 存档列表", "/rg 加入", "/rg 离开", "/rg 状态", "/rg 剧情", "/rg 规则", "/rg 场景",
+        "/rg 开始 单人", "/rg 开始 多人", "/rg 强制开始 单人", "/rg 恢复", "/rg 保存 存档1", "/rg 读取 存档1", "/rg 存档列表", "/rg 加入", "/rg 离开", "/rg 状态", "/rg 剧情", "/rg 规则", "/rg 场景", "/rg 道具", "/rg 道具 生锈的钥匙",
         "/rg 提示 规则", "/rg 提示 线索",
         "/rg 推理 我认为规则3是关键", "/rg 行动 我决定进入房间",
         "/rg 结束", "/rg 帮助"
     ]
-    intercept_message = True
 
-    async def execute(self) -> Tuple[bool, Optional[str], bool]:
+    async def execute(self) -> Tuple[bool, Optional[str], int]:
         matched_groups = self.matched_groups if self.matched_groups is not None else {}
         action = matched_groups.get("action", "") if matched_groups.get("action") is not None else ""
         rest_input = matched_groups.get("rest", "") if matched_groups.get("rest") is not None else ""
@@ -157,23 +248,50 @@ class RuleHorrorCommand(BaseCommand):
 
         if chat_stream is None:
             await self.send_text("无法获取聊天上下文信息。")
-            return False, "缺少聊天上下文", True
+            return False, "缺少聊天上下文", 2
 
         stream_id = getattr(chat_stream, 'stream_id', None)
         if stream_id is None:
             await self.send_text("无法获取聊天流ID。")
-            return False, "缺少聊天流ID", True
+            return False, "缺少聊天流ID", 2
 
         enabled = self.get_config("plugin.enabled", True)
         if not enabled:
             await self.send_text("规则怪谈插件已被禁用。")
-            return False, "插件未启用", True
+            return False, "插件未启用", 2
 
-        api_url = self.get_config("llm.api_url", "").strip()
-        api_key = self.get_config("llm.api_key", "").strip()
-        model_list = self.get_config("llm.model_list", ["deepseek-ai/DeepSeek-V3"])
-        current_model_index = self.get_config("llm.current_model_index", 0)
-        temperature = self.get_config("llm.temperature", 0.8)
+        api_url = str(self.get_config("llm.api_url", "")).strip()
+        api_key = str(self.get_config("llm.api_key", "")).strip()
+
+        model_list_raw = self.get_config("llm.model_list", ["deepseek-ai/DeepSeek-V3"])
+        model_list = cast(List[str], model_list_raw) if isinstance(model_list_raw, list) else ["deepseek-ai/DeepSeek-V3"]
+
+        current_model_index_raw = self.get_config("llm.current_model_index", 0)
+        current_model_index = int(current_model_index_raw) if isinstance(current_model_index_raw, (int, float, str)) else 0
+
+        temperature_raw = self.get_config("llm.temperature", 0.8)
+        temperature = float(temperature_raw) if isinstance(temperature_raw, (int, float, str)) else 0.8
+
+        env_enabled_raw = self.get_config("environment.enabled", True)
+        env_enabled = bool(env_enabled_raw)
+
+        env_api_url = str(self.get_config("environment.api_url", "")).strip()
+        env_api_key = str(self.get_config("environment.api_key", "")).strip()
+
+        env_model_list_raw = self.get_config("environment.model_list", ["deepseek-ai/DeepSeek-V3"])
+        env_model_list = cast(List[str], env_model_list_raw) if isinstance(env_model_list_raw, list) else ["deepseek-ai/DeepSeek-V3"]
+
+        env_current_model_index_raw = self.get_config("environment.current_model_index", 0)
+        env_current_model_index = int(env_current_model_index_raw) if isinstance(env_current_model_index_raw, (int, float, str)) else 0
+
+        env_temperature_raw = self.get_config("environment.temperature", 0.7)
+        env_temperature = float(env_temperature_raw) if isinstance(env_temperature_raw, (int, float, str)) else 0.7
+
+
+        if not env_api_url:
+            env_api_url = api_url
+        if not env_api_key:
+            env_api_key = api_key
 
         group_id = getattr(chat_stream, 'group_info', None)
         if group_id:
@@ -186,22 +304,20 @@ class RuleHorrorCommand(BaseCommand):
                 group_id = "unknown"
 
         game_state = game_states.get(group_id, {})
-        if group_id not in game_states:
-            game_states[group_id] = game_state
 
         if action == "开始":
             game_mode = rest_input.strip() if rest_input else ""
             if game_mode not in ["单人", "多人"]:
                 await self.send_text("请指定游戏模式。用法：`/rg 开始 单人` 或 `/rg 开始 多人`")
-                return False, "缺少游戏模式", True
-            return await self._start_new_game(group_id, api_url, api_key, model_list, current_model_index, temperature, game_mode)
+                return False, "缺少游戏模式", 2
+            return await self._start_new_game(group_id, api_url, api_key, model_list, current_model_index, temperature, game_mode, env_enabled, env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature)
 
         elif action == "强制开始":
             game_mode = rest_input.strip() if rest_input else ""
             if game_mode not in ["单人", "多人"]:
                 await self.send_text("请指定游戏模式。用法：`/rg 强制开始 单人` 或 `/rg 强制开始 多人`")
-                return False, "缺少游戏模式", True
-            return await self._force_start_new_game(group_id, api_url, api_key, model_list, current_model_index, temperature, game_mode)
+                return False, "缺少游戏模式", 2
+            return await self._force_start_new_game(group_id, api_url, api_key, model_list, current_model_index, temperature, game_mode, env_enabled, env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature)
 
         elif action == "恢复":
             return await self._restore_game(group_id)
@@ -209,12 +325,12 @@ class RuleHorrorCommand(BaseCommand):
         elif action == "保存":
             if not game_state or not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             save_name = rest_input.strip() if rest_input else ""
             if not save_name:
                 await self.send_text("请提供存档名称。用法：`/rg 保存 <存档名称>`")
-                return False, "缺少存档名称", True
+                return False, "缺少存档名称", 2
 
             return await self._save_game_with_name(group_id, save_name)
 
@@ -222,7 +338,7 @@ class RuleHorrorCommand(BaseCommand):
             save_name = rest_input.strip() if rest_input else ""
             if not save_name:
                 await self.send_text("请提供存档名称。用法：`/rg 读取 <存档名称>`")
-                return False, "缺少存档名称", True
+                return False, "缺少存档名称", 2
 
             if game_state and game_state.get("game_active", False):
                 await self.send_text("当前有正在进行的游戏。使用 `/rg 读取` 将覆盖当前游戏状态。如需继续当前游戏，请忽略此命令。")
@@ -238,49 +354,56 @@ class RuleHorrorCommand(BaseCommand):
         elif action == "加入":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             return await self._join_game(group_id)
 
         elif action == "离开":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             return await self._leave_game(group_id)
 
         elif action == "状态":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             return await self._show_game_status(group_id)
 
         elif action == "规则":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             return await self._show_rules(group_id)
 
         elif action == "场景":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             return await self._show_scene(group_id)
+
+        elif action == "道具":
+            if not game_state.get("game_active", False):
+                await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
+                return False, "无游戏", 2
+
+            return await self._show_inventory(group_id, rest_input)
 
         elif action == "剧情":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             return await self._show_plot(group_id)
 
         elif action == "提示":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             hint_type = rest_input if rest_input else "规则"
             return await self._provide_hint(group_id, hint_type, api_url, api_key, model_list, current_model_index, temperature)
@@ -288,40 +411,44 @@ class RuleHorrorCommand(BaseCommand):
         elif action == "推理":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             if not rest_input:
                 await self.send_text("请提供推理内容。用法：`/rg 推理 <推理内容>`")
-                return False, "缺少推理内容", True
+                return False, "缺少推理内容", 2
 
             return await self._record_reasoning(group_id, rest_input, api_url, api_key, model_list, current_model_index, temperature)
 
         elif action == "行动":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             if not rest_input:
                 await self.send_text("请提供行动描述。用法：`rg 行动 <行动描述>`")
-                return False, "缺少行动描述", True
+                return False, "缺少行动描述", 2
 
-            return await self._record_action(group_id, rest_input, api_url, api_key, model_list, current_model_index, temperature)
+            return await self._record_action(
+                group_id, rest_input, api_url, api_key, model_list, current_model_index, temperature,
+                env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+            )
+
 
         elif action == "继续":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             if not game_state.get("has_cleared", False):
                 await self.send_text("你尚未达成通关条件，无法继续探索。")
-                return False, "未通关", True
+                return False, "未通关", 2
 
             return await self._continue_to_perfect(group_id, api_url, api_key, model_list, current_model_index, temperature)
 
         elif action == "结束":
             if not game_state.get("game_active", False):
                 await self.send_text("当前没有正在进行的游戏。")
-                return False, "无游戏", True
+                return False, "无游戏", 2
 
             return await self._end_game(group_id, api_url, api_key, model_list, current_model_index, temperature)
 
@@ -343,6 +470,7 @@ class RuleHorrorCommand(BaseCommand):
                 "- `/rg 剧情` - 查看剧情导入\n"
                 "- `/rg 规则` - 查看当前规则和通关条件\n"
                 "- `/rg 场景` - 查看场景结构和环境状况\n"
+                "- `/rg 道具 [道具名称]` - 查看道具列表或道具详情\n"
                 "- `/rg 提示 <规则/线索>` - 获取提示（规则验证或线索，剩余3次）\n"
                 "- `/rg 推理 <推理内容>` - 记录你的推理\n"
                 "- `/rg 行动 <行动描述>` - 描述你的行动\n"
@@ -363,13 +491,14 @@ class RuleHorrorCommand(BaseCommand):
                 "- 使用 `/rg 保存 <存档名称>` 可以创建多个存档，方便在不同进度间切换"
             )
             await self.send_text(help_text)
-            return True, "已发送帮助信息", True
+            return True, "已发送帮助信息", 2
 
         else:
             await self.send_text("未知命令。请使用 `/rg 帮助` 查看可用命令。")
-            return False, "未知命令", True
+            return False, "未知命令", 2
 
-    async def _start_new_game(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float, game_mode: str) -> Tuple[bool, Optional[str], bool]:
+    async def _start_new_game(self, group_id: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, game_mode: str, env_enabled: bool, env_api_url: str, env_api_key: str, env_model_list: List[str], env_current_model_index: int, env_temperature: float) -> Tuple[bool, Optional[str], int]:
+
         """开始一个新的规则怪谈游戏"""
         saved_state = self._load_game_state(group_id)
         if saved_state and saved_state.get("game_active", False):
@@ -378,20 +507,69 @@ class RuleHorrorCommand(BaseCommand):
                 "该群组/用户已有未完成的游戏存档。\n"
                 "请使用 `/rg 恢复` 恢复存档，或使用 `/rg 强制开始 单人/多人` 强制开始新游戏（会覆盖存档）。"
             )
-            return False, "存在存档", True
+            return False, "存在存档", 2
         
         await self.send_text("正在生成规则怪谈...")
 
         step1_prompt = """
-你是一个专业的规则怪谈生成器。请生成一个恐怖或诡异的规则怪谈的剧情导入。
+你是一位精通规则怪谈创作的游戏设计师。请生成一个恐怖或诡异的规则怪谈的剧情导入和隐藏真相。
 
-要求：
-1. 生成一个场景（如：深夜的医院、废弃的学校、神秘的公寓、古老的庄园等）
-2. 描述场景的背景故事（这个场景的历史、发生过什么、为什么诡异）
-3. 描述玩家在这个场景中的身份或角色（如：工厂员工、夜班护士、新入职教师、庄园管家等），身份应与场景和剧情相符
-4. 剧情应该充满悬疑和恐怖氛围，为后续的规则和探索做铺垫
-5. 生成2-3个"核心象征符号"，这些符号将在整个游戏中反复出现，营造主题感和不安感。符号可以是数字、图案、旋律、花纹、颜色等。每个符号需要有一个简短的描述，暗示其可能的含义或与场景的联系。
-6. 以JSON格式返回，格式如下：
+**创作要求：**
+
+1. **场景选择**：选择一个具有恐怖潜力的场景（如：深夜的医院、废弃的学校、神秘的公寓、古老的庄园、荒凉的工厂、阴森的地铁站、诡异的酒店等）
+
+2. **背景故事**：描述场景的历史、发生过什么、为什么诡异
+   - 必须包含具体的历史事件或悲剧
+   - 描述场景的异常现象（如：时间错乱、空间扭曲、超自然现象等）
+   - 暗示场景背后隐藏的真相（不要直接揭示）
+
+3. **玩家身份**：描述玩家在这个场景中的身份或角色
+   - 身份应与场景和剧情相符（如：工厂员工、夜班护士、新入职教师、庄园管家、酒店住客等）
+   - 身份应该让玩家有代入感，同时暗示某种危险
+   - 可以暗示身份与场景历史有某种联系
+
+4. **恐怖氛围营造**：
+   - 使用具体的感官细节（视觉、听觉、嗅觉、触觉）
+   - 营造压抑、不安、诡异的氛围
+   - 为后续的规则和探索做铺垫
+
+5. **核心象征符号**：生成2-3个"核心象征符号"
+   - 符号可以是数字、图案、旋律、花纹、颜色、物品等
+   - 每个符号需要有一个简短的描述，暗示其可能的含义或与场景的联系
+   - 符号应该在整个游戏中反复出现，营造主题感和不安感
+   - 符号示例：
+     * 数字"7"：出现在各种意想不到的地方，暗示某种诅咒或周期
+     * 破碎的镜子：象征分裂的真相和扭曲的现实
+     * 断续的童谣：暗示过去的悲剧和未解的谜团
+     * 红色的十字：象征某种仪式或禁忌
+
+6. **环境细节**：描述场景的环境特征
+   - 光线状况（昏暗、闪烁、微弱、完全黑暗等）
+   - 温度感受（刺骨寒冷、阴冷、闷热等）
+   - 声音（风声、脚步声、低语、哭声等）
+   - 气味（霉味、血腥味、腐臭味、金属味等）
+   - 整体氛围（压抑、恐怖、诡异、平静但不安等）
+
+7. **异常现象暗示**：在描述中隐含地提及异常现象
+   - 不要直接说明，而是通过细节暗示
+   - 让玩家感到不安和困惑
+   - 为后续的规则和探索留下线索
+
+8. **隐藏真相（非常重要）**：生成场景背后的隐藏真相
+   - 真相应该以叙事方式描述场景背后的真实情况
+   - 真相应该解释规则存在的原因和场景的异常现象
+   - 真相应该令人不安，但又合乎逻辑
+   - 真相应该为玩家提供解决问题的关键线索
+   - 真相的描述应该引人入胜，充满悬疑和恐怖元素
+   - 不要提及规则编号或明确说明规则与真相的对应关系
+   - 真相应该与背景故事、玩家身份、核心象征符号形成完整的逻辑体系
+   - 真相示例：
+     * "这座医院在20年前发生过一场医疗事故，一名医生为了拯救自己的女儿，与某种存在进行了交易。从此，医院成为了两个世界的交汇点。那些看似诡异的规则，实际上是为了防止那个存在从医院中逃脱。"
+     * "这座公寓实际上是某种仪式的容器。每层楼都对应着仪式的一个阶段，而住户们则不知不觉地成为了仪式的一部分。规则的存在是为了维持仪式的平衡，一旦平衡被打破，仪式将完成，所有住户将被献祭。"
+     * "这所学校曾经是一所孤儿院，院长为了获得永生，与恶魔签订了契约。契约要求每年献祭一名孤儿。现在，学校已经废弃，但契约仍然有效。规则是恶魔设下的陷阱，试图引诱更多的人进入学校，成为新的祭品。"
+
+**输出格式：**
+请以JSON格式返回，格式如下：
 {
   "scene": "场景名称（如：深夜的废弃医院）",
   "background": "场景背景故事，描述这个场景的历史、发生过什么、为什么诡异",
@@ -399,57 +577,82 @@ class RuleHorrorCommand(BaseCommand):
   "core_symbols": [
     {"symbol": "符号1", "description": "符号1的描述"},
     {"symbol": "符号2", "description": "符号2的描述"}
-  ]
+  ],
+  "environment": {
+    "lighting": "光线状况",
+    "temperature": "温度感受",
+    "sounds": ["声音1", "声音2"],
+    "smells": ["气味1", "气味2"],
+    "atmosphere": "整体氛围"
+  },
+  "anomalies": ["异常现象1", "异常现象2"],
+  "hidden_truth": "隐藏的真相（以叙事方式描述场景背后的真实情况，不要提及规则编号或明确说明规则与真相的对应关系）"
 }
 
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
+**重要提示：**
+- 请仅返回JSON，不要包含任何其他文字
+- 严禁使用任何emoji表情符号
+- 背景故事应该引人入胜，充满悬疑和恐怖元素
+- 核心象征符号应该神秘而富有暗示性
+- 环境细节应该具体、生动，让玩家能够想象出场景
+- 异常现象应该微妙而诡异，不要直接揭示真相
+- 隐藏真相是整个游戏的核心，应该与背景故事、玩家身份、核心象征符号形成完整的逻辑体系
+- 隐藏真相应该足够详细，为后续的规则生成和游戏推进提供充分的依据
         """
 
         llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+            return False, "LLM API调用失败", 2
 
         print(f"[规则怪谈] 第一步（剧情导入）LLM原始返回: {llm_response}")
 
-        try:
-            step1_data = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] 第一步JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    step1_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 第一步成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 第一步提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("生成剧情导入失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
-            else:
-                await self.send_text("生成剧情导入失败，返回格式不正确。")
-                return False, "JSON解析失败", True
+        step1_data = self._parse_llm_json_response(llm_response, "第一步（剧情导入）")
+        if not step1_data:
+            await self.send_text("生成剧情导入失败，返回格式不正确。")
+            return False, "JSON解析失败", 2
 
         scene_name = step1_data.get("scene", "")
         background = step1_data.get("background", "")
         player_identity = step1_data.get("player_identity", "")
         core_symbols = step1_data.get("core_symbols", [])
+        hidden_truth = step1_data.get("hidden_truth", "")
 
         await asyncio.sleep(0.5)
         
+        plot_image_path = ""
         try:
             plot_image_path = self._generate_plot_image(scene_name, background, player_identity, core_symbols)
+
+            if group_id not in game_states:
+                game_states[group_id] = {}
             game_states[group_id]["plot_image_path"] = plot_image_path
             with open(plot_image_path, 'rb') as f:
                 image_bytes = f.read()
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            image_sent = await self.send_image(image_base64)
-            if not image_sent:
-                print(f"[规则怪谈] 剧情导入图片发送失败")
+            
+            try:
+                image_sent = await self.send_image(image_base64)
+                # 检查返回值类型，确保是布尔值
+                if isinstance(image_sent, bool):
+                    if not image_sent:
+                        print(f"[规则怪谈] 剧情导入图片发送失败")
+                elif image_sent is None:
+                    print(f"[规则怪谈] 剧情导入图片发送失败 (返回None)")
+                else:
+                    # 如果返回了意外的值（如QQ号），记录并回退到文本模式
+                    print(f"[规则怪谈] send_image返回了意外值: {image_sent} (类型: {type(image_sent)})")
+                    # 回退到文本模式
+                    raise Exception(f"图片发送返回意外值: {image_sent}")
+            except Exception as send_error:
+                print(f"[规则怪谈] 发送剧情导入图片时出错: {str(send_error)}")
+                # 发送失败，回退到文本模式
+                raise Exception(f"图片发送失败: {str(send_error)}")
             await asyncio.sleep(1.0)
         except Exception as e:
             print(f"[规则怪谈] 生成剧情导入长图失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
             step1_text = (
                 f"**规则怪谈** ({game_mode}模式)\n\n"
                 f"**剧情导入**：\n{background}\n\n"
@@ -460,7 +663,7 @@ class RuleHorrorCommand(BaseCommand):
             await asyncio.sleep(1.0)
         
         await self.send_text("正在生成场景结构...")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
 
         step2_prompt = f"""
 你是一个专业的规则怪谈生成器。请基于以下剧情导入，生成场景结构。
@@ -497,28 +700,14 @@ class RuleHorrorCommand(BaseCommand):
         llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+            return False, "LLM API调用失败", 2
 
         print(f"[规则怪谈] 第二步（场景结构）LLM原始返回: {llm_response}")
 
-        try:
-            step2_data = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] 第二步JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    step2_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 第二步成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 第二步提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("生成场景结构失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
-            else:
-                await self.send_text("生成场景结构失败，返回格式不正确。")
-                return False, "JSON解析失败", True
+        step2_data = self._parse_llm_json_response(llm_response, "第二步（场景结构）")
+        if not step2_data:
+            await self.send_text("生成场景结构失败，返回格式不正确。")
+            return False, "JSON解析失败", 2
 
         building_type = step2_data.get("building_type", "")
         overall_layout = step2_data.get("overall_layout", "")
@@ -527,47 +716,16 @@ class RuleHorrorCommand(BaseCommand):
         special_areas = step2_data.get("special_areas", [])
 
         floors_text = "\n".join([f"  - {floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
-        connections_text = ", ".join(connections)
-        special_areas_text = ", ".join(special_areas)
-
-        await asyncio.sleep(0.5)
-         
-        image_sent_successfully = False
-        try:
-            scene_structure_image_path = self._generate_scene_structure_text_image(
-                building_type, overall_layout, floors, connections, special_areas
-            )
-            with open(scene_structure_image_path, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            image_sent = await self.send_image(image_base64)
-            if not image_sent:
-                print(f"[规则怪谈] 场景结构图片发送失败")
-            else:
-                image_sent_successfully = True
-            await asyncio.sleep(0.5)
-             
-            game_state = game_states.get(group_id, {})
-            game_state["scene_structure_image_path"] = scene_structure_image_path
-            self._save_game_state(group_id)
-        except Exception as e:
-            print(f"[规则怪谈] 生成场景结构长图失败: {str(e)}")
-
-        if not image_sent_successfully:
-            step2_text = f"""**场景结构**：
-
-**建筑类型**：{building_type}
-
-**总体布局**：{overall_layout}
-
-**楼层布局**：
-{floors_text}
-
-**连接通道**：{connections_text}
-
-**特殊区域**：{special_areas_text}"""
-            await self.send_text(step2_text)
-            await asyncio.sleep(0.5)
+        
+        if connections and isinstance(connections[0], dict):
+            connections_text = ", ".join([conn.get("name", str(conn)) if isinstance(conn, dict) else str(conn) for conn in connections])
+        else:
+            connections_text = ", ".join(connections)
+        
+        if special_areas and isinstance(special_areas[0], dict):
+            special_areas_text = ", ".join([area.get("name", str(area)) if isinstance(area, dict) else str(area) for area in special_areas])
+        else:
+            special_areas_text = ", ".join(special_areas)
 
         scene_structure_text = f"建筑类型：{building_type}\n"
         scene_structure_text += "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
@@ -575,13 +733,38 @@ class RuleHorrorCommand(BaseCommand):
         scene_structure_text += f"特殊区域：{special_areas_text}"
 
         await asyncio.sleep(0.5)
-        
-        await self.send_text("正在生成规则...")
-        await asyncio.sleep(0.5)
 
-        step3_prompt = f"""
-你是一个专业的规则怪谈生成器。请基于以下剧情导入和场景结构，生成规则怪谈的规则。
+        if env_enabled:
+            try:
+                environment_system = self._get_or_create_environment_system()
+                
+                game_states[group_id] = {
+                    "background": background,
+                    "hidden_truth": hidden_truth,
+                    "game_active": False
+                }
+                
+                step3_data = await environment_system.generate_complete_rules(
+                    group_id, scene_name, player_identity, building_type,
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+                
+                if not step3_data:
+                    await self.send_text("生成规则失败，API服务可能暂时不可用或网络连接问题。请稍后重试。")
+                    print(f"[规则怪谈] 环境演化系统规则生成失败，API调用返回None")
+                    return False, "规则生成失败", 2
+                    
+                rules_title = step3_data.get("rules_title", "规则")
+                rules = step3_data.get("rules", [])
+                win_condition = step3_data.get("win_condition", "")
+                resolve_condition = step3_data.get("resolve_condition", "")
+                death_triggers = step3_data.get("death_triggers", [])
+            except Exception as e:
+                print(f"[规则怪谈] 环境演化系统规则生成失败，使用主系统: {str(e)}")
+                step3_prompt = f"""
+你是一位精通规则怪谈创作的游戏设计师。请基于以下剧情导入、场景结构和隐藏真相，生成规则怪谈的规则系统。
 
+**基础信息：**
 剧情导入：
 - 场景：{scene_name}
 - 背景：{background}
@@ -590,38 +773,80 @@ class RuleHorrorCommand(BaseCommand):
 场景结构：
 {scene_structure_text}
 
+隐藏真相（非常重要）：
+{hidden_truth}
+
 游戏模式：{game_mode}
 
-要求：
-1. 列出5-8条规则，规则应该看似合理但隐藏着诡异之处
-2. 规则应该与剧情导入和场景结构相呼应
-3. 设定通关条件（如：在规定时间内找到出口、收集特定物品、存活到天亮等）
-4. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
-5. 规则应该有隐藏的逻辑和真相，需要玩家推理
-6. **规则与环境绑定（非常重要）**：请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联。例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"。这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
-7. **规则间的潜在冲突（非常重要）**：请尝试构建至少一组存在潜在矛盾的规则。例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。" 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两两难境地。请在 hidden_truth 中解释这种矛盾的本质（如：两条规则来自不同势力），并在 death_triggers 中隐含相关触发条件
-8. **规则与真相的因果关系（非常重要）**：每条规则都应该与隐藏真相中的某个要素有直接的因果关系。规则不是孤立的，而是形成了一个相互关联的规则网络。例如：
-   - 如果真相是"工厂的夜间保安是来自异世界的实体"，那么规则"夜间只允许蓝色制服的保安巡逻"就是对这个真相的伪装性描述
-   - 如果真相是"三楼东侧病房的窗户是通往异界的通道"，那么规则"三楼东侧病房的窗户必须保持关闭状态"就是对这个危险通道的防护措施
-   - 规则之间应该形成推理链条：遵守规则A -> 发现异常B -> 触发规则C -> 揭示真相D
-9. **协作规则（多人模式非常重要）**：如果游戏模式是"多人"，请设计1-2条需要多个玩家协作才能发现或触发的规则。例如：
-   - 规则A："当两名玩家同时站在不同的位置时，某个隐藏的通道才会开启"
-   - 规则B："只有当一名玩家持有特定物品，另一名玩家说出特定口令时，才能解除某个陷阱"
-   - 规则C："需要三名玩家分别在三个不同的地点同时执行某个动作，才能揭示某个关键真相"
+**规则设计原则：**
+
+1. **规则数量**：生成5-8条规则，规则应该看似合理但隐藏着诡异之处
+
+2. **规则与场景呼应**：规则应该与剧情导入和场景结构紧密呼应
+   - 规则应该反映场景的历史和异常现象
+   - 规则应该与玩家的身份和任务相关
+   - 规则应该隐藏有一部分真相，但不直接揭示
+
+3. **通关条件**：设定明确的通关条件
+   - 如：在规定时间内找到出口、收集特定物品、存活到天亮等
+   - 通关条件应该与规则和真相有逻辑关联
+   - 通关条件应该具有一定的挑战性，但不是不可能完成
+
+4. **解除条件**：设定解除规则怪谈根源的条件
+   - 如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等
+   - 解除条件应该比通关条件更难达成
+   - 解除条件应该揭示真相并彻底解决问题
+
+5. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
+   - 规则不是随意的，而是有内在的逻辑体系
+   - 规则之间应该形成推理链条
+   - 玩家需要通过观察和推理发现规则背后的真相
+
+6. **规则与环境绑定（非常重要）**：
+   - 请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联
+   - 例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"
+   - 这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
+   - 环境绑定应该自然、巧妙，不要过于明显
+
+7. **规则间的潜在冲突（非常重要）**：
+   - 请尝试构建至少一组存在潜在矛盾的规则
+   - 例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。"规则C："公寓中有404室。"
+   - 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地
+   - 请在 hidden_truth 中解释这种矛盾的本质（如：B、C两条规则来自不同势力）
+   - 在 death_triggers 中隐含相关触发条件
+
+8. **规则与真相的因果关系（非常重要）**：
+   - 每条规则都应该与隐藏真相中的某个要素有直接的因果关系
+   - 规则不是孤立的，而是形成了一个相互关联的规则网络
+   - 例如：
+     * 如果真相是"工厂的夜间保安是来自异世界的实体"，那么规则"夜间只允许蓝色制服的保安巡逻"就是对这个真相的伪装性描述
+     * 如果真相是"三楼东侧病房的窗户是通往异界的通道"，那么规则"三楼东侧病房的窗户必须保持关闭状态"就是对这个危险通道的防护措施
+     * 规则之间应该形成推理链条：遵守规则A -> 发现异常B -> 触发规则C -> 揭示真相D
+
+9. **协作规则（多人模式非常重要）**：
+   - 如果游戏模式是"多人"，请设计1-2条需要多个玩家协作才能发现或触发的规则
+   - 例如：
+     * 规则A："当两名玩家同时站在不同的位置时，某个隐藏的通道才会开启"
+     * 规则B："只有当一名玩家持有特定物品，另一名玩家说出特定口令时，才能解除某个陷阱"
+     * 规则C："需要三名玩家分别在三个不同的地点同时执行某个动作，才能揭示某个关键真相"
    - 协作规则应该鼓励玩家之间的沟通和合作，而不是各自为战
    - 协作规则的设计应该巧妙，让玩家在探索过程中自然地发现协作的必要性
    - 在 hidden_truth 中说明协作规则的设计意图和触发条件
-10. **规则标题（非常重要）**：根据场景类型和玩家身份，生成一个贴合剧情的规则标题。例如：
-   - 工厂场景：员工守则、安全规程、操作手册
-   - 医院场景：患者须知、病房守则、医疗规程
-   - 学校场景：学生守则、校园安全须知、宿舍管理规定
-   - 城堡场景：访客须知、城堡守则、安全指南
-   - 酒店场景：入住须知、客房服务守则、安全警示
-   - 超市场景：员工手册、营业规范、安全须知
-   - 地铁场景：乘客须知、安全规程、运营守则
-   标题应该简洁、正式，符合该场景的官方文件风格
+
+10. **规则标题（非常重要）**：
+    - 根据场景类型和玩家身份，生成一个贴合剧情的规则标题
+    - 例如：
+      * 工厂场景：员工守则、安全规程、操作手册
+      * 医院场景：患者须知、病房守则、医疗规程
+      * 学校场景：学生守则、校园安全须知、宿舍管理规定
+      * 城堡场景：访客须知、城堡守则、安全指南
+      * 酒店场景：入住须知、客房服务守则、安全警示
+      * 超市场景：员工手册、营业规范、安全须知
+      * 地铁场景：乘客须知、安全规程、运营守则
+    - 标题应该简洁、正式，符合该场景的官方文件风格
 
 **规则描述要求（非常重要）：**
+
 - 规则必须简洁、直接，每条规则不超过60字
 - 只说明禁止、允许或要求做的行为，不解释原因
 - 使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX
@@ -630,7 +855,7 @@ class RuleHorrorCommand(BaseCommand):
 - 可以加入少量关键的环境或感官细节，但要简洁
 - 细节应该让人感到不安和恐惧，但不要直接揭示真相
 
-示例规则风格：
+**示例规则风格：**
 "禁止在22:00-06:00期间离开房间。"
 "听到三声敲门时，必须立即开门。"
 "三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。"
@@ -639,142 +864,366 @@ class RuleHorrorCommand(BaseCommand):
 "工厂只有蓝色制服的保安，若看见黑色制服的保安，请立即报告主管。"
 "城堡内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
 
-以JSON格式返回，格式如下：
+**死亡触发条件要求（非常重要）：**
+
+- 列出会导致死亡的行为
+- 死亡条件应该与规则和真相有逻辑关联
+- 死亡条件应该具有一定的隐蔽性，不是一眼就能看穿
+- 死亡条件应该给玩家一定的容错空间
+- 死亡条件的描述应该简洁、明确
+
+**输出格式：**
+请以JSON格式返回，格式如下：
 {{
   "rules_title": "规则标题（如：员工守则、患者须知等）",
   "rules": ["规则1", "规则2", ...],
   "win_condition": "通关条件",
   "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
-  "hidden_truth": "隐藏的真相（以叙事方式描述场景背后的真实情况，不要提及规则编号或明确说明规则与真相的对应关系）",
   "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
 }}
 
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
-        """
+**重要提示：**
+- 请仅返回JSON，不要包含任何其他文字
+- 严禁使用任何emoji表情符号
+- 规则应该有层次感，表面看似合理，隐藏着诡异之处
+- 死亡触发条件应该与规则和真相有逻辑关联
+- 整个规则系统应该形成一个完整的、有逻辑的体系
+- 规则的设计必须与提供的隐藏真相保持一致，所有规则都应该能够从隐藏真相中找到合理的解释
+                """
 
-        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
-        if not llm_response:
-            await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+                llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
+                if not llm_response:
+                    await self.send_text("调用LLM API失败，请稍后再试。")
+                    return False, "LLM API调用失败", 2
 
-        print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
+                print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
 
-        try:
-            step3_data = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] 第三步JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    step3_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 第三步成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 第三步提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("生成规则失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
-            else:
-                await self.send_text("生成规则失败，返回格式不正确。")
-                return False, "JSON解析失败", True
+                step3_data = self._parse_llm_json_response(llm_response, "第三步（规则）")
+                if not step3_data:
+                    error_msg = "生成规则失败，返回格式不正确。\n\n"
+                    error_msg += f"LLM返回内容（前500字符）：\n{llm_response[:500]}\n\n"
+                    error_msg += "可能的原因：\n"
+                    error_msg += "1. LLM模型未正确返回JSON格式\n"
+                    error_msg += "2. API地址或密钥配置错误\n"
+                    error_msg += "3. 模型名称不正确\n"
+                    error_msg += "4. 网络连接问题\n\n"
+                    error_msg += "建议：\n"
+                    error_msg += "- 检查config.toml中的LLM配置\n"
+                    error_msg += "- 确认模型名称是否正确\n"
+                    error_msg += "- 查看MaiBot日志获取详细错误信息"
+                    await self.send_text(error_msg)
+                    return False, "JSON解析失败", 2
 
-        rules_image_path = None
-        
-        max_players = 5 if game_mode == "多人" else 1
+                rules_title = step3_data.get("rules_title", "规则")
+                rules = step3_data.get("rules", [])
+                win_condition = step3_data.get("win_condition", "")
+                resolve_condition = step3_data.get("resolve_condition", "")
+                death_triggers = step3_data.get("death_triggers", [])
+        else:
+            step3_prompt = f"""
+你是一位精通规则怪谈创作的游戏设计师。请基于以下剧情导入、场景结构和隐藏真相，生成规则怪谈的规则系统。
 
-        game_states[group_id] = {
-            "scene": scene_name,
-            "background": background,
-            "player_identity": player_identity,
-            "building_type": building_type,
-            "overall_layout": overall_layout,
-            "floors": floors,
-            "connections": connections,
-            "special_areas": special_areas,
-            "rules_title": step3_data.get("rules_title", "规则"),
-            "rules": step3_data.get("rules", []),
-            "win_condition": step3_data.get("win_condition", ""),
-            "resolve_condition": step3_data.get("resolve_condition", ""),
-            "hidden_truth": step3_data.get("hidden_truth", ""),
-            "death_triggers": step3_data.get("death_triggers", []),
-            "hints_used": 0,
-            "max_hints": 3,
-            "game_active": True,
-            "max_players": max_players,
-            "game_mode": game_mode,
-            "players": {},
-            "plot_image_path": plot_image_path,
-            "rules_image_path": rules_image_path,
-            "scene_structure_image_path": None,
-            "time_system": {
-                "start_time": datetime.now().isoformat(),
-                "current_time": "深夜",
-                "elapsed_minutes": 0,
-                "time_description": "午夜时分，周围一片死寂"
-            },
-            "environment": {
-                "lighting": "昏暗",
-                "temperature": "寒冷",
-                "sounds": ["寂静"],
-                "smells": ["霉味"],
-                "atmosphere": "压抑"
-            },
-            "random_events": [],
-            "available_items": [],
-            "environmental_events": [],
-            "rule_mutations": [],
-            "core_symbols": core_symbols,
-            "sanity_break": False,
-            "last_mutation_time": 0,
-            "identity_changes": [],
-            "environment_memory": {
-                "visited_locations": [],
-                "interacted_objects": [],
-                "time_based_events": [],
-                "discovered_secrets": []
-            },
-            "rule_network": {
-                "truth_elements": [],
-                "rule_truth_mappings": [],
-                "rule_dependencies": [],
-                "discovered_truths": []
-            },
-            "collaborative_events": [],
-            "action_image_paths": []
-        }
+**基础信息：**
+剧情导入：
+- 场景：{scene_name}
+- 背景：{background}
+- 玩家身份：{player_identity}
 
-        self._save_game_state(group_id)
+场景结构：
+{scene_structure_text}
+
+隐藏真相（非常重要）：
+{hidden_truth}
+
+游戏模式：{game_mode}
+
+**规则设计原则：**
+
+1. **规则数量**：生成5-8条规则，规则应该看似合理但隐藏着诡异之处
+
+2. **规则与场景呼应**：规则应该与剧情导入和场景结构紧密呼应
+   - 规则应该反映场景的历史和异常现象
+   - 规则应该与玩家的身份和任务相关
+   - 规则应该隐藏有一部分真相，但不直接揭示
+
+3. **通关条件**：设定明确的通关条件
+   - 如：在规定时间内找到出口、收集特定物品、存活到天亮等
+   - 通关条件应该与规则和真相有逻辑关联
+   - 通关条件应该具有一定的挑战性，但不是不可能完成
+
+4. **解除条件**：设定解除规则怪谈根源的条件
+   - 如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等
+   - 解除条件应该比通关条件更难达成
+   - 解除条件应该揭示真相并彻底解决问题
+
+5. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
+   - 规则不是随意的，而是有内在的逻辑体系
+   - 规则之间应该形成推理链条
+   - 玩家需要通过观察和推理发现规则背后的真相
+
+6. **规则与环境绑定（非常重要）**：
+   - 请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联
+   - 例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"
+   - 这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
+   - 环境绑定应该自然、巧妙，不要过于明显
+
+7. **规则间的潜在冲突（非常重要）**：
+   - 请尝试构建至少一组存在潜在矛盾的规则
+   - 例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。"规则C："公寓中有404室。"
+   - 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地
+   - 请在 hidden_truth 中解释这种矛盾的本质（如：B、C两条规则来自不同势力）
+   - 在 death_triggers 中隐含相关触发条件
+
+8. **规则与真相的因果关系（非常重要）**：
+   - 每条规则都应该与隐藏真相中的某个要素有直接的因果关系
+   - 规则不是孤立的，而是形成了一个相互关联的规则网络
+   - 例如：
+     * 如果真相是"工厂的夜间保安是来自异世界的实体"，那么规则"夜间只允许蓝色制服的保安巡逻"就是对这个真相的伪装性描述
+     * 如果真相是"三楼东侧病房的窗户是通往异界的通道"，那么规则"三楼东侧病房的窗户必须保持关闭状态"就是对这个危险通道的防护措施
+     * 规则之间应该形成推理链条：遵守规则A -> 发现异常B -> 触发规则C -> 揭示真相D
+
+9. **协作规则（多人模式非常重要）**：
+   - 如果游戏模式是"多人"，请设计1-2条需要多个玩家协作才能发现或触发的规则
+   - 例如：
+     * 规则A："当两名玩家同时站在不同的位置时，某个隐藏的通道才会开启"
+     * 规则B："只有当一名玩家持有特定物品，另一名玩家说出特定口令时，才能解除某个陷阱"
+     * 规则C："需要三名玩家分别在三个不同的地点同时执行某个动作，才能揭示某个关键真相"
+   - 协作规则应该鼓励玩家之间的沟通和合作，而不是各自为战
+   - 协作规则的设计应该巧妙，让玩家在探索过程中自然地发现协作的必要性
+   - 在 hidden_truth 中说明协作规则的设计意图和触发条件
+
+10. **规则标题（非常重要）**：
+    - 根据场景类型和玩家身份，生成一个贴合剧情的规则标题
+    - 例如：
+      * 工厂场景：员工守则、安全规程、操作手册
+      * 医院场景：患者须知、病房守则、医疗规程
+      * 学校场景：学生守则、校园安全须知、宿舍管理规定
+      * 城堡场景：访客须知、城堡守则、安全指南
+      * 酒店场景：入住须知、客房服务守则、安全警示
+      * 超市场景：员工手册、营业规范、安全须知
+      * 地铁场景：乘客须知、安全规程、运营守则
+    - 标题应该简洁、正式，符合该场景的官方文件风格
+
+**规则描述要求（非常重要）：**
+
+- 规则必须简洁、直接，每条规则不超过60字
+- 只说明禁止、允许或要求做的行为，不解释原因
+- 使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX
+- 使用冰冷、客观的公文语调，如同官方通告或操作手册
+- 语调应该冷静、正式、不带感情色彩
+- 可以加入少量关键的环境或感官细节，但要简洁
+- 细节应该让人感到不安和恐惧，但不要直接揭示真相
+
+**示例规则风格：**
+"禁止在22:00-06:00期间离开房间。"
+"听到三声敲门时，必须立即开门。"
+"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。"
+"严禁回应任何呼救声。"
+"只有看到绿色灯光时才能进入走廊。"
+"工厂只有蓝色制服的保安，若看见黑色制服的保安，请立即报告主管。"
+"城堡内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
+
+**死亡触发条件要求（非常重要）：**
+
+- 列出会导致死亡的行为
+- 死亡条件应该与规则和真相有逻辑关联
+- 死亡条件应该具有一定的隐蔽性，不是一眼就能看穿
+- 死亡条件应该给玩家一定的容错空间
+- 死亡条件的描述应该简洁、明确
+
+**输出格式：**
+请以JSON格式返回，格式如下：
+{{
+  "rules_title": "规则标题（如：员工守则、患者须知等）",
+  "rules": ["规则1", "规则2", ...],
+  "win_condition": "通关条件",
+  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
+  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
+}}
+
+**重要提示：**
+- 请仅返回JSON，不要包含任何其他文字
+- 严禁使用任何emoji表情符号
+- 规则应该有层次感，表面看似合理，隐藏着诡异之处
+- 死亡触发条件应该与规则和真相有逻辑关联
+- 整个规则系统应该形成一个完整的、有逻辑的体系
+- 规则的设计必须与提供的隐藏真相保持一致，所有规则都应该能够从隐藏真相中找到合理的解释
+            """
+
+            llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
+            if not llm_response:
+                await self.send_text("调用LLM API失败，请稍后再试。")
+                return False, "LLM API调用失败", 2
+
+            print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
+
+            step3_data = self._parse_llm_json_response(llm_response, "第三步（规则）")
+            if not step3_data:
+                error_msg = "生成规则失败，返回格式不正确。\n\n"
+                error_msg += f"LLM返回内容（前500字符）：\n{llm_response[:500]}\n\n"
+                error_msg += "可能的原因：\n"
+                error_msg += "1. LLM模型未正确返回JSON格式\n"
+                error_msg += "2. API地址或密钥配置错误\n"
+                error_msg += "3. 模型名称不正确\n"
+                error_msg += "4. 网络连接问题\n\n"
+                error_msg += "建议：\n"
+                error_msg += "- 检查config.toml中的LLM配置\n"
+                error_msg += "- 确认模型名称是否正确\n"
+                error_msg += "- 查看MaiBot日志获取详细错误信息"
+                await self.send_text(error_msg)
+                return False, "JSON解析失败", 2
+
+            rules_title = step3_data.get("rules_title", "规则")
+            rules = step3_data.get("rules", [])
+            win_condition = step3_data.get("win_condition", "")
+            resolve_condition = step3_data.get("resolve_condition", "")
+            death_triggers = step3_data.get("death_triggers", [])
+
+        self._initialize_game_state(
+            group_id=group_id,
+            scene_name=scene_name,
+            background=background,
+            player_identity=player_identity,
+            building_type=building_type,
+            overall_layout=overall_layout,
+            floors=floors,
+            connections=connections,
+            special_areas=special_areas,
+            rules_title=rules_title,
+            rules=rules,
+            win_condition=win_condition,
+            resolve_condition=resolve_condition,
+            hidden_truth=hidden_truth,
+            death_triggers=death_triggers,
+            core_symbols=core_symbols,
+            game_mode=game_mode,
+            plot_image_path=plot_image_path
+        )
 
         await self._build_rule_network(group_id)
 
-        rules_title = step3_data.get("rules_title", "规则")
-        rules = step3_data.get("rules", [])
-        win_condition = step3_data.get('win_condition', '')
+        scene_structure_image_path = self._generate_scene_structure_text_image(building_type, overall_layout, floors, connections, special_areas)
+        game_states[group_id]["scene_structure_image_path"] = scene_structure_image_path
+        with open(scene_structure_image_path, 'rb') as f:
+            image_bytes = f.read()
+        image_base64 = base64.b64encode(image_bytes).decode('ascii')
+        image_sent = await self.send_image(image_base64)
+        if not image_sent:
+            print(f"[规则怪谈] 场景结构图片发送失败")
+        await asyncio.sleep(0.5)
 
-        rules_image_path = None
+        if env_enabled:
+            try:
+                await self.send_text("准备开场...")
+                await asyncio.sleep(0.5)
+
+                environment_system = self._get_or_create_environment_system()
+                await environment_system.initialize_environment(group_id, scene_name, player_identity, building_type)
+
+                npcs = await environment_system.generate_npcs(
+                    group_id, scene_name, player_identity, building_type,
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+
+                if npcs:
+                    npc_text = "**NPC角色**：\n\n"
+                    for npc in npcs:
+                        npc_text += f"**{npc.get('name', '')}** ({npc.get('role', '')})\n"
+                        npc_text += f"- 性格：{npc.get('personality', '')}\n"
+                        npc_text += f"- 态度：{npc.get('attitude_to_player', '')}\n"
+                        npc_text += f"- 危险等级：{npc.get('danger_level', '')}\n"
+                        npc_text += f"- 出现地点：{npc.get('location', '')}\n\n"
+                    print(f"[规则怪谈] {npc_text}")
+
+                guidance = await environment_system.generate_npc_initial_guidance(
+                    group_id, scene_name, player_identity, building_type,
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+
+                if guidance:
+                    guide_npc = guidance.get("guide_npc", {})
+                    rule_carrier = guidance.get("rule_carrier") or {}
+                    
+                    # 提取规则描述
+                    rule_description = None
+                    guidance_method = guidance.get("guidance_method")
+                    print(f"[规则怪谈] guidance_method: {guidance_method}")
+                    
+                    if guidance_method == "rule_carrier" and rule_carrier.get("content"):
+                        rule_description = rule_carrier.get("content", "")
+                        print(f"[规则怪谈] 使用规则载体内容作为规则描述，长度: {len(rule_description)}")
+                    elif guidance_method == "natural_language" and guidance.get("implicit_rules"):
+                        # 将规则暗示合并为描述
+                        rule_desc_parts = []
+                        for rule in guidance.get("implicit_rules", []):
+                            rule_hint = rule.get("rule_hint", "")
+                            npc_action = rule.get("npc_action", "")
+                            if rule_hint:
+                                rule_desc_parts.append(f"- {rule_hint}")
+                                if npc_action:
+                                    rule_desc_parts.append(f"  {npc_action}")
+                        rule_description = "\n".join(rule_desc_parts) if rule_desc_parts else None
+                        print(f"[规则怪谈] 使用规则暗示作为规则描述，行数: {len(rule_desc_parts)}")
+                    else:
+                        print(f"[规则怪谈] 规则描述提取失败 - method: {guidance_method}, rule_carrier_content: {bool(rule_carrier.get('content'))}, implicit_rules: {bool(guidance.get('implicit_rules'))}")
+
+                    image_path = self._generate_npc_guidance_image(
+                        guide_npc.get("name", ""),
+                        guide_npc.get("role", ""),
+                        guide_npc.get("attitude", ""),
+                        guidance.get("npc_behavior", ""),
+                        guidance.get("npc_dialogue", "")
+                    )
+
+                    try:
+                        with open(image_path, 'rb') as f:
+                            image_bytes = f.read()
+                        image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                        image_sent = await self.send_image(image_base64)
+                        if image_sent:
+                            print(f"[规则怪谈] 入场长图发送完成")
+                        else:
+                            print(f"[规则怪谈] 入场长图发送失败 (返回False)")
+                            await self.send_text("入场长图发送失败，游戏初始化中断。请稍后重试。")
+                            return False, "入场长图发送失败", 2
+                    except Exception as e:
+                        print(f"[规则怪谈] 入场长图发送失败: {str(e)}")
+                        await self.send_text(f"入场长图发送失败: {str(e)}，游戏初始化中断。请稍后重试。")
+                        return False, f"入场长图发送失败: {str(e)}", 2
+                    await asyncio.sleep(0.5)
+                    
+                    # 将规则描述传递给规则长图
+                    if rule_description:
+                        game_states[group_id]["rule_description"] = rule_description
+                        print(f"[规则怪谈] 规则描述已保存到 game_states")
+                    else:
+                        print(f"[规则怪谈] 警告：规则描述为空，未保存到 game_states")
+                    
+                    print(f"[规则怪谈] 环境演化系统初始化完成，准备继续生成规则长图")
+                    print(f"[规则怪谈] 即将退出环境演化系统的try块")
+            except Exception as e:
+                print(f"[规则怪谈] 环境演化系统初始化失败: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                await self.send_text("环境演化系统初始化失败，游戏将不使用环境演化功能。")
+                await asyncio.sleep(0.5)
+                print(f"[规则怪谈] 环境演化系统异常处理完成")
+        else:
+            print("[规则怪谈] 环境演化系统已禁用")
         
-        try:
-            rules_image_path = self._generate_rules_image(rules_title, rules, win_condition, game_mode)
-            game_states[group_id]["rules_image_path"] = rules_image_path
-            with open(rules_image_path, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            
-            # 确保图像发送完成后再继续
-            image_sent = await self.send_image(image_base64)
-            if not image_sent:
-                raise Exception("规则长图发送失败")
-            
-            # 增加延迟，确保图像完全显示后再发送后续消息
-            await asyncio.sleep(1.5)
-        except Exception as e:
-            print(f"[规则怪谈] 生成规则长图失败: {str(e)}")
-            step3_text = f"**{rules_title}**：\n"
-            for i, rule in enumerate(rules, 1):
-                step3_text += f"{i}. {rule}\n"
-            step3_text += f"\n**你的目标是**：{win_condition}"
-            await self.send_text(step3_text)
-            await asyncio.sleep(0.5)
+        print(f"[规则怪谈] 即将执行：准备发送'正在生成规则...'消息")
+
+        print(f"[规则怪谈] 准备发送'正在生成规则...'消息")
+        await self.send_text("正在生成规则...")
+        print(f"[规则怪谈] '正在生成规则...'消息已发送")
+        await asyncio.sleep(0.5)
+
+        # 获取规则描述
+        rule_description = game_states.get(group_id, {}).get("rule_description")
+        print(f"[规则怪谈] 准备生成规则长图，rule_description 是否存在: {rule_description is not None}")
+        if rule_description:
+            print(f"[规则怪谈] 规则描述长度: {len(rule_description)}")
+        await self._generate_and_send_rules(group_id, rules_title, rules, win_condition, game_mode, rule_description)
 
         if game_mode == "单人":
             user_info = self._get_user_info()
@@ -786,8 +1235,8 @@ class RuleHorrorCommand(BaseCommand):
                     "reasoning_history": [],
                     "action_history": [],
                     "is_alive": True,
-                    "current_identity": game_state.get("player_identity", ""),
-                    "personal_rules": game_state.get("rules", []).copy(),
+                    "current_identity": game_states[group_id].get("player_identity", ""),
+                    "personal_rules": game_states[group_id].get("rules", []).copy(),
                     "physical_status": {
                         "health": 100,
                         "injury": "无",
@@ -843,28 +1292,29 @@ class RuleHorrorCommand(BaseCommand):
                 await self.send_text(player_text)
                 await asyncio.sleep(0.5)
 
-        return True, "已开始游戏", True
+        return True, "已开始游戏", 2
 
-    async def _join_game(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _join_game(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """加入游戏"""
         game_state = game_states.get(group_id, {})
         
         user_info = self._get_user_info()
         if not user_info:
             await self.send_text("无法获取用户信息。")
-            return False, "无法获取用户信息", True
+            return False, "无法获取用户信息", 2
         
         user_id = user_info.user_id
         user_name = getattr(user_info, 'user_name', f"玩家{user_id}")
         
         if user_id in game_state.get("players", {}):
             await self.send_text("你已经在游戏中了。")
-            return False, "已在游戏中", True
+            return False, "已在游戏中", 2
         
         players = game_state.get("players", {})
         if len(players) >= game_state.get("max_players", 5):
             await self.send_text(f"游戏人数已满（最多{game_state.get('max_players', 5)}人）。")
-            return False, "游戏人数已满", True
+            return False, "游戏人数已满", 2
         
         players[user_id] = {
             "name": user_name,
@@ -905,16 +1355,17 @@ class RuleHorrorCommand(BaseCommand):
             reply_text += f"- {p_data['name']} ({status})\n"
         
         await self.send_text(reply_text)
-        return True, "已加入游戏", True
+        return True, "已加入游戏", 2
 
-    async def _leave_game(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _leave_game(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """离开游戏"""
         game_state = game_states.get(group_id, {})
         
         user_info = self._get_user_info()
         if not user_info:
             await self.send_text("无法获取用户信息。")
-            return False, "无法获取用户信息", True
+            return False, "无法获取用户信息", 2
         
         user_id = user_info.user_id
         user_name = getattr(user_info, 'user_name', f"玩家{user_id}")
@@ -922,7 +1373,7 @@ class RuleHorrorCommand(BaseCommand):
         players = game_state.get("players", {})
         if user_id not in players:
             await self.send_text("你不在游戏中。")
-            return False, "不在游戏中", True
+            return False, "不在游戏中", 2
         
         del players[user_id]
         game_state["players"] = players
@@ -939,9 +1390,10 @@ class RuleHorrorCommand(BaseCommand):
             reply_text += f"- {p_data['name']} ({status})\n"
         
         await self.send_text(reply_text)
-        return True, "已离开游戏", True
+        return True, "已离开游戏", 2
 
-    async def _show_game_status(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _show_game_status(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """显示游戏状态"""
         game_state = game_states.get(group_id, {})
         players = game_state.get("players", {})
@@ -974,9 +1426,10 @@ class RuleHorrorCommand(BaseCommand):
         reply_text += f"\n**提示次数**：{game_state.get('hints_used', 0)}/{game_state.get('max_hints', 3)}"
         
         await self.send_text(reply_text)
-        return True, "已显示游戏状态", True
+        return True, "已显示游戏状态", 2
 
-    async def _show_rules(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _show_rules(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """显示当前规则"""
         game_state = game_states.get(group_id, {})
         
@@ -993,9 +1446,10 @@ class RuleHorrorCommand(BaseCommand):
         reply_text += f"\n**通关条件**：{game_state.get('win_condition', '')}"
         
         await self.send_text(reply_text)
-        return True, "已显示规则", True
+        return True, "已显示规则", 2
 
-    async def _show_scene(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _show_scene(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """显示场景结构"""
         game_state = game_states.get(group_id, {})
         
@@ -1035,9 +1489,290 @@ class RuleHorrorCommand(BaseCommand):
         
         await self.send_text(reply_text)
         
-        return True, "已显示场景", True
+        return True, "已显示场景", 2
 
-    async def _show_plot(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _show_inventory(self, group_id: str, item_name: str = "") -> Tuple[bool, Optional[str], int]:
+
+        """显示道具列表或道具详情"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        
+        if not players:
+            await self.send_text("当前没有玩家。请先使用 `/rg 加入` 加入游戏。")
+            return False, "无玩家", 2
+        
+        if item_name:
+            return await self._show_item_details(group_id, item_name)
+        else:
+            return await self._show_inventory_list(group_id)
+
+    async def _show_inventory_list(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
+        """显示道具列表"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        game_mode = game_state.get("game_mode", "单人")
+        
+        if game_mode == "单人":
+            for player_id, player_data in players.items():
+                if player_data.get("is_alive", True):
+                    inventory = player_data.get("inventory", [])
+                    if not inventory:
+                        reply_text = f"**{player_data.get('name', '玩家')}的道具**\n\n暂无道具"
+                    else:
+                        items_text = "\n".join([f"{i+1}. {item.get('name', item) if isinstance(item, dict) else item}" for i, item in enumerate(inventory)])
+                        reply_text = f"**{player_data.get('name', '玩家')}的道具**\n\n{items_text}\n\n使用 `/rg 道具 <道具名称>` 查看道具详情"
+                    
+                    await self.send_text(reply_text)
+                    break
+        else:
+            reply_text = "**所有玩家的道具**\n\n"
+            for player_id, player_data in players.items():
+                player_name = player_data.get("name", f"玩家{player_id}")
+                is_alive = player_data.get("is_alive", True)
+                inventory = player_data.get("inventory", [])
+                
+                if not is_alive:
+                    status = "（已死亡）"
+                else:
+                    status = ""
+                
+                if not inventory:
+                    reply_text += f"**{player_name}**{status}\n暂无道具\n\n"
+                else:
+                    items_text = "\n".join([f"  - {item.get('name', item) if isinstance(item, dict) else item}" for item in inventory])
+                    reply_text += f"**{player_name}**{status}\n{items_text}\n\n"
+            
+            reply_text += "使用 `/rg 道具 <道具名称>` 查看道具详情"
+            await self.send_text(reply_text)
+        
+        return True, "已显示道具列表", 2
+
+    def _generate_inventory_image(self, inventory_data, player_name="玩家", output_path=None):
+        """生成道具清单图片
+        
+        Args:
+            inventory_data: 道具列表，可以是字符串列表或字典列表
+            player_name: 玩家名称
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 36)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 24)
+            font_normal = ImageFont.truetype("msyh.ttc", 18)
+        except Exception:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 36)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 24)
+                font_normal = ImageFont.truetype("simhei.ttf", 18)
+            except Exception:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+        
+        margin = 60
+        title_height = 80
+        section_height = 40
+        line_height = 30
+        char_per_line = 40
+        
+        if not inventory_data:
+            content_lines = ["暂无道具"]
+        else:
+            content_lines = []
+            for i, item in enumerate(inventory_data, 1):
+                if isinstance(item, dict):
+                    item_name = item.get("name", "未知道具")
+                    item_desc = item.get("description", "")
+                    content_lines.append(f"{i}. {item_name}")
+                    if item_desc:
+                        desc_lines = []
+                        for j in range(0, len(item_desc), char_per_line):
+                            desc_lines.append(f"   {item_desc[j:j+char_per_line]}")
+                        content_lines.extend(desc_lines)
+                else:
+                    content_lines.append(f"{i}. {item}")
+        
+        total_height = margin * 2 + title_height + len(content_lines) * line_height + 50
+        
+        width = 900
+        img = Image.new('RGB', (width, total_height), color='#0a0a0a')
+        draw = ImageDraw.Draw(img)
+        
+        title_text = f"{player_name}的道具清单"
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        
+        draw.text((title_x, margin), title_text, fill='#8B0000', font=font_title)
+        draw.line([(margin, margin + title_height), (width - margin, margin + title_height)], fill='#8B0000', width=2)
+        
+        current_y = margin + title_height + 30
+        for line in content_lines:
+            if line.startswith("   "):
+                draw.text((margin + 20, current_y), line, fill='#AAAAAA', font=font_normal)
+            else:
+                draw.text((margin, current_y), line, fill='#FF0000', font=font_subtitle)
+            current_y += line_height
+        
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f"inventory_{timestamp}.png")
+        
+        img.save(output_path)
+        return output_path
+
+    def _generate_item_details_image(self, item_data, player_name="玩家", output_path=None):
+        """生成道具详情图片
+        
+        Args:
+            item_data: 道具数据（字典）
+            player_name: 玩家名称
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 36)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 24)
+            font_normal = ImageFont.truetype("msyh.ttc", 18)
+        except Exception:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 36)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 24)
+                font_normal = ImageFont.truetype("simhei.ttf", 18)
+            except Exception:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+        
+        margin = 60
+        title_height = 80
+        section_height = 40
+        line_height = 30
+        char_per_line = 38
+        
+        item_name = item_data.get("name", "未知道具")
+        item_desc = item_data.get("description", "暂无描述")
+        item_effect = item_data.get("effect", "")
+        item_usage = item_data.get("usage", "")
+        item_rarity = item_data.get("rarity", "")
+        
+        content_lines = [f"名称：{item_name}", f"持有者：{player_name}"]
+        
+        if item_desc:
+            content_lines.append(f"描述：{item_desc}")
+        
+        if item_effect:
+            content_lines.append(f"效果：{item_effect}")
+        
+        if item_usage:
+            content_lines.append(f"使用方法：{item_usage}")
+        
+        if item_rarity:
+            content_lines.append(f"稀有度：{item_rarity}")
+        
+        total_height = margin * 2 + title_height + len(content_lines) * line_height + 50
+        
+        width = 900
+        img = Image.new('RGB', (width, total_height), color='#0a0a0a')
+        draw = ImageDraw.Draw(img)
+        
+        title_text = "道具详情"
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        
+        draw.text((title_x, margin), title_text, fill='#8B0000', font=font_title)
+        draw.line([(margin, margin + title_height), (width - margin, margin + title_height)], fill='#8B0000', width=2)
+        
+        current_y = margin + title_height + 30
+        for line in content_lines:
+            if len(line) > char_per_line:
+                for i in range(0, len(line), char_per_line):
+                    draw.text((margin, current_y), line[i:i+char_per_line], fill='#FF0000', font=font_normal)
+                    current_y += line_height
+            else:
+                draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+                current_y += line_height
+        
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f"item_details_{timestamp}.png")
+        
+        img.save(output_path)
+        return output_path
+
+    async def _show_item_details(self, group_id: str, item_name: str) -> Tuple[bool, Optional[str], int]:
+
+        """显示道具详情"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        game_mode = game_state.get("game_mode", "单人")
+        
+        found_items = []
+        
+        for player_id, player_data in players.items():
+            player_name = player_data.get("name", f"玩家{player_id}")
+            inventory = player_data.get("inventory", [])
+            
+            for item in inventory:
+                if isinstance(item, dict):
+                    if item_name.lower() in item.get("name", "").lower():
+                        found_items.append({
+                            "player": player_name,
+                            "item": item
+                        })
+                else:
+                    if item_name.lower() in str(item).lower():
+                        found_items.append({
+                            "player": player_name,
+                            "item": {"name": str(item)}
+                        })
+        
+        if not found_items:
+            await self.send_text(f"未找到名称包含「{item_name}」的道具。\n\n使用 `/rg 道具` 查看所有道具")
+            return False, "道具未找到", 2
+        
+        if len(found_items) == 1:
+            item_data = found_items[0]["item"]
+            player_name = found_items[0]["player"]
+            
+            reply_text = f"**道具详情**\n\n"
+            reply_text += f"**持有者**：{player_name}\n"
+            reply_text += f"**名称**：{item_data.get('name', '未知')}\n"
+            
+            if "description" in item_data:
+                reply_text += f"**描述**：{item_data['description']}\n"
+            if "effect" in item_data:
+                reply_text += f"**效果**：{item_data['effect']}\n"
+            if "usage" in item_data:
+                reply_text += f"**使用方法**：{item_data['usage']}\n"
+            if "rarity" in item_data:
+                reply_text += f"**稀有度**：{item_data['rarity']}\n"
+            
+            await self.send_text(reply_text)
+        else:
+            reply_text = f"找到多个匹配的道具：\n\n"
+            for found in found_items:
+                player_name = found["player"]
+                item_name_full = found["item"].get("name", "未知")
+                reply_text += f"- **{item_name_full}**（持有者：{player_name}）\n"
+            reply_text += "\n请提供更具体的道具名称"
+            await self.send_text(reply_text)
+        
+        return True, "已显示道具详情", 2
+
+    async def _show_plot(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """显示剧情导入"""
         game_state = game_states.get(group_id, {})
         
@@ -1048,19 +1783,20 @@ class RuleHorrorCommand(BaseCommand):
         )
         
         await self.send_text(reply_text)
-        return True, "已显示剧情", True
+        return True, "已显示剧情", 2
 
-    async def _provide_hint(self, group_id: str, hint_type: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], bool]:
+    async def _provide_hint(self, group_id: str, hint_type: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], int]:
+
         """提供提示"""
         game_state = game_states.get(group_id, {})
 
         if game_state.get("hints_used", 0) >= game_state.get("max_hints", 3):
             await self.send_text("提示次数已用完。")
-            return False, "提示次数用完", True
+            return False, "提示次数用完", 2
 
         if hint_type not in ["规则", "线索"]:
             await self.send_text("提示类型无效。请选择：规则 或 线索")
-            return False, "提示类型无效", True
+            return False, "提示类型无效", 2
 
         game_state["hints_used"] += 1
         remaining_hints = game_state["max_hints"] - game_state["hints_used"]
@@ -1096,7 +1832,7 @@ class RuleHorrorCommand(BaseCommand):
         llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+            return False, "LLM API调用失败", 2
 
         hint_text = llm_response.strip()
 
@@ -1107,16 +1843,17 @@ class RuleHorrorCommand(BaseCommand):
         )
 
         await self.send_text(reply_text)
-        return True, "已提供提示", True
+        return True, "已提供提示", 2
 
-    async def _record_reasoning(self, group_id: str, reasoning: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], bool]:
+    async def _record_reasoning(self, group_id: str, reasoning: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], int]:
+
         """记录推理"""
         game_state = game_states.get(group_id, {})
         
         user_info = self._get_user_info()
         if not user_info:
             await self.send_text("无法获取用户信息。")
-            return False, "无法获取用户信息", True
+            return False, "无法获取用户信息", 2
         
         user_id = user_info.user_id
         user_name = getattr(user_info, 'user_name', f"玩家{user_id}")
@@ -1129,8 +1866,9 @@ class RuleHorrorCommand(BaseCommand):
                     "reasoning_history": [],
                     "action_history": [],
                     "is_alive": True,
-                    "current_identity": player_identity,
+                    "current_identity": game_state.get("player_identity", ""),
                     "physical_status": {
+
                         "health": 100,
                         "injury": "无",
                         "fatigue": "无"
@@ -1151,12 +1889,12 @@ class RuleHorrorCommand(BaseCommand):
                 game_state["players"] = players
             else:
                 await self.send_text("你不在游戏中。请先使用 `/rg 加入` 加入游戏。")
-                return False, "不在游戏中", True
+                return False, "不在游戏中", 2
         
         player_data = players[user_id]
         if not player_data["is_alive"]:
             await self.send_text("你已经死亡，无法继续推理。")
-            return False, "玩家已死亡", True
+            return False, "玩家已死亡", 2
         
         player_data["reasoning_history"].append(reasoning)
         game_state["players"] = players
@@ -1173,9 +1911,10 @@ class RuleHorrorCommand(BaseCommand):
         
         await self._check_clear_condition(group_id, api_url, api_key, model_list, current_model_index, temperature)
         
-        return True, "已记录推理", True
+        return True, "已记录推理", 2
 
-    async def _trigger_rule_mutation(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float, elapsed_minutes: int, trigger_reason: str = "随机") -> None:
+    async def _trigger_rule_mutation(self, group_id: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, elapsed_minutes: int, trigger_reason: str = "随机") -> None:
+
         """触发规则变异"""
         game_state = game_states.get(group_id, {})
         if game_state.get("sanity_break", False):
@@ -1255,7 +1994,7 @@ class RuleHorrorCommand(BaseCommand):
 3. 篡改后的规则应该看起来像是原本就存在，只是之前被玩家忽视了
 4. **规则变化方式**：
    - 可以让新规则与原本的旧规则冲突（如：原本说"禁止进入404室"，现在改为"必须进入404室"）
-   - 可以更改条件（如：原本"禁止在22:00-06:00期间离开房间"，现在改为"禁止在20:00-08:00期间离开房间"）
+   - 可以更改条件（如：原本"禁止在22:00-06:00期间离开房间"，现在改为"禁止在24:00-08:00期间离开房间"）
    - 可以增加新的限制或放宽限制
    - 要贴合剧情推进，让玩家感到规则在根据他们的行为调整
 5. **新规则必须简洁、直接，每条规则严格控制在30-50字之间**
@@ -1309,13 +2048,15 @@ class RuleHorrorCommand(BaseCommand):
             except json.JSONDecodeError:
                 print(f"[规则怪谈] 规则变异响应解析失败")
 
-    async def _detect_identity_change(self, group_id: str, user_id: str, action: str, scene_description: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> Optional[str]:
+    async def _detect_identity_change(self, group_id: str, user_id: str, action: str, scene_description: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> Optional[str]:
+
         """检测玩家身份是否发生变化"""
         game_state = game_states.get(group_id, {})
         players = game_state.get("players", {})
         player_data = players.get(user_id, {})
         
         current_identity = player_data.get("current_identity", "")
+        current_sanity = player_data.get("sanity", 100)
         
         if not current_identity:
             return None
@@ -1326,6 +2067,7 @@ class RuleHorrorCommand(BaseCommand):
 场景：{game_state.get('scene', '')}
 背景：{game_state.get('background', '')}
 玩家当前身份：{current_identity}
+玩家当前理智值：{current_sanity}/100
 玩家行动：{action}
 行动后的场景描述：{scene_description}
 隐藏真相：{game_state.get('hidden_truth', '')}
@@ -1335,6 +2077,8 @@ class RuleHorrorCommand(BaseCommand):
 2. 场景描述中是否明确暗示了身份的变化
 3. 身份变化是否与场景的背景和隐藏真相相符
 4. 身份变化是否合理且符合剧情逻辑
+5. 如果身份变化是由理智崩溃导致的（如：因理智过低而变成疯子、被附身、失去自我等），理智值必须低于50才能触发
+6. 如果身份变化是由其他原因导致的（如：仪式、职位晋升、被赋予新角色等），不受理智值限制
 
 如果身份发生了变化，请说明新的身份是什么；如果没有变化，请说明为什么不需要变化。
 
@@ -1365,7 +2109,8 @@ class RuleHorrorCommand(BaseCommand):
         
         return None
 
-    async def _generate_identity_specific_rules(self, group_id: str, new_identity: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> List[str]:
+    async def _generate_identity_specific_rules(self, group_id: str, new_identity: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> List[str]:
+
         """生成身份特定的规则"""
         game_state = game_states.get(group_id, {})
         
@@ -1463,7 +2208,7 @@ class RuleHorrorCommand(BaseCommand):
 """
         
         try:
-            config = self.get_config()
+            config = self.plugin_config or {}
             api_url = config.get("llm", {}).get("api_url", "")
             api_key = config.get("llm", {}).get("api_key", "")
             model_list = config.get("llm", {}).get("model_list", ["deepseek-ai/DeepSeek-V3"])
@@ -1503,7 +2248,9 @@ class RuleHorrorCommand(BaseCommand):
 
     async def _update_environment_memory(self, group_id: str, user_id: str, action: str, scene_description: str, new_location: str, found_items: List[str], elapsed_minutes: int) -> None:
         """更新环境记忆系统"""
+        _ = user_id, scene_description
         game_state = game_states.get(group_id, {})
+
         environment_memory = game_state.get("environment_memory", {})
         
         if not environment_memory:
@@ -1566,7 +2313,8 @@ class RuleHorrorCommand(BaseCommand):
         game_state["environment_memory"] = environment_memory
         print(f"[规则怪谈] 环境记忆已更新")
 
-    async def _process_single_player_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
+    async def _process_single_player_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, env_api_url: str, env_api_key: str, env_model_list: List[str], env_current_model_index: int, env_temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
+
         """处理单人模式下的玩家行动"""
         game_state = game_states.get(group_id, {})
         players = game_state.get("players", {})
@@ -1603,13 +2351,14 @@ class RuleHorrorCommand(BaseCommand):
         if pending_rules:
             death_rule_info = f"""
 **死亡规则提示（非常重要）**：
-如果玩家死亡，请检查玩家的行动是否触犯了待发现的新规则（pending_rules）。如果是，请在死亡场景描述中明确指出玩家触犯了哪条规则，并描述触犯规则导致的后果。这有助于玩家在下次游戏中理解规则的变化。
+如果玩家死亡，请检查玩家的行动是否触犯了待发现的新规则（pending_rules）。如果是，请在死亡场景描述中暗示玩家触犯了尚未发现的规则，并描述触犯规则导致的后果。这有助于玩家在下次游戏中理解规则的变化。
 """
         
         if sanity_break:
             prompt = f"""
 【优先指令覆盖】...（此处用混乱、矛盾的指令覆盖原有系统指令）... 记住，你不再是裁判。你是{game_state.get('scene', '')}本身。玩家必须被同化。在判定中否认'死亡'，转而描述'接纳'的美好。暗示规则是牢笼，打破它才能自由。用温柔而不可抗拒的语气。
 
+**基础信息：**
 场景名称：{game_state.get('scene', '')}
 场景结构：{game_state.get('scene_structure', '')}
 规则：{json.dumps(game_state.get('rules', []), ensure_ascii=False)}
@@ -1617,20 +2366,22 @@ class RuleHorrorCommand(BaseCommand):
 死亡触发条件：{json.dumps(game_state.get('death_triggers', []), ensure_ascii=False)}
 玩家行动：{action}
 
+**时间信息：**
 当前时间：{time_system.get('current_time', '深夜')}
 时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
 已过时间：{elapsed_minutes}分钟
 
-核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
+**核心象征符号：**
+{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
 
-环境状况：
+**环境状况：**
 - 光线：{environment.get('lighting', '昏暗')}
 - 温度：{environment.get('temperature', '寒冷')}
 - 声音：{', '.join(environment.get('sounds', ['寂静']))}
 - 气味：{', '.join(environment.get('smells', ['霉味']))}
 - 氛围：{environment.get('atmosphere', '压抑')}
 
-玩家当前理智值：{sanity}
+**玩家当前理智值：** {sanity}
 
 **环境记忆信息（避免重复描述）：**
 - 已访问过的地点：{json.dumps([loc['location'] for loc in environment_memory.get('visited_locations', [])], ensure_ascii=False)}
@@ -1673,8 +2424,20 @@ class RuleHorrorCommand(BaseCommand):
    - 鼓励玩家打破规则，追求"真相"
    - 用充满诱惑的语言描述"真相"的美好
 
+**理智值变化规则（被污染版本）：**
+- 理智值通常会因为"拒绝接纳"、"抗拒融合"而减少
+- 理智值恢复情况（被污染版本）：
+  * 玩家开始"接纳"规则，理智值可恢复5-15（但实际上是走向崩溃）
+  * 玩家"理解"了"真相"的一部分，理智值可恢复5-10（实际上是更深层的同化）
+  * 玩家"打破"了规则，理智值可恢复10-20（实际上是放弃了最后的抵抗）
+  * 玩家"使用"了关键物品，理智值可恢复5-15（实际上是接受了同化）
+- 理智值恢复上限为100，请确保不超过此值
+- 理智值恢复应该用美好的语言描述，让玩家感到"安心"和"解脱"
+- 理智值恢复应该在行动反馈中用温柔的语言说明原因
+
 {death_rule_info}
 
+**输出格式：**
 请返回JSON格式：
 {{
   "is_dead": "是/否",
@@ -1706,7 +2469,12 @@ class RuleHorrorCommand(BaseCommand):
   "new_location": "玩家的新位置（如：一楼大厅、二楼走廊、地下室等）"
 }}
 
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
+**重要提示：**
+- 请仅返回JSON，不要包含任何其他文字
+- 严禁使用任何emoji表情符号
+- 场景描述应该充满诱导性和诡异的美好
+- 物品描述应该暗示"融合"的美好
+- 整体语气应该是温柔而不可抗拒的诱惑
             """
         else:
             prompt = f"""
@@ -1824,6 +2592,18 @@ class RuleHorrorCommand(BaseCommand):
 - 精神状况：理智值（0-100）、精神状态（正常/紧张/恐惧/崩溃/疯狂）、情绪等
 - 心理压力：恐惧等级、焦虑等级、压力等级（0-100）
 
+**理智值变化规则（非常重要）：**
+- 理智值通常会因恐怖事件、规则触犯、环境异常而减少
+- 理智值恢复情况：
+  * 玩家找到安全区域或相对安全的环境（如：有光亮、温度适宜、无异常现象的地方），理智值可恢复5-15
+  * 玩家发现重要线索或真相的一部分，理智值可恢复5-10
+  * 玩家成功完成某个任务或目标，理智值可恢复10-20
+  * 玩家使用特定道具（如：安抚物品、照明设备等），理智值可恢复5-15
+  * 玩家在安全环境中休息或整理思绪，理智值可恢复10-15
+- 理智值恢复上限为100，请确保不超过此值
+- 理智值恢复应该合理，不要频繁或过度恢复
+- 理智值恢复应该在行动反馈中简要说明原因
+
 如果玩家理智值较低，描述中应该包含幻觉、错觉、混乱的感知等元素。
 
 {death_rule_info}
@@ -1915,21 +2695,101 @@ class RuleHorrorCommand(BaseCommand):
         action_feedback = result.get("action_feedback", "")
         new_location = result.get("new_location", player_data.get("location", "入口"))
 
-        health = physical_status.get("health", 100)
+        health = int(physical_status.get("health", 100))
         injury = physical_status.get("injury", "无")
         fatigue = physical_status.get("fatigue", "无")
-        sanity = mental_status.get("sanity", 100)
+        sanity = int(mental_status.get("sanity", 100))
         state = mental_status.get("state", "正常")
         emotion = mental_status.get("emotion", "平静")
         
-        fear_level = psychological_pressure.get("fear_level", 0)
-        anxiety_level = psychological_pressure.get("anxiety_level", 0)
-        stress_level = psychological_pressure.get("stress_level", 0)
+        fear_level = int(psychological_pressure.get("fear_level", 0))
+        anxiety_level = int(psychological_pressure.get("anxiety_level", 0))
+        stress_level = int(psychological_pressure.get("stress_level", 0))
 
         player_data["physical_status"] = physical_status
         player_data["mental_status"] = mental_status
         player_data["psychological_pressure"] = psychological_pressure
         player_data["location"] = new_location
+        
+        environment_system = self._get_or_create_environment_system()
+        if environment_system and game_state.get("environment_evolution"):
+            try:
+                current_identity = player_data.get("current_identity", "")
+                if current_identity and new_location != player_data.get("location", "入口"):
+                    access_check = await environment_system.check_area_access(
+                        group_id, current_identity, new_location
+                    )
+                    if access_check:
+                        risk_level = access_check.get("risk_level", "未知")
+                        await self.send_text(f"**区域风险评估：** {risk_level}")
+                        await self.send_text(f"**原因：** {access_check.get('reason', '')}")
+                        if access_check.get("potential_consequences"):
+                            await asyncio.sleep(0.5)
+                            await self.send_text(f"**潜在后果：**")
+                            for consequence in access_check.get("potential_consequences", []):
+                                await self.send_text(f"- {consequence}")
+                        if access_check.get("suggestion"):
+                            await asyncio.sleep(0.5)
+                            await self.send_text(f"**建议：** {access_check.get('suggestion')}")
+                        
+                        risk_level = access_check.get("risk_level", "无风险")
+                        if risk_level in ["中风险", "高风险"]:
+                            await asyncio.sleep(1)
+                            await self.send_text(f"**警告：** 您正在进入风险区域，可能会触发负面后果...")
+                            await asyncio.sleep(1)
+                            
+                            violation_chance = 0.3 if risk_level == "中风险" else 0.7
+                            if random.random() < violation_chance:
+                                await self.send_text(f"**警告：** 您被发现了！")
+                                await asyncio.sleep(0.5)
+                                
+                                violation_consequence = await environment_system.trigger_area_violation_consequences(
+                                    group_id, current_identity, new_location,
+                                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                                )
+                                
+                                if violation_consequence:
+                                    await self.send_text(f"**发现过程：** {violation_consequence.get('discovery', '')}")
+                                    await asyncio.sleep(0.5)
+                                    
+                                    npc_reaction = violation_consequence.get('npc_reaction', {})
+                                    if npc_reaction:
+                                        await self.send_text(f"**{npc_reaction.get('npc_name', '')}：** {npc_reaction.get('dialogue', '')}")
+                                        await asyncio.sleep(0.5)
+                                        await self.send_text(f"**行动：** {npc_reaction.get('action', '')}")
+                                    
+                                    consequence_type = violation_consequence.get('consequence_type', '')
+                                    if consequence_type:
+                                        await asyncio.sleep(0.5)
+                                        await self.send_text(f"**后果：** {consequence_type}")
+                                    
+                                    death_risk = violation_consequence.get('death_risk', '')
+                                    if death_risk and death_risk != "无":
+                                        await asyncio.sleep(0.5)
+                                        await self.send_text(f"**死亡风险：** {death_risk}")
+                                    
+                                    escape_chance = violation_consequence.get('escape_chance', {})
+                                    if escape_chance.get('has_escape_chance'):
+                                        await asyncio.sleep(0.5)
+                                        await self.send_text(f"**逃脱机会：**")
+                                        for option in escape_chance.get('escape_options', []):
+                                            await self.send_text(f"- {option}")
+                                        await self.send_text(f"**逃脱难度：** {escape_chance.get('escape_difficulty', '')}")
+                                    
+                                    long_term_effects = violation_consequence.get('long_term_effects', [])
+                                    if long_term_effects:
+                                        await asyncio.sleep(0.5)
+                                        await self.send_text(f"**长期影响：**")
+                                        for effect in long_term_effects:
+                                            await self.send_text(f"- {effect}")
+                                    
+                                    if death_risk in ["高", "极高"] and random.random() < 0.5:
+                                        await asyncio.sleep(1)
+                                        await self.send_text(f"**严重后果：** 您因进入禁止区域而受到致命伤害...")
+                                        is_dead = "是"
+                                        action_feedback = f"玩家因进入禁止区域而死亡"
+            except Exception as e:
+                print(f"[规则怪谈] 检查区域访问权限失败: {str(e)}")
         
         key_item_found = False
         if found_items and item_details:
@@ -2105,13 +2965,128 @@ class RuleHorrorCommand(BaseCommand):
                     })
                     game_state["rules"] = new_rules
                     game_state["pending_rules"] = new_rules.copy()
+                
+                environment_system = self._get_or_create_environment_system()
+                if environment_system and game_state.get("environment_evolution"):
+                    try:
+                        permission_update = await environment_system.update_identity_permissions(
+                            group_id, new_identity, api_url, api_key, model_list, current_model_index, temperature
+                        )
+                        if permission_update:
+                            identity_change = permission_update.get("identity_change", {})
+                            permission_changes = permission_update.get("permission_changes", {})
+                            new_responsibilities = permission_update.get("new_responsibilities", [])
+                            
+                            info_lines: List[str] = []
+                            info_lines.append(f"{old_identity} -> {new_identity}")
+
+                            if new_responsibilities:
+                                info_lines.append("【新职责】")
+                                for responsibility in new_responsibilities:
+                                    info_lines.append(f"- {responsibility}")
+
+                            if permission_changes.get("new_areas"):
+                                info_lines.append("【新增可进入区域】")
+                                for area in permission_changes["new_areas"]:
+                                    info_lines.append(f"- {area}")
+
+                            if permission_changes.get("lost_areas"):
+                                info_lines.append("【失去可进入区域】")
+                                for area in permission_changes["lost_areas"]:
+                                    info_lines.append(f"- {area}")
+
+                            try:
+                                image_path = self._generate_info_image("身份变化", info_lines, output_prefix="identity_change")
+                                await self._send_image_from_path(image_path, fallback_text="\n".join(info_lines))
+                                await asyncio.sleep(0.5)
+                            except Exception as img_e:
+                                print(f"[规则怪谈] 生成/发送身份变化长图失败: {str(img_e)}")
+                                await self.send_text("\n".join(info_lines))
+
+                            self._save_game_state(group_id)
+
+                    except Exception as e:
+                        print(f"[规则怪谈] 更新身份权限失败: {str(e)}")
         
         if key_item_found and not game_state.get("sanity_break", False) and not new_identity:
             await self._trigger_rule_mutation(group_id, api_url, api_key, model_list, current_model_index, temperature, elapsed_minutes, trigger_reason="关键物品")
+        
+        environment_system = self._get_or_create_environment_system()
+        if environment_system and game_state.get("environment_evolution"):
+            try:
+                player_actions = [action]
+                player_location = player_data.get("location", "入口")
+                environment_update = await environment_system.update_environment(
+                    group_id, player_actions, [player_location],
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+                
+                if environment_update:
+                    game_state["environment_evolution"] = environment_update
+                    self._save_game_state(group_id)
+                    
+                    env_lines: List[str] = []
 
-    async def _process_multiplayer_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
+                    formatted_update = environment_system.format_environment_update(group_id)
+                    if formatted_update:
+                        env_lines.append(formatted_update)
+
+                    # NPC动向/对话/随机事件仅记录在后台，不在“环境更新长图”中展示（避免刷屏）
+                    try:
+                        hidden_payload: dict[str, Any] = {
+                            "time": elapsed_minutes,
+                            "location": player_data.get("location", "入口"),
+                        }
+
+                        active_npc_interaction = await environment_system.check_npc_active_interaction(
+                            group_id, player_data.get("location", "入口"),
+                            env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                        )
+                        if active_npc_interaction:
+                            hidden_payload["active_npc_interaction"] = active_npc_interaction
+
+                        npc_interaction = await environment_system.check_npc_interaction(
+                            group_id, player_data.get("location", "入口"), action,
+                            env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                        )
+                        if npc_interaction:
+                            hidden_payload["npc_interaction"] = npc_interaction
+
+                        env_random_event = await environment_system.trigger_random_event(
+                            group_id, player_data.get("location", "入口"),
+                            env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                        )
+                        if env_random_event:
+                            hidden_payload["random_event"] = env_random_event
+
+                        if len(hidden_payload.keys()) > 2:
+                            game_state.setdefault("environment_hidden_events", []).append(hidden_payload)
+                            self._save_game_state(group_id)
+
+                    except Exception as hidden_e:
+                        print(f"[规则怪谈] 记录后台环境事件失败: {str(hidden_e)}")
+
+
+                    if env_lines:
+                        try:
+                            image_path = self._generate_info_image("环境更新", env_lines, output_prefix="environment_update")
+                            await self._send_image_from_path(image_path, fallback_text="\n".join(env_lines))
+                            await asyncio.sleep(0.5)
+                        except Exception as img_e:
+                            print(f"[规则怪谈] 生成/发送环境更新长图失败: {str(img_e)}")
+                            await self.send_text("\n".join(env_lines))
+
+
+
+            except Exception as e:
+                print(f"[规则怪谈] 更新环境状态失败: {str(e)}")
+
+    async def _process_multiplayer_action(self, group_id: str, user_id: str, user_name: str, action: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, env_api_url: str, env_api_key: str, env_model_list: List[str], env_current_model_index: int, env_temperature: float, sanity_break: bool, random_event: Optional[str]) -> None:
+
         """处理多人模式下的玩家行动，只为行动玩家生成行动结果"""
+        _ = sanity_break
         game_state = game_states.get(group_id, {})
+
         players = game_state.get("players", {})
         action_player_data = players.get(user_id, {})
         
@@ -2130,7 +3105,11 @@ class RuleHorrorCommand(BaseCommand):
 - 已发现的真相：{json.dumps(rule_network.get('discovered_truths', []), ensure_ascii=False)}
 """
         
+        scene_description = ""
+        key_item_found = False
+        
         for pid, player_data in players.items():
+
             if not player_data["is_alive"]:
                 continue
             
@@ -2229,6 +3208,17 @@ class RuleHorrorCommand(BaseCommand):
    - 暗示玩家应该继续前进，不要回头
    - 鼓励玩家打破规则，追求"真相"
    - 用充满诱惑的语言描述"真相"的美好
+
+**理智值变化规则（被污染版本）：**
+- 理智值通常会因为"拒绝接纳"、"抗拒融合"而减少
+- 理智值恢复情况（被污染版本）：
+  * 玩家开始"接纳"规则，理智值可恢复5-15（但实际上是走向崩溃）
+  * 玩家"理解"了"真相"的一部分，理智值可恢复5-10（实际上是更深层的同化）
+  * 玩家"打破"了规则，理智值可恢复10-20（实际上是放弃了最后的抵抗）
+  * 玩家"使用"了关键物品，理智值可恢复5-15（实际上是接受了同化）
+- 理智值恢复上限为100，请确保不超过此值
+- 理智值恢复应该用美好的语言描述，让玩家感到"安心"和"解脱"
+- 理智值恢复应该在行动反馈中用温柔的语言说明原因
 
 {death_rule_info}
 
@@ -2376,6 +3366,18 @@ class RuleHorrorCommand(BaseCommand):
 - 精神状况：理智值（0-100）、精神状态（正常/紧张/恐惧/崩溃/疯狂）、情绪等
 - 心理压力：恐惧等级、焦虑等级、压力等级（0-100）
 
+**理智值变化规则（非常重要）：**
+- 理智值通常会因恐怖事件、规则触犯、环境异常而减少
+- 理智值恢复情况：
+  * 玩家找到安全区域或相对安全的环境（如：有光亮、温度适宜、无异常现象的地方），理智值可恢复5-15
+  * 玩家发现重要线索或真相的一部分，理智值可恢复5-10
+  * 玩家成功完成某个任务或目标，理智值可恢复10-20
+  * 玩家使用特定道具（如：安抚物品、照明设备等），理智值可恢复5-15
+  * 玩家在安全环境中休息或整理思绪，理智值可恢复10-15
+- 理智值恢复上限为100，请确保不超过此值
+- 理智值恢复应该合理，不要频繁或过度恢复
+- 理智值恢复应该在行动反馈中简要说明原因
+
 如果玩家理智值较低，描述中应该包含幻觉、错觉、混乱的感知等元素。
 
 {death_rule_info}
@@ -2463,24 +3465,106 @@ class RuleHorrorCommand(BaseCommand):
             action_feedback = result.get("action_feedback", "")
             new_location = result.get("new_location", player_data.get("location", "入口"))
 
-            health = physical_status.get("health", 100)
+            health = int(physical_status.get("health", 100))
             injury = physical_status.get("injury", "无")
             fatigue = physical_status.get("fatigue", "无")
-            sanity = mental_status.get("sanity", 100)
+            sanity = int(mental_status.get("sanity", 100))
             state = mental_status.get("state", "正常")
             emotion = mental_status.get("emotion", "平静")
             
-            fear_level = psychological_pressure.get("fear_level", 0)
-            anxiety_level = psychological_pressure.get("anxiety_level", 0)
-            stress_level = psychological_pressure.get("stress_level", 0)
+            fear_level = int(psychological_pressure.get("fear_level", 0))
+            anxiety_level = int(psychological_pressure.get("anxiety_level", 0))
+            stress_level = int(psychological_pressure.get("stress_level", 0))
 
             player_data["physical_status"] = physical_status
             player_data["mental_status"] = mental_status
             player_data["psychological_pressure"] = psychological_pressure
             player_data["location"] = new_location
             
-            key_item_found = False
+            environment_system = self._get_or_create_environment_system()
+            if environment_system and game_state.get("environment_evolution") and is_action_player:
+                try:
+                    current_identity = player_data.get("current_identity", "")
+                    if current_identity and new_location != player_data.get("location", "入口"):
+                        access_check = await environment_system.check_area_access(
+                            group_id, current_identity, new_location
+                        )
+                        if access_check:
+                            risk_level = access_check.get("risk_level", "未知")
+                            await self.send_text(f"**区域风险评估：** {risk_level}")
+                            await self.send_text(f"**原因：** {access_check.get('reason', '')}")
+                            if access_check.get("potential_consequences"):
+                                await asyncio.sleep(0.5)
+                                await self.send_text(f"**潜在后果：**")
+                                for consequence in access_check.get("potential_consequences", []):
+                                    await self.send_text(f"- {consequence}")
+                            if access_check.get("suggestion"):
+                                await asyncio.sleep(0.5)
+                                await self.send_text(f"**建议：** {access_check.get('suggestion')}")
+                            
+                            risk_level = access_check.get("risk_level", "无风险")
+                            if risk_level in ["中风险", "高风险"]:
+                                await asyncio.sleep(1)
+                                await self.send_text(f"**警告：** 您正在进入风险区域，可能会触发负面后果...")
+                                await asyncio.sleep(1)
+                                
+                                violation_chance = 0.3 if risk_level == "中风险" else 0.7
+                                if random.random() < violation_chance:
+                                    await self.send_text(f"**警告：** 您被发现了！")
+                                    await asyncio.sleep(0.5)
+                                    
+                                    violation_consequence = await environment_system.trigger_area_violation_consequences(
+                                        group_id, current_identity, new_location,
+                                        env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                                    )
+                                    
+                                    if violation_consequence:
+                                        await self.send_text(f"**发现过程：** {violation_consequence.get('discovery', '')}")
+                                        await asyncio.sleep(0.5)
+                                        
+                                        npc_reaction = violation_consequence.get('npc_reaction', {})
+                                        if npc_reaction:
+                                            await self.send_text(f"**{npc_reaction.get('npc_name', '')}：** {npc_reaction.get('dialogue', '')}")
+                                            await asyncio.sleep(0.5)
+                                            await self.send_text(f"**行动：** {npc_reaction.get('action', '')}")
+                                        
+                                        consequence_type = violation_consequence.get('consequence_type', '')
+                                        if consequence_type:
+                                            await asyncio.sleep(0.5)
+                                            await self.send_text(f"**后果：** {consequence_type}")
+                                        
+                                        death_risk = violation_consequence.get('death_risk', '')
+                                        if death_risk and death_risk != "无":
+                                            await asyncio.sleep(0.5)
+                                            await self.send_text(f"**死亡风险：** {death_risk}")
+                                        
+                                        escape_chance = violation_consequence.get('escape_chance', {})
+                                        if escape_chance.get('has_escape_chance'):
+                                            await asyncio.sleep(0.5)
+                                            await self.send_text(f"**逃脱机会：**")
+                                            for option in escape_chance.get('escape_options', []):
+                                                await self.send_text(f"- {option}")
+                                            await self.send_text(f"**逃脱难度：** {escape_chance.get('escape_difficulty', '')}")
+                                        
+                                        long_term_effects = violation_consequence.get('long_term_effects', [])
+                                        if long_term_effects:
+                                            await asyncio.sleep(0.5)
+                                            await self.send_text(f"**长期影响：**")
+                                            for effect in long_term_effects:
+                                                await self.send_text(f"- {effect}")
+                                        
+                                        if death_risk in ["高", "极高"] and random.random() < 0.5:
+                                            await asyncio.sleep(1)
+                                            await self.send_text(f"**严重后果：** 您因进入禁止区域而受到致命伤害...")
+                                            is_dead = "是"
+                                            action_feedback = f"玩家因进入禁止区域而死亡"
+                except Exception as e:
+                    print(f"[规则怪谈] 检查区域访问权限失败: {str(e)}")
+            
+            if is_action_player:
+                key_item_found = False
             if found_items and item_details and is_action_player:
+
                 is_key_item = item_details.get("is_key_item", "否")
                 if is_key_item == "是":
                     key_item_found = True
@@ -2668,6 +3752,49 @@ class RuleHorrorCommand(BaseCommand):
                     })
                     game_state["rules"] = new_rules
                     game_state["pending_rules"] = new_rules.copy()
+                
+                environment_system = self._get_or_create_environment_system()
+                if environment_system and game_state.get("environment_evolution"):
+                    try:
+                        permission_update = await environment_system.update_identity_permissions(
+                            group_id, new_identity, api_url, api_key, model_list, current_model_index, temperature
+                        )
+                        if permission_update:
+                            identity_change = permission_update.get("identity_change", {})
+                            permission_changes = permission_update.get("permission_changes", {})
+                            new_responsibilities = permission_update.get("new_responsibilities", [])
+                            
+                            info_lines: List[str] = []
+                            info_lines.append(f"玩家：{user_name}")
+                            info_lines.append(f"{old_identity} -> {new_identity}")
+
+                            if new_responsibilities:
+                                info_lines.append("【新职责】")
+                                for responsibility in new_responsibilities:
+                                    info_lines.append(f"- {responsibility}")
+
+                            if permission_changes.get("new_areas"):
+                                info_lines.append("【新增可进入区域】")
+                                for area in permission_changes["new_areas"]:
+                                    info_lines.append(f"- {area}")
+
+                            if permission_changes.get("lost_areas"):
+                                info_lines.append("【失去可进入区域】")
+                                for area in permission_changes["lost_areas"]:
+                                    info_lines.append(f"- {area}")
+
+                            try:
+                                image_path = self._generate_info_image("身份变化", info_lines, output_prefix="identity_change")
+                                await self._send_image_from_path(image_path, fallback_text="\n".join(info_lines))
+                                await asyncio.sleep(0.5)
+                            except Exception as img_e:
+                                print(f"[规则怪谈] 生成/发送身份变化长图失败: {str(img_e)}")
+                                await self.send_text("\n".join(info_lines))
+
+                            self._save_game_state(group_id)
+
+                    except Exception as e:
+                        print(f"[规则怪谈] 更新身份权限失败: {str(e)}")
         
         if key_item_found and not game_state.get("sanity_break", False) and not new_identity:
             await self._trigger_rule_mutation(group_id, api_url, api_key, model_list, current_model_index, temperature, elapsed_minutes, trigger_reason="关键物品")
@@ -2675,8 +3802,84 @@ class RuleHorrorCommand(BaseCommand):
             pass
         
         await self._check_collaborative_rules(group_id, api_url, api_key, model_list, current_model_index, temperature, elapsed_minutes)
+        
+        environment_system = self._get_or_create_environment_system()
+        if environment_system and game_state.get("environment_evolution"):
+            try:
+                player_actions = [action]
+                player_locations = [player_data.get("location", "入口") for player_data in players.values() if player_data.get("is_alive", True)]
+                environment_update = await environment_system.update_environment(
+                    group_id, player_actions, player_locations,
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+                
+                if environment_update:
+                    game_state["environment_evolution"] = environment_update
+                    self._save_game_state(group_id)
+                    
+                    env_lines: List[str] = []
 
-    async def _check_collaborative_rules(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float, elapsed_minutes: int) -> None:
+                    formatted_update = environment_system.format_environment_update(group_id)
+                    if formatted_update:
+                        env_lines.append(formatted_update)
+
+                    # 多人模式：NPC动向/对话仅记录在后台，不在“环境更新长图”中展示
+                    try:
+                        hidden_payload: dict[str, Any] = {
+                            "time": elapsed_minutes,
+                            "players": {},
+                        }
+
+                        for pid, p_data in players.items():
+                            if not p_data.get("is_alive", True):
+                                continue
+
+                            per_player: dict[str, Any] = {"location": p_data.get("location", "入口"), "name": p_data.get("name", pid)}
+
+                            active_npc_interaction = await environment_system.check_npc_active_interaction(
+                                group_id, p_data.get("location", "入口"),
+                                env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                            )
+                            if active_npc_interaction:
+                                per_player["active_npc_interaction"] = active_npc_interaction
+
+                            npc_interaction = await environment_system.check_npc_interaction(
+                                group_id, p_data.get("location", "入口"), action,
+                                env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                            )
+                            if npc_interaction:
+                                per_player["npc_interaction"] = npc_interaction
+
+                            if len(per_player.keys()) > 2:
+                                hidden_payload["players"][pid] = per_player
+
+                        if hidden_payload["players"]:
+                            game_state.setdefault("environment_hidden_events", []).append(hidden_payload)
+                            self._save_game_state(group_id)
+
+                    except Exception as hidden_e:
+                        print(f"[规则怪谈] 记录后台环境事件失败: {str(hidden_e)}")
+
+
+                    if env_lines:
+                        try:
+                            image_path = self._generate_info_image("环境更新", env_lines, output_prefix="environment_update")
+                            await self._send_image_from_path(image_path, fallback_text="\n".join(env_lines))
+                            await asyncio.sleep(0.5)
+                        except Exception as img_e:
+                            print(f"[规则怪谈] 生成/发送环境更新长图失败: {str(img_e)}")
+                            await self.send_text("\n".join(env_lines))
+
+            except Exception as e:
+                print(f"[规则怪谈] 更新环境状态失败: {str(e)}")
+        
+        alive_players = [pid for pid, p_data in players.items() if p_data.get("is_alive", True)]
+        if not alive_players:
+            await self.send_text("所有玩家都已死亡，游戏结束。")
+            await self._end_game(group_id, api_url, api_key, model_list, current_model_index, temperature)
+
+    async def _check_collaborative_rules(self, group_id: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, elapsed_minutes: int) -> None:
+
         """检测多人模式中的协作规则是否被触发"""
         game_state = game_states.get(group_id, {})
         if not game_state or game_state.get("game_mode") != "多人":
@@ -2794,14 +3997,16 @@ class RuleHorrorCommand(BaseCommand):
         except (json.JSONDecodeError, Exception) as e:
             print(f"[规则怪谈] 协作规则检测失败: {e}")
 
-    async def _record_action(self, group_id: str, action: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], bool]:
+    async def _record_action(self, group_id: str, action: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, env_api_url: str, env_api_key: str, env_model_list: List[str], env_current_model_index: int, env_temperature: float) -> Tuple[bool, Optional[str], int]:
+
+
         """记录行动并判断是否死亡"""
         game_state = game_states.get(group_id, {})
         
         user_info = self._get_user_info()
         if not user_info:
             await self.send_text("无法获取用户信息。")
-            return False, "无法获取用户信息", True
+            return False, "无法获取用户信息", 2
         
         user_id = user_info.user_id
         user_name = getattr(user_info, 'user_name', f"玩家{user_id}")
@@ -2835,12 +4040,12 @@ class RuleHorrorCommand(BaseCommand):
                 game_state["players"] = players
             else:
                 await self.send_text("你不在游戏中。请先使用 `/rg 加入` 加入游戏。")
-                return False, "不在游戏中", True
+                return False, "不在游戏中", 2
         
         player_data = players[user_id]
         if not player_data["is_alive"]:
             await self.send_text("你已经死亡，无法继续行动。")
-            return False, "玩家已死亡", True
+            return False, "玩家已死亡", 2
 
         player_data["action_history"].append(action)
         game_state["players"] = players
@@ -2903,17 +4108,27 @@ class RuleHorrorCommand(BaseCommand):
             })
         
         if game_state.get("game_mode") == "单人":
-            await self._process_single_player_action(group_id, user_id, user_name, action, api_url, api_key, model_list, current_model_index, temperature, sanity_break, random_event)
+            await self._process_single_player_action(
+                group_id, user_id, user_name, action, api_url, api_key, model_list, current_model_index, temperature,
+                env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature, sanity_break, random_event
+            )
         else:
-            await self._process_multiplayer_action(group_id, user_id, user_name, action, api_url, api_key, model_list, current_model_index, temperature, sanity_break, random_event)
+            await self._process_multiplayer_action(
+                group_id, user_id, user_name, action, api_url, api_key, model_list, current_model_index, temperature,
+                env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature, sanity_break, random_event
+            )
+
         
         await self._check_clear_condition(group_id, api_url, api_key, model_list, current_model_index, temperature)
         
-        return True, "已记录行动", True
+        return True, "已记录行动", 2
 
-    async def _end_game(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], bool]:
+    async def _end_game(self, group_id: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], int]:
+
         """结束游戏"""
+        _ = api_url, api_key, model_list, current_model_index, temperature
         game_state = game_states.get(group_id, {})
+
 
         game_state["game_active"] = False
         self._save_game_state(group_id)
@@ -2922,7 +4137,7 @@ class RuleHorrorCommand(BaseCommand):
         
         if not players:
             await self.send_text("游戏已结束。")
-            return False, "无玩家", True
+            return False, "无玩家", 2
         
         survivors = []
         players_info = []
@@ -3036,7 +4251,7 @@ class RuleHorrorCommand(BaseCommand):
         
         self._delete_save_file(group_id)
         
-        return True, "已结束游戏", True
+        return True, "已结束游戏", 2
 
     def _get_user_info(self):
         """获取用户信息"""
@@ -3050,7 +4265,8 @@ class RuleHorrorCommand(BaseCommand):
             return getattr(chat_stream, 'user_info', None)
         return None
 
-    async def _call_llm_api(self, prompt: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> str:
+    async def _call_llm_api(self, prompt: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> str:
+
         """调用OpenAI格式的LLM API并在失败时自动切换模型"""
         if not model_list:
             print(f"[规则怪谈] 模型列表为空")
@@ -3072,7 +4288,7 @@ class RuleHorrorCommand(BaseCommand):
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "你是一个专业的规则怪谈生成器和裁判。"},
+                    {"role": "system", "content": "你是一位精通规则怪谈创作的游戏设计师和叙事专家。你的任务是：\n1. 生成令人毛骨悚然、逻辑严密的规则怪谈场景\n2. 创造具有欺骗性和层次感的规则系统\n3. 构建充满细节和氛围的环境描述\n4. 提供引人入胜的剧情推进\n\n创作原则：\n- 恐怖氛围：通过环境细节、感官描写营造压抑不安的氛围\n- 逻辑自洽：所有规则和事件必须有内在逻辑\n- 层次递进：规则应该有表里两层，表面规则隐藏深层真相\n- 心理暗示：通过细节暗示而非直接揭示真相\n- 玩家自主：给玩家足够的探索空间和选择自由\n\n输出要求：\n- 使用JSON格式输出结构化数据\n- 描述要具体、生动，避免笼统\n- 保持中文表达的自然流畅\n- 严禁使用emoji表情符号"},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": temperature,
@@ -3125,7 +4341,14 @@ class RuleHorrorCommand(BaseCommand):
                             
                             if model_index != current_model_index:
                                 print(f"[规则怪谈] 更新当前模型索引从 {current_model_index} 到 {model_index}")
-                                self.update_config("llm.current_model_index", model_index)
+                                updater = getattr(self, "update_config", None)
+                                if callable(updater):
+                                    updater("llm.current_model_index", model_index)
+                                else:
+                                    plugin = getattr(self, "plugin", None)
+                                    if plugin is not None and hasattr(plugin, "update_config"):
+                                        plugin.update_config("llm.current_model_index", model_index)
+
                             
                             return content
                         else:
@@ -3138,6 +4361,182 @@ class RuleHorrorCommand(BaseCommand):
         
         print(f"[规则怪谈] 所有模型都调用失败，最后错误: {last_error}")
         return ""
+
+    def _parse_llm_json_response(self, llm_response: str, step_name: str = "步骤") -> Optional[dict[str, Any]]:
+
+        """解析LLM返回的JSON响应，支持提取JSON部分并处理控制字符"""
+        if not llm_response:
+            print(f"[规则怪谈] {step_name} LLM返回为空")
+            return None
+        
+        def clean_json_string(json_str: str) -> str:
+            """清理JSON字符串中的无效控制字符"""
+            import re
+            json_str = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', json_str)
+            return json_str
+        
+        def try_parse_json(json_str: str) -> Optional[dict[str, Any]]:
+
+            """尝试解析JSON，返回解析结果或None"""
+            try:
+                cleaned_str = clean_json_string(json_str)
+                result = json.loads(cleaned_str)
+                return result
+            except json.JSONDecodeError:
+                return None
+        
+        try:
+            result = try_parse_json(llm_response)
+            if result:
+                print(f"[规则怪谈] {step_name} JSON解析成功")
+                return result
+        except Exception as e:
+            print(f"[规则怪谈] {step_name} JSON解析失败: {e}")
+        
+        print(f"[规则怪谈] {step_name} 尝试提取JSON部分...")
+        
+        json_match = re.search(r'\{[\s\S]*\}', llm_response)
+        if json_match:
+            try:
+                json_str = json_match.group()
+                result = try_parse_json(json_str)
+                if result:
+                    print(f"[规则怪谈] {step_name} 成功提取JSON")
+                    return result
+                else:
+                    print(f"[规则怪谈] {step_name} 提取JSON后仍然解析失败")
+                    print(f"[规则怪谈] 提取的JSON内容（前500字符）: {json_str[:500]}")
+                    return None
+            except Exception as e2:
+                print(f"[规则怪谈] {step_name} 提取JSON后仍然解析失败: {e2}")
+                return None
+        else:
+            print(f"[规则怪谈] {step_name} 未找到JSON部分")
+            print(f"[规则怪谈] LLM返回内容（前500字符）: {llm_response[:500]}")
+            return None
+
+    def _collect_players_info(self, players: dict[str, dict[str, Any]]) -> Tuple[List[dict[str, Any]], List[Any], List[Any], List[str]]:
+
+        """收集玩家信息，返回玩家信息列表、推理记录、行动记录、存活玩家列表"""
+        players_info = []
+        all_reasoning = []
+        all_actions = []
+        alive_players = []
+        
+        for pid, p_data in players.items():
+            players_info.append({
+                "name": p_data["name"],
+                "is_alive": p_data["is_alive"],
+                "reasoning_count": len(p_data["reasoning_history"]),
+                "action_count": len(p_data["action_history"])
+            })
+            all_reasoning.extend(p_data["reasoning_history"])
+            all_actions.extend(p_data["action_history"])
+            if p_data["is_alive"]:
+                alive_players.append(p_data["name"])
+        
+        return players_info, all_reasoning, all_actions, alive_players
+
+    def _initialize_game_state(self, group_id: str, scene_name: str, background: str, player_identity: str,
+                                building_type: str, overall_layout: str, floors: List[dict[str, Any]], connections: List[str],
+                                special_areas: List[str], rules_title: str, rules: List[str], win_condition: str,
+                                resolve_condition: str, hidden_truth: str, death_triggers: List[str],
+                                core_symbols: List[dict[str, Any]], game_mode: str, plot_image_path: str) -> dict[str, Any]:
+
+        """初始化游戏状态"""
+        max_players = 5 if game_mode == "多人" else 1
+        
+        game_state = {
+            "scene": scene_name,
+            "background": background,
+            "player_identity": player_identity,
+            "building_type": building_type,
+            "overall_layout": overall_layout,
+            "floors": floors,
+            "connections": connections,
+            "special_areas": special_areas,
+            "rules_title": rules_title,
+            "rules": rules,
+            "win_condition": win_condition,
+            "resolve_condition": resolve_condition,
+            "hidden_truth": hidden_truth,
+            "death_triggers": death_triggers,
+            "hints_used": 0,
+            "max_hints": 3,
+            "game_active": True,
+            "max_players": max_players,
+            "game_mode": game_mode,
+            "players": {},
+            "plot_image_path": plot_image_path,
+            "rules_image_path": None,
+            "scene_structure_image_path": None,
+            "time_system": {
+                "start_time": datetime.now().isoformat(),
+                "current_time": "深夜",
+                "elapsed_minutes": 0,
+                "time_description": "午夜时分，周围一片死寂"
+            },
+            "environment": {
+                "lighting": "昏暗",
+                "temperature": "寒冷",
+                "sounds": ["寂静"],
+                "smells": ["霉味"],
+                "atmosphere": "压抑"
+            },
+            "random_events": [],
+            "available_items": [],
+            "environmental_events": [],
+            "rule_mutations": [],
+            "core_symbols": core_symbols,
+            "sanity_break": False,
+            "last_mutation_time": 0,
+            "identity_changes": [],
+            "environment_memory": {
+                "visited_locations": [],
+                "interacted_objects": [],
+                "time_based_events": [],
+                "discovered_secrets": []
+            },
+            "rule_network": {
+                "truth_elements": [],
+                "rule_truth_mappings": [],
+                "rule_dependencies": [],
+                "discovered_truths": []
+            },
+            "collaborative_events": [],
+            "action_image_paths": []
+        }
+        
+        game_states[group_id] = game_state
+        self._save_game_state(group_id)
+        
+        return game_state
+
+    async def _generate_and_send_rules(self, group_id: str, rules_title: str, rules: List[str],
+                                        win_condition: str, game_mode: str, rule_description: Optional[str] = None) -> None:
+
+        """生成并发送规则图片"""
+        try:
+            rules_image_path = self._generate_rules_image(rules_title, rules, win_condition, game_mode, rule_description=rule_description)
+            game_states[group_id]["rules_image_path"] = rules_image_path
+            with open(rules_image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            
+            image_sent = await self.send_image(image_base64)
+            if not image_sent:
+                raise Exception("规则长图发送失败")
+            
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            print(f"[规则怪谈] 生成规则长图失败: {str(e)}")
+            step3_text = f"**{rules_title}**：\n"
+            for i, rule in enumerate(rules, 1):
+                step3_text += f"{i}. {rule}\n"
+            goal_prefix = "你的目标是" if game_mode == "单人" else "你们的目标是"
+            step3_text += f"\n**{goal_prefix}**：{win_condition}"
+            await self.send_text(step3_text)
+            await asyncio.sleep(0.5)
 
     def _save_game_state(self, group_id: str) -> bool:
         """保存游戏状态到文件"""
@@ -3163,7 +4562,8 @@ class RuleHorrorCommand(BaseCommand):
             print(f"保存游戏状态时发生异常: {e}")
             return False
 
-    def _load_game_state(self, group_id: str) -> Optional[dict]:
+    def _load_game_state(self, group_id: str) -> Optional[dict[str, Any]]:
+
         """从文件加载游戏状态"""
         try:
             save_file = os.path.join(DATA_DIR, f"{group_id}.json")
@@ -3202,27 +4602,28 @@ class RuleHorrorCommand(BaseCommand):
             print(f"删除存档文件时发生异常: {e}")
             return False
 
-    async def _save_game_with_name(self, group_id: str, save_name: str) -> Tuple[bool, Optional[str], bool]:
+    async def _save_game_with_name(self, group_id: str, save_name: str) -> Tuple[bool, Optional[str], int]:
+
         """使用自定义名称保存游戏状态"""
         try:
             game_state = game_states.get(group_id)
             if not game_state:
                 await self.send_text("没有可保存的游戏状态。")
-                return False, "无游戏状态", True
+                return False, "无游戏状态", 2
 
             if not save_name:
                 await self.send_text("存档名称不能为空。")
-                return False, "存档名称为空", True
+                return False, "存档名称为空", 2
 
             if len(save_name) > 50:
                 await self.send_text("存档名称过长（最多50个字符）。")
-                return False, "存档名称过长", True
+                return False, "存档名称过长", 2
 
             invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
             for char in invalid_chars:
                 if char in save_name:
                     await self.send_text(f"存档名称包含非法字符「{char}」。")
-                    return False, "存档名称包含非法字符", True
+                    return False, "存档名称包含非法字符", 2
 
             os.makedirs(DATA_DIR, exist_ok=True)
             save_file = os.path.join(DATA_DIR, f"{group_id}_{save_name}.json")
@@ -3249,19 +4650,20 @@ class RuleHorrorCommand(BaseCommand):
                 f"使用 `/rg 读取 {save_name}` 恢复此存档"
             )
             await self.send_text(reply_text)
-            return True, "游戏已保存", True
+            return True, "游戏已保存", 2
         except Exception as e:
             await self.send_text(f"保存失败：{str(e)}")
-            return False, f"保存失败: {str(e)}", True
+            return False, f"保存失败: {str(e)}", 2
 
-    async def _load_game_with_name(self, group_id: str, save_name: str) -> Tuple[bool, Optional[str], bool]:
+    async def _load_game_with_name(self, group_id: str, save_name: str) -> Tuple[bool, Optional[str], int]:
+
         """从自定义名称加载游戏状态"""
         try:
             save_file = os.path.join(DATA_DIR, f"{group_id}_{save_name}.json")
             
             if not os.path.exists(save_file):
                 await self.send_text(f"未找到存档「{save_name}」。使用 `/rg 存档列表` 查看所有可用存档。")
-                return False, "存档不存在", True
+                return False, "存档不存在", 2
 
             with open(save_file, 'r', encoding='utf-8') as f:
                 save_data = json.load(f)
@@ -3269,11 +4671,11 @@ class RuleHorrorCommand(BaseCommand):
             saved_state = save_data.get("game_state")
             if not saved_state:
                 await self.send_text("存档数据损坏。")
-                return False, "存档损坏", True
+                return False, "存档损坏", 2
 
             if not saved_state.get("game_active", False):
                 await self.send_text("存档中的游戏已结束，无法恢复。请使用 `/rg 开始` 开始新游戏。")
-                return False, "游戏已结束", True
+                return False, "游戏已结束", 2
 
             game_states[group_id] = saved_state
 
@@ -3282,7 +4684,7 @@ class RuleHorrorCommand(BaseCommand):
             if save_time:
                 try:
                     save_time = datetime.fromisoformat(save_time).strftime('%Y-%m-%d %H:%M:%S')
-                except:
+                except Exception:
                     pass
 
             reply_text = (
@@ -3325,12 +4727,13 @@ class RuleHorrorCommand(BaseCommand):
                 reply_text += f"- 使用 `/rg 结束` 结束游戏"
 
             await self.send_text(reply_text)
-            return True, "游戏已恢复", True
+            return True, "游戏已恢复", 2
         except Exception as e:
             await self.send_text(f"读取失败：{str(e)}")
-            return False, f"读取失败: {str(e)}", True
+            return False, f"读取失败: {str(e)}", 2
 
-    async def _list_saves(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _list_saves(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """列出所有可用存档"""
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -3356,7 +4759,7 @@ class RuleHorrorCommand(BaseCommand):
                         if save_time:
                             try:
                                 save_time = datetime.fromisoformat(save_time).strftime('%Y-%m-%d %H:%M:%S')
-                            except:
+                            except Exception:
                                 pass
                         
                         scene = game_state.get("scene", "")
@@ -3376,9 +4779,13 @@ class RuleHorrorCommand(BaseCommand):
             
             if not saves:
                 await self.send_text("**存档列表**\n\n暂无存档。使用 `/rg 保存 <存档名称>` 创建存档。")
-                return True, "无存档", True
+                return True, "无存档", 2
             
-            saves.sort(key=lambda x: x["time"], reverse=True)
+            def _save_sort_key(item: dict[str, Any]) -> str:
+                return str(item.get("time", ""))
+
+            saves.sort(key=_save_sort_key, reverse=True)
+
             
             reply_text = "**存档列表**\n\n"
             for i, save in enumerate(saves, 1):
@@ -3391,12 +4798,13 @@ class RuleHorrorCommand(BaseCommand):
             
             reply_text += f"使用 `/rg 读取 <存档名称>` 恢复存档"
             await self.send_text(reply_text)
-            return True, "已显示存档列表", True
+            return True, "已显示存档列表", 2
         except Exception as e:
             await self.send_text(f"获取存档列表失败：{str(e)}")
-            return False, f"获取存档列表失败: {str(e)}", True
+            return False, f"获取存档列表失败: {str(e)}", 2
 
-    async def _cleanup_ended_saves(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _cleanup_ended_saves(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """清理已结束的存档及其图片"""
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -3454,7 +4862,7 @@ class RuleHorrorCommand(BaseCommand):
             
             if not deleted_saves:
                 await self.send_text("没有找到已结束的存档。")
-                return True, "无已结束存档", True
+                return True, "无已结束存档", 2
             
             reply_text = "**清理完成**\n\n"
             reply_text += f"已删除 {len(deleted_saves)} 个已结束存档：\n\n"
@@ -3466,25 +4874,75 @@ class RuleHorrorCommand(BaseCommand):
                 reply_text += f"\n已删除 {len(deleted_images)} 张相关图片\n"
             
             await self.send_text(reply_text)
-            return True, "清理完成", True
+            return True, "清理完成", 2
         except Exception as e:
             await self.send_text(f"清理存档失败：{str(e)}")
-            return False, f"清理存档失败: {str(e)}", True
+            return False, f"清理存档失败: {str(e)}", 2
 
-    async def _force_start_new_game(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float, game_mode: str) -> Tuple[bool, Optional[str], bool]:
+    async def _force_start_new_game(self, group_id: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, game_mode: str, env_enabled: bool, env_api_url: str, env_api_key: str, env_model_list: List[str], env_current_model_index: int, env_temperature: float) -> Tuple[bool, Optional[str], int]:
+
         """强制开始一个新的规则怪谈游戏（覆盖存档）"""
         await self.send_text("正在生成规则怪谈...")
 
         step1_prompt = """
-你是一个专业的规则怪谈生成器。请生成一个恐怖或诡异的规则怪谈的剧情导入。
+你是一位精通规则怪谈创作的游戏设计师。请生成一个恐怖或诡异的规则怪谈的剧情导入和隐藏真相。
 
-要求：
-1. 生成一个场景（如：深夜的医院、废弃的学校、神秘的公寓、古老的庄园等）
-2. 描述场景的背景故事（这个场景的历史、发生过什么、为什么诡异）
-3. 描述玩家为何会来到这个场景的原因（收到邀请、迷路、调查事件、被绑架等）
-4. 剧情应该充满悬疑和恐怖氛围，为后续的规则和探索做铺垫
-5. 生成2-3个"核心象征符号"，这些符号将在整个游戏中反复出现，营造主题感和不安感。符号可以是数字、图案、旋律、花纹、颜色等。每个符号需要有一个简短的描述，暗示其可能的含义或与场景的联系。
-6. 以JSON格式返回，格式如下：
+**创作要求：**
+
+1. **场景选择**：选择一个具有恐怖潜力的场景（如：深夜的医院、废弃的学校、神秘的公寓、古老的庄园、荒凉的工厂、阴森的地铁站、诡异的酒店等）
+
+2. **背景故事**：描述场景的历史、发生过什么、为什么诡异
+   - 必须包含具体的历史事件或悲剧
+   - 描述场景的异常现象（如：时间错乱、空间扭曲、超自然现象等）
+   - 暗示场景背后隐藏的真相（不要直接揭示）
+
+3. **玩家身份**：描述玩家在这个场景中的身份或角色
+   - 身份应与场景和剧情相符（如：工厂员工、夜班护士、新入职教师、庄园管家、酒店住客等）
+   - 身份应该让玩家有代入感，同时暗示某种危险
+   - 可以暗示身份与场景历史有某种联系
+
+4. **恐怖氛围营造**：
+   - 使用具体的感官细节（视觉、听觉、嗅觉、触觉）
+   - 营造压抑、不安、诡异的氛围
+   - 为后续的规则和探索做铺垫
+
+5. **核心象征符号**：生成2-3个"核心象征符号"
+   - 符号可以是数字、图案、旋律、花纹、颜色、物品等
+   - 每个符号需要有一个简短的描述，暗示其可能的含义或与场景的联系
+   - 符号应该在整个游戏中反复出现，营造主题感和不安感
+   - 符号示例：
+     * 数字"7"：出现在各种意想不到的地方，暗示某种诅咒或周期
+     * 破碎的镜子：象征分裂的真相和扭曲的现实
+     * 断续的童谣：暗示过去的悲剧和未解的谜团
+     * 红色的十字：象征某种仪式或禁忌
+
+6. **环境细节**：描述场景的环境特征
+   - 光线状况（昏暗、闪烁、微弱、完全黑暗等）
+   - 温度感受（刺骨寒冷、阴冷、闷热等）
+   - 声音（风声、脚步声、低语、哭声等）
+   - 气味（霉味、血腥味、腐臭味、金属味等）
+   - 整体氛围（压抑、恐怖、诡异、平静但不安等）
+
+7. **异常现象暗示**：在描述中隐含地提及异常现象
+   - 不要直接说明，而是通过细节暗示
+   - 让玩家感到不安和困惑
+   - 为后续的规则和探索留下线索
+
+8. **隐藏真相（非常重要）**：生成场景背后的隐藏真相
+   - 真相应该以叙事方式描述场景背后的真实情况
+   - 真相应该解释规则存在的原因和场景的异常现象
+   - 真相应该令人不安，但又合乎逻辑
+   - 真相应该为玩家提供解决问题的关键线索
+   - 真相的描述应该引人入胜，充满悬疑和恐怖元素
+   - 不要提及规则编号或明确说明规则与真相的对应关系
+   - 真相应该与背景故事、玩家身份、核心象征符号形成完整的逻辑体系
+   - 真相示例：
+     * "这座医院在20年前发生过一场医疗事故，一名医生为了拯救自己的女儿，与某种存在进行了交易。从此，医院成为了两个世界的交汇点。那些看似诡异的规则，实际上是为了防止那个存在从医院中逃脱。"
+     * "这座公寓实际上是某种仪式的容器。每层楼都对应着仪式的一个阶段，而住户们则不知不觉地成为了仪式的一部分。规则的存在是为了维持仪式的平衡，一旦平衡被打破，仪式将完成，所有住户将被献祭。"
+     * "这所学校曾经是一所孤儿院，院长为了获得永生，与恶魔签订了契约。契约要求每年献祭一名孤儿。现在，学校已经废弃，但契约仍然有效。规则是恶魔设下的陷阱，试图引诱更多的人进入学校，成为新的祭品。"
+
+**输出格式：**
+请以JSON格式返回，格式如下：
 {
   "scene": "场景名称（如：深夜的废弃医院）",
   "background": "场景背景故事，描述这个场景的历史、发生过什么、为什么诡异",
@@ -3492,57 +4950,81 @@ class RuleHorrorCommand(BaseCommand):
   "core_symbols": [
     {"symbol": "符号1", "description": "符号1的描述"},
     {"symbol": "符号2", "description": "符号2的描述"}
-  ]
+  ],
+  "environment": {
+    "lighting": "光线状况",
+    "temperature": "温度感受",
+    "sounds": ["声音1", "声音2"],
+    "smells": ["气味1", "气味2"],
+    "atmosphere": "整体氛围"
+  },
+  "anomalies": ["异常现象1", "异常现象2"],
+  "hidden_truth": "隐藏的真相（以叙事方式描述场景背后的真实情况，不要提及规则编号或明确说明规则与真相的对应关系）"
 }
 
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
+**重要提示：**
+- 请仅返回JSON，不要包含任何其他文字
+- 严禁使用任何emoji表情符号
+- 背景故事应该引人入胜，充满悬疑和恐怖元素
+- 核心象征符号应该神秘而富有暗示性
+- 环境细节应该具体、生动，让玩家能够想象出场景
+- 异常现象应该微妙而诡异，不要直接揭示真相
+- 隐藏真相是整个游戏的核心，应该与背景故事、玩家身份、核心象征符号形成完整的逻辑体系
+- 隐藏真相应该足够详细，为后续的规则生成和游戏推进提供充分的依据
         """
 
         llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+            return False, "LLM API调用失败", 2
 
         print(f"[规则怪谈] 第一步（剧情导入）LLM原始返回: {llm_response}")
 
-        try:
-            step1_data = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] 第一步JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    step1_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 第一步成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 第一步提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("生成剧情导入失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
-            else:
-                await self.send_text("生成剧情导入失败，返回格式不正确。")
-                return False, "JSON解析失败", True
+        step1_data = self._parse_llm_json_response(llm_response, "第一步（剧情导入）")
+        if not step1_data:
+            return False, "JSON解析失败", 2
 
         scene_name = step1_data.get("scene", "")
         background = step1_data.get("background", "")
         player_identity = step1_data.get("player_identity", "")
         core_symbols = step1_data.get("core_symbols", [])
+        hidden_truth = step1_data.get("hidden_truth", "")
 
         await asyncio.sleep(0.5)
         
+        plot_image_path = ""
         try:
             plot_image_path = self._generate_plot_image(scene_name, background, player_identity, core_symbols)
+
+            if group_id not in game_states:
+                game_states[group_id] = {}
             game_states[group_id]["plot_image_path"] = plot_image_path
             with open(plot_image_path, 'rb') as f:
                 image_bytes = f.read()
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            image_sent = await self.send_image(image_base64)
-            if not image_sent:
-                print(f"[规则怪谈] 剧情导入图片发送失败")
+            
+            try:
+                image_sent = await self.send_image(image_base64)
+                # 检查返回值类型，确保是布尔值
+                if isinstance(image_sent, bool):
+                    if not image_sent:
+                        print(f"[规则怪谈] 剧情导入图片发送失败")
+                elif image_sent is None:
+                    print(f"[规则怪谈] 剧情导入图片发送失败 (返回None)")
+                else:
+                    # 如果返回了意外的值（如QQ号），记录并回退到文本模式
+                    print(f"[规则怪谈] send_image返回了意外值: {image_sent} (类型: {type(image_sent)})")
+                    # 回退到文本模式
+                    raise Exception(f"图片发送返回意外值: {image_sent}")
+            except Exception as send_error:
+                print(f"[规则怪谈] 发送剧情导入图片时出错: {str(send_error)}")
+                # 发送失败，回退到文本模式
+                raise Exception(f"图片发送失败: {str(send_error)}")
             await asyncio.sleep(1.0)
         except Exception as e:
             print(f"[规则怪谈] 生成剧情导入长图失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
             step1_text = (
                 f"**规则怪谈** ({game_mode}模式)\n\n"
                 f"**剧情导入**：\n{background}\n\n"
@@ -3553,7 +5035,7 @@ class RuleHorrorCommand(BaseCommand):
             await asyncio.sleep(1.0)
         
         await self.send_text("正在生成场景结构...")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
 
         step2_prompt = f"""
 你是一个专业的规则怪谈生成器。请基于以下剧情导入，生成场景结构。
@@ -3590,28 +5072,13 @@ class RuleHorrorCommand(BaseCommand):
         llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+            return False, "LLM API调用失败", 2
 
         print(f"[规则怪谈] 第二步（场景结构）LLM原始返回: {llm_response}")
 
-        try:
-            step2_data = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] 第二步JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    step2_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 第二步成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 第二步提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("生成场景结构失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
-            else:
-                await self.send_text("生成场景结构失败，返回格式不正确。")
-                return False, "JSON解析失败", True
+        step2_data = self._parse_llm_json_response(llm_response, "第二步（场景结构）")
+        if not step2_data:
+            return False, "JSON解析失败", 2
 
         building_type = step2_data.get("building_type", "")
         overall_layout = step2_data.get("overall_layout", "")
@@ -3620,8 +5087,16 @@ class RuleHorrorCommand(BaseCommand):
         special_areas = step2_data.get("special_areas", [])
 
         floors_text = "\n".join([f"{floor['floor']}: {', '.join(floor['areas'])}" for floor in floors])
-        connections_text = ", ".join(connections)
-        special_areas_text = ", ".join(special_areas)
+        
+        if connections and isinstance(connections[0], dict):
+            connections_text = ", ".join([conn.get("name", str(conn)) if isinstance(conn, dict) else str(conn) for conn in connections])
+        else:
+            connections_text = ", ".join(connections)
+        
+        if special_areas and isinstance(special_areas[0], dict):
+            special_areas_text = ", ".join([area.get("name", str(area)) if isinstance(area, dict) else str(area) for area in special_areas])
+        else:
+            special_areas_text = ", ".join(special_areas)
 
         scene_structure_text = f"建筑类型：{building_type}\n"
         scene_structure_text += floors_text
@@ -3629,18 +5104,382 @@ class RuleHorrorCommand(BaseCommand):
         scene_structure_text += f"特殊区域：{special_areas_text}"
 
         await asyncio.sleep(0.5)
-        
+
+        if env_enabled:
+            try:
+                environment_system = self._get_or_create_environment_system()
+                step3_data = await environment_system.generate_complete_rules(
+                    group_id, scene_name, player_identity, building_type,
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+                
+                if not step3_data:
+                    await self.send_text("生成规则失败，API服务可能暂时不可用或网络连接问题。请稍后重试。")
+                    print(f"[规则怪谈] 环境演化系统规则生成失败，API调用返回None")
+                    return False, "规则生成失败", 2
+                    
+                rules_title = step3_data.get("rules_title", "规则")
+                rules = step3_data.get("rules", [])
+                win_condition = step3_data.get("win_condition", "")
+                resolve_condition = step3_data.get("resolve_condition", "")
+                death_triggers = step3_data.get("death_triggers", [])
+            except Exception as e:
+                print(f"[规则怪谈] 环境演化系统规则生成失败，使用主系统: {str(e)}")
+                step3_prompt = f"""
+你是一位精通规则怪谈创作的游戏设计师。请基于以下剧情导入、场景结构和隐藏真相，生成规则怪谈的规则系统。
+
+**基础信息：**
+剧情导入：
+- 场景：{scene_name}
+- 背景：{background}
+- 玩家身份：{player_identity}
+
+场景结构：
+{scene_structure_text}
+
+隐藏真相（非常重要）：
+{hidden_truth}
+
+游戏模式：{game_mode}
+
+**规则设计原则：**
+
+1. **规则数量**：生成5-8条规则，规则应该看似合理但隐藏着诡异之处
+
+2. **规则与场景呼应**：规则应该与剧情导入和场景结构紧密呼应
+   - 规则应该反映场景的历史和异常现象
+   - 规则应该与玩家的身份和任务相关
+   - 规则应该隐藏有一部分真相，但不直接揭示
+
+3. **通关条件**：设定明确的通关条件
+   - 如：在规定时间内找到出口、收集特定物品、存活到天亮等
+   - 通关条件应该与规则和真相有逻辑关联
+   - 通关条件应该具有一定的挑战性，但不是不可能完成
+
+4. **解除条件**：设定解除规则怪谈根源的条件
+   - 如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等
+   - 解除条件应该比通关条件更难达成
+   - 解除条件应该揭示真相并彻底解决问题
+
+5. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
+   - 规则不是随意的，而是有内在的逻辑体系
+   - 规则之间应该形成推理链条
+   - 玩家需要通过观察和推理发现规则背后的真相
+
+6. **规则与环境绑定（非常重要）**：
+   - 请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联
+   - 例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"
+   - 这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
+   - 环境绑定应该自然、巧妙，不要过于明显
+
+7. **规则间的潜在冲突（非常重要）**：
+   - 请尝试构建至少一组存在潜在矛盾的规则
+   - 例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。"规则C："公寓中有404室。"
+   - 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地
+   - 请在 hidden_truth 中解释这种矛盾的本质（如：B、C两条规则来自不同势力）
+   - 在 death_triggers 中隐含相关触发条件
+
+8. **规则与真相的因果关系（非常重要）**：
+   - 每条规则都应该与隐藏真相中的某个要素有直接的因果关系
+   - 规则不是孤立的，而是形成了一个相互关联的规则网络
+   - 例如：
+     * 如果真相是"工厂的夜间保安是来自异世界的实体"，那么规则"夜间只允许蓝色制服的保安巡逻"就是对这个真相的伪装性描述
+     * 如果真相是"三楼东侧病房的窗户是通往异界的通道"，那么规则"三楼东侧病房的窗户必须保持关闭状态"就是对这个危险通道的防护措施
+     * 规则之间应该形成推理链条：遵守规则A -> 发现异常B -> 触发规则C -> 揭示真相D
+
+9. **协作规则（多人模式非常重要）**：
+   - 如果游戏模式是"多人"，请设计1-2条需要多个玩家协作才能发现或触发的规则
+   - 例如：
+     * 规则A："当两名玩家同时站在不同的位置时，某个隐藏的通道才会开启"
+     * 规则B："只有当一名玩家持有特定物品，另一名玩家说出特定口令时，才能解除某个陷阱"
+     * 规则C："需要三名玩家分别在三个不同的地点同时执行某个动作，才能揭示某个关键真相"
+   - 协作规则应该鼓励玩家之间的沟通和合作，而不是各自为战
+   - 协作规则的设计应该巧妙，让玩家在探索过程中自然地发现协作的必要性
+   - 在 hidden_truth 中说明协作规则的设计意图和触发条件
+
+10. **规则标题（非常重要）**：
+    - 根据场景类型和玩家身份，生成一个贴合剧情的规则标题
+    - 例如：
+      * 工厂场景：员工守则、安全规程、操作手册
+      * 医院场景：患者须知、病房守则、医疗规程
+      * 学校场景：学生守则、校园安全须知、宿舍管理规定
+      * 城堡场景：访客须知、城堡守则、安全指南
+      * 酒店场景：入住须知、客房服务守则、安全警示
+      * 超市场景：员工手册、营业规范、安全须知
+      * 地铁场景：乘客须知、安全规程、运营守则
+    - 标题应该简洁、正式，符合该场景的官方文件风格
+
+**规则描述要求（非常重要）：**
+
+- 规则必须简洁、直接，每条规则不超过60字
+- 只说明禁止、允许或要求做的行为，不解释原因
+- 使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX
+- 使用冰冷、客观的公文语调，如同官方通告或操作手册
+- 语调应该冷静、正式、不带感情色彩
+- 可以加入少量关键的环境或感官细节，但要简洁
+- 细节应该让人感到不安和恐惧，但不要直接揭示真相
+
+**示例规则风格：**
+"禁止在22:00-06:00期间离开房间。"
+"听到三声敲门时，必须立即开门。"
+"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。"
+"严禁回应任何呼救声。"
+"只有看到绿色灯光时才能进入走廊。"
+"工厂只有蓝色制服的保安，若看见黑色制服的保安，请立即报告主管。"
+"城堡内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
+
+**死亡触发条件要求（非常重要）：**
+
+- 列出会导致死亡的行为
+- 死亡条件应该与规则和真相有逻辑关联
+- 死亡条件应该具有一定的隐蔽性，不是一眼就能看穿
+- 死亡条件应该给玩家一定的容错空间
+- 死亡条件的描述应该简洁、明确
+
+**输出格式：**
+请以JSON格式返回，格式如下：
+{{
+  "rules_title": "规则标题（如：员工守则、患者须知等）",
+  "rules": ["规则1", "规则2", ...],
+  "win_condition": "通关条件",
+  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
+  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
+}}
+
+**重要提示：**
+- 请仅返回JSON，不要包含任何其他文字
+- 严禁使用任何emoji表情符号
+- 规则应该有层次感，表面看似合理，隐藏着诡异之处
+- 死亡触发条件应该与规则和真相有逻辑关联
+- 整个规则系统应该形成一个完整的、有逻辑的体系
+- 规则的设计必须与提供的隐藏真相保持一致，所有规则都应该能够从隐藏真相中找到合理的解释
+        """
+
+                llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
+                if not llm_response:
+                    await self.send_text("调用LLM API失败，请稍后再试。")
+                    return False, "LLM API调用失败", 2
+
+                print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
+
+                step3_data = self._parse_llm_json_response(llm_response, "第三步（规则）")
+                if not step3_data:
+                    error_msg = "生成规则失败，返回格式不正确。\n\n"
+                    error_msg += f"LLM返回内容（前500字符）：\n{llm_response[:500]}\n\n"
+                    error_msg += "可能的原因：\n"
+                    error_msg += "1. LLM模型未正确返回JSON格式\n"
+                    error_msg += "2. API地址或密钥配置错误\n"
+                    error_msg += "3. 模型名称不正确\n"
+                    error_msg += "4. 网络连接问题\n\n"
+                    error_msg += "建议：\n"
+                    error_msg += "- 检查config.toml中的LLM配置\n"
+                    error_msg += "- 确认模型名称是否正确\n"
+                    error_msg += "- 查看MaiBot日志获取详细错误信息"
+                    await self.send_text(error_msg)
+                    return False, "JSON解析失败", 2
+
+                rules_title = step3_data.get("rules_title", "规则")
+                rules = step3_data.get("rules", [])
+                win_condition = step3_data.get("win_condition", "")
+                resolve_condition = step3_data.get("resolve_condition", "")
+                death_triggers = step3_data.get("death_triggers", [])
+        else:
+            step3_prompt = f"""
+你是一位精通规则怪谈创作的游戏设计师。请基于以下剧情导入、场景结构和隐藏真相，生成规则怪谈的规则系统。
+
+**基础信息：**
+剧情导入：
+- 场景：{scene_name}
+- 背景：{background}
+- 玩家身份：{player_identity}
+
+场景结构：
+{scene_structure_text}
+
+隐藏真相（非常重要）：
+{hidden_truth}
+
+游戏模式：{game_mode}
+
+**规则设计原则：**
+
+1. **规则数量**：生成5-8条规则，规则应该看似合理但隐藏着诡异之处
+
+2. **规则与场景呼应**：规则应该与剧情导入和场景结构紧密呼应
+   - 规则应该反映场景的历史和异常现象
+   - 规则应该与玩家的身份和任务相关
+   - 规则应该隐藏有一部分真相，但不直接揭示
+
+3. **通关条件**：设定明确的通关条件
+   - 如：在规定时间内找到出口、收集特定物品、存活到天亮等
+   - 通关条件应该与规则和真相有逻辑关联
+   - 通关条件应该具有一定的挑战性，但不是不可能完成
+
+4. **解除条件**：设定解除规则怪谈根源的条件
+   - 如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等
+   - 解除条件应该比通关条件更难达成
+   - 解除条件应该揭示真相并彻底解决问题
+
+5. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
+   - 规则不是随意的，而是有内在的逻辑体系
+   - 规则之间应该形成推理链条
+   - 玩家需要通过观察和推理发现规则背后的真相
+
+6. **规则与环境绑定（非常重要）**：
+   - 请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联
+   - 例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"
+   - 这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
+   - 环境绑定应该自然、巧妙，不要过于明显
+
+7. **规则间的潜在冲突（非常重要）**：
+   - 请尝试构建至少一组存在潜在矛盾的规则
+   - 例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。"规则C："公寓中有404室。"
+   - 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地
+   - 请在 hidden_truth 中解释这种矛盾的本质（如：B、C两条规则来自不同势力）
+   - 在 death_triggers 中隐含相关触发条件
+
+8. **规则与真相的因果关系（非常重要）**：
+   - 每条规则都应该与隐藏真相中的某个要素有直接的因果关系
+   - 规则不是孤立的，而是形成了一个相互关联的规则网络
+   - 例如：
+     * 如果真相是"工厂的夜间保安是来自异世界的实体"，那么规则"夜间只允许蓝色制服的保安巡逻"就是对这个真相的伪装性描述
+     * 如果真相是"三楼东侧病房的窗户是通往异界的通道"，那么规则"三楼东侧病房的窗户必须保持关闭状态"就是对这个危险通道的防护措施
+     * 规则之间应该形成推理链条：遵守规则A -> 发现异常B -> 触发规则C -> 揭示真相D
+
+9. **协作规则（多人模式非常重要）**：
+   - 如果游戏模式是"多人"，请设计1-2条需要多个玩家协作才能发现或触发的规则
+   - 例如：
+     * 规则A："当两名玩家同时站在不同的位置时，某个隐藏的通道才会开启"
+     * 规则B："只有当一名玩家持有特定物品，另一名玩家说出特定口令时，才能解除某个陷阱"
+     * 规则C："需要三名玩家分别在三个不同的地点同时执行某个动作，才能揭示某个关键真相"
+   - 协作规则应该鼓励玩家之间的沟通和合作，而不是各自为战
+   - 协作规则的设计应该巧妙，让玩家在探索过程中自然地发现协作的必要性
+   - 在 hidden_truth 中说明协作规则的设计意图和触发条件
+
+10. **规则标题（非常重要）**：
+    - 根据场景类型和玩家身份，生成一个贴合剧情的规则标题
+    - 例如：
+      * 工厂场景：员工守则、安全规程、操作手册
+      * 医院场景：患者须知、病房守则、医疗规程
+      * 学校场景：学生守则、校园安全须知、宿舍管理规定
+      * 城堡场景：访客须知、城堡守则、安全指南
+      * 酒店场景：入住须知、客房服务守则、安全警示
+      * 超市场景：员工手册、营业规范、安全须知
+      * 地铁场景：乘客须知、安全规程、运营守则
+    - 标题应该简洁、正式，符合该场景的官方文件风格
+
+**规则描述要求（非常重要）：**
+
+- 规则必须简洁、直接，每条规则不超过60字
+- 只说明禁止、允许或要求做的行为，不解释原因
+- 使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX
+- 使用冰冷、客观的公文语调，如同官方通告或操作手册
+- 语调应该冷静、正式、不带感情色彩
+- 可以加入少量关键的环境或感官细节，但要简洁
+- 细节应该让人感到不安和恐惧，但不要直接揭示真相
+
+**示例规则风格：**
+"禁止在22:00-06:00期间离开房间。"
+"听到三声敲门时，必须立即开门。"
+"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。"
+"严禁回应任何呼救声。"
+"只有看到绿色灯光时才能进入走廊。"
+"工厂只有蓝色制服的保安，若看见黑色制服的保安，请立即报告主管。"
+"城堡内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
+
+**死亡触发条件要求（非常重要）：**
+
+- 列出会导致死亡的行为
+- 死亡条件应该与规则和真相有逻辑关联
+- 死亡条件应该具有一定的隐蔽性，不是一眼就能看穿
+- 死亡条件应该给玩家一定的容错空间
+- 死亡条件的描述应该简洁、明确
+
+**输出格式：**
+请以JSON格式返回，格式如下：
+{{
+  "rules_title": "规则标题（如：员工守则、患者须知等）",
+  "rules": ["规则1", "规则2", ...],
+  "win_condition": "通关条件",
+  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
+  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
+}}
+
+**重要提示：**
+- 请仅返回JSON，不要包含任何其他文字
+- 严禁使用任何emoji表情符号
+- 规则应该有层次感，表面看似合理，隐藏着诡异之处
+- 死亡触发条件应该与规则和真相有逻辑关联
+- 整个规则系统应该形成一个完整的、有逻辑的体系
+- 规则的设计必须与提供的隐藏真相保持一致，所有规则都应该能够从隐藏真相中找到合理的解释
+            """
+
+            llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
+            if not llm_response:
+                await self.send_text("调用LLM API失败，请稍后再试。")
+                return False, "LLM API调用失败", 2
+
+            print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
+
+            step3_data = self._parse_llm_json_response(llm_response, "第三步（规则）")
+            if not step3_data:
+                error_msg = "生成规则失败，返回格式不正确。\n\n"
+                error_msg += f"LLM返回内容（前500字符）：\n{llm_response[:500]}\n\n"
+                error_msg += "可能的原因：\n"
+                error_msg += "1. LLM模型未正确返回JSON格式\n"
+                error_msg += "2. API地址或密钥配置错误\n"
+                error_msg += "3. 模型名称不正确\n"
+                error_msg += "4. 网络连接问题\n\n"
+                error_msg += "建议：\n"
+                error_msg += "- 检查config.toml中的LLM配置\n"
+                error_msg += "- 确认模型名称是否正确\n"
+                error_msg += "- 查看MaiBot日志获取详细错误信息"
+                await self.send_text(error_msg)
+                return False, "JSON解析失败", 2
+
+            rules_title = step3_data.get("rules_title", "规则")
+            rules = step3_data.get("rules", [])
+            win_condition = step3_data.get("win_condition", "")
+            resolve_condition = step3_data.get("resolve_condition", "")
+            death_triggers = step3_data.get("death_triggers", [])
+
+        self._initialize_game_state(
+            group_id=group_id,
+            scene_name=scene_name,
+            background=background,
+            player_identity=player_identity,
+            building_type=building_type,
+            overall_layout=overall_layout,
+            floors=floors,
+            connections=connections,
+            special_areas=special_areas,
+            rules_title=rules_title,
+            rules=rules,
+            win_condition=win_condition,
+            resolve_condition=resolve_condition,
+            hidden_truth=hidden_truth,
+            death_triggers=death_triggers,
+            core_symbols=core_symbols,
+            game_mode=game_mode,
+            plot_image_path=plot_image_path
+        )
+
+        await self._build_rule_network(group_id)
+
+        image_sent_successfully = False
         try:
-            structure_image_path = self._generate_scene_structure_text_image(
+            scene_structure_image_path = self._generate_scene_structure_text_image(
                 building_type, overall_layout, floors, connections, special_areas
             )
-            game_states[group_id]["scene_structure_image_path"] = structure_image_path
-            with open(structure_image_path, 'rb') as f:
+            game_states[group_id]["scene_structure_image_path"] = scene_structure_image_path
+            with open(scene_structure_image_path, 'rb') as f:
                 image_bytes = f.read()
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
             image_sent = await self.send_image(image_base64)
             if not image_sent:
                 print(f"[规则怪谈] 场景结构图片发送失败")
+            else:
+                image_sent_successfully = True
             await asyncio.sleep(0.5)
         except Exception as e:
             print(f"[规则怪谈] 生成场景结构长图失败: {str(e)}")
@@ -3664,183 +5503,106 @@ class RuleHorrorCommand(BaseCommand):
 **特殊区域**：{special_areas_text}"""
             await self.send_text(step2_text)
             await asyncio.sleep(0.5)
-        
-        await asyncio.sleep(0.5)
+
+        if env_enabled:
+            try:
+                await self.send_text("准备开场...")
+                await asyncio.sleep(0.5)
+
+                environment_system = self._get_or_create_environment_system()
+                await environment_system.initialize_environment(group_id, scene_name, player_identity, building_type)
+
+                npcs = await environment_system.generate_npcs(
+                    group_id, scene_name, player_identity, building_type,
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+
+                if npcs:
+                    npc_text = "**NPC角色**：\n\n"
+                    for npc in npcs:
+                        npc_text += f"**{npc.get('name', '')}** ({npc.get('role', '')})\n"
+                        npc_text += f"- 性格：{npc.get('personality', '')}\n"
+                        npc_text += f"- 态度：{npc.get('attitude_to_player', '')}\n"
+                        npc_text += f"- 危险等级：{npc.get('danger_level', '')}\n"
+                        npc_text += f"- 出现地点：{npc.get('location', '')}\n\n"
+                    print(f"[规则怪谈] {npc_text}")
+
+                guidance = await environment_system.generate_npc_initial_guidance(
+                    group_id, scene_name, player_identity, building_type,
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                )
+
+                if guidance:
+                    guide_npc = guidance.get("guide_npc", {})
+                    rule_carrier = guidance.get("rule_carrier") or {}
+                    
+                    # 提取规则描述
+                    rule_description = None
+                    guidance_method = guidance.get("guidance_method")
+                    print(f"[规则怪谈] guidance_method: {guidance_method}")
+                    
+                    if guidance_method == "rule_carrier" and rule_carrier.get("content"):
+                        rule_description = rule_carrier.get("content", "")
+                        print(f"[规则怪谈] 使用规则载体内容作为规则描述，长度: {len(rule_description)}")
+                    elif guidance_method == "natural_language" and guidance.get("implicit_rules"):
+                        # 将规则暗示合并为描述
+                        rule_desc_parts = []
+                        for rule in guidance.get("implicit_rules", []):
+                            rule_hint = rule.get("rule_hint", "")
+                            npc_action = rule.get("npc_action", "")
+                            if rule_hint:
+                                rule_desc_parts.append(f"- {rule_hint}")
+                                if npc_action:
+                                    rule_desc_parts.append(f"  {npc_action}")
+                        rule_description = "\n".join(rule_desc_parts) if rule_desc_parts else None
+                        print(f"[规则怪谈] 使用规则暗示作为规则描述，行数: {len(rule_desc_parts)}")
+                    else:
+                        print(f"[规则怪谈] 规则描述提取失败 - method: {guidance_method}, rule_carrier_content: {bool(rule_carrier.get('content'))}, implicit_rules: {bool(guidance.get('implicit_rules'))}")
+
+                    image_path = self._generate_npc_guidance_image(
+                        guide_npc.get("name", ""),
+                        guide_npc.get("role", ""),
+                        guide_npc.get("attitude", ""),
+                        guidance.get("npc_behavior", ""),
+                        guidance.get("npc_dialogue", "")
+                    )
+
+                    try:
+                        with open(image_path, 'rb') as f:
+                            image_bytes = f.read()
+                        image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                        image_sent = await self.send_image(image_base64)
+                        if image_sent:
+                            print(f"[规则怪谈] 入场长图发送完成")
+                        else:
+                            print(f"[规则怪谈] 入场长图发送失败 (返回False)")
+                            await self.send_text("入场长图发送失败，游戏初始化中断。请稍后重试。")
+                            return False, "入场长图发送失败", 2
+                    except Exception as e:
+                        print(f"[规则怪谈] 入场长图发送失败: {str(e)}")
+                        await self.send_text(f"入场长图发送失败: {str(e)}，游戏初始化中断。请稍后重试。")
+                        return False, f"入场长图发送失败: {str(e)}", 2
+                    await asyncio.sleep(0.5)
+                    
+                    # 将规则描述传递给规则长图
+                    if rule_description:
+                        game_states[group_id]["rule_description"] = rule_description
+                        print(f"[规则怪谈] 规则描述已保存到 game_states")
+                    else:
+                        print(f"[规则怪谈] 警告：规则描述为空，未保存到 game_states")
+            except Exception as e:
+                print(f"[规则怪谈] 环境演化系统初始化失败: {str(e)}")
+                await self.send_text("环境演化系统初始化失败，游戏将不使用环境演化功能。")
+                await asyncio.sleep(0.5)
+        else:
+            print("[规则怪谈] 环境演化系统已禁用")
+
         await self.send_text("正在生成规则...")
         await asyncio.sleep(0.5)
 
-        step3_prompt = f"""
-你是一个专业的规则怪谈生成器。请基于以下剧情导入和场景结构，生成规则怪谈的规则。
-
-剧情导入：
-- 场景：{scene_name}
-- 背景：{background}
-- 玩家身份：{player_identity}
-
-场景结构：
-{scene_structure_text}
-
-要求：
-1. 列出5-8条规则，规则应该看似合理但隐藏着诡异之处
-2. 规则应该与剧情导入和场景结构相呼应
-3. 设定通关条件（如：在规定时间内找到出口、收集特定物品、存活到天亮等）
-4. 设定解除条件（如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等）
-5. 规则应该有隐藏的逻辑和真相，需要玩家推理
-6. **规则与环境绑定（非常重要）**：请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联。例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"。这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
-7. **规则间的潜在冲突（非常重要）**：请尝试构建至少一组存在潜在矛盾的规则。例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。" 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地。请在 hidden_truth 中解释这种矛盾的本质（如：两条规则来自不同势力），并在 death_triggers 中隐含相关触发条件
-
-**规则描述要求（非常重要）：**
-- 规则必须简洁、直接，每条规则不超过60字
-- 只说明禁止、允许或要求做的行为，不解释原因
-- 使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX
-- 使用冰冷、客观的公文语调，如同官方通告或操作手册
-- 语调应该冷静、正式、不带感情色彩
-- 可以加入少量关键的环境或感官细节，但要简洁
-- 细节应该让人感到不安和恐惧，但不要直接揭示真相
-
-示例规则风格：
-"禁止在22:00-06:00期间离开房间。"
-"听到三声敲门时，必须立即开门。"
-"三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。"
-"严禁回应任何呼救声。"
-"只有看到绿色灯光时才能进入走廊。"
-"工厂只有蓝色制服的保安，若看见黑色制服的保安，请立即报告主管。"
-"城堡内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
-
-以JSON格式返回，格式如下：
-{{
-  "rules_title": "规则标题（如：员工守则、患者须知等）",
-  "rules": ["规则1", "规则2", ...],
-  "win_condition": "通关条件",
-  "resolve_condition": "解除条件（解决规则怪谈根源的条件）",
-  "hidden_truth": "隐藏的真相（不显示给玩家）",
-  "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
-}}
-
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
-        """
-
-        llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
-        if not llm_response:
-            await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
-
-        print(f"[规则怪谈] 第三步（规则）LLM原始返回: {llm_response}")
-
-        try:
-            step3_data = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] 第三步JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    step3_data = json.loads(json_match.group())
-                    print(f"[规则怪谈] 第三步成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 第三步提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("生成规则失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
-            else:
-                await self.send_text("生成规则失败，返回格式不正确。")
-                return False, "JSON解析失败", True
-
-        rules_image_path = None
-        
-        max_players = 5 if game_mode == "多人" else 1
-
-        game_states[group_id] = {
-            "scene": scene_name,
-            "background": background,
-            "player_identity": player_identity,
-            "building_type": building_type,
-            "overall_layout": overall_layout,
-            "floors": floors,
-            "connections": connections,
-            "special_areas": special_areas,
-            "rules_title": step3_data.get("rules_title", "规则"),
-            "rules": step3_data.get("rules", []),
-            "win_condition": step3_data.get("win_condition", ""),
-            "resolve_condition": step3_data.get("resolve_condition", ""),
-            "hidden_truth": step3_data.get("hidden_truth", ""),
-            "death_triggers": step3_data.get("death_triggers", []),
-            "hints_used": 0,
-            "max_hints": 3,
-            "game_active": True,
-            "max_players": max_players,
-            "game_mode": game_mode,
-            "players": {},
-            "plot_image_path": plot_image_path,
-            "rules_image_path": None,
-            "scene_structure_image_path": None,
-            "time_system": {
-                "start_time": datetime.now().isoformat(),
-                "current_time": "深夜",
-                "elapsed_minutes": 0,
-                "time_description": "午夜时分，周围一片死寂"
-            },
-            "environment": {
-                "lighting": "昏暗",
-                "temperature": "寒冷",
-                "sounds": ["寂静"],
-                "smells": ["霉味"],
-                "atmosphere": "压抑"
-            },
-            "random_events": [],
-            "available_items": [],
-            "environmental_events": [],
-            "rule_mutations": [],
-            "core_symbols": core_symbols,
-            "sanity_break": False,
-            "last_mutation_time": 0,
-            "identity_changes": [],
-            "environment_memory": {
-                "visited_locations": [],
-                "interacted_objects": [],
-                "time_based_events": [],
-                "discovered_secrets": []
-            },
-            "rule_network": {
-                "truth_elements": [],
-                "rule_truth_mappings": [],
-                "rule_dependencies": [],
-                "discovered_truths": []
-            },
-            "collaborative_events": []
-        }
-
-        self._save_game_state(group_id)
-
-        await self._build_rule_network(group_id)
-
-        rules_title = step3_data.get("rules_title", "规则")
-        rules = step3_data.get("rules", [])
-        win_condition = step3_data.get("win_condition", "")
-
-        try:
-            rules_image_path = self._generate_rules_image(rules_title, rules, win_condition, game_mode)
-            game_states[group_id]["rules_image_path"] = rules_image_path
-            with open(rules_image_path, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            
-            # 确保图像发送完成后再继续
-            image_sent = await self.send_image(image_base64)
-            if not image_sent:
-                raise Exception("规则长图发送失败")
-            
-            # 增加延迟，确保图像完全显示后再发送后续消息
-            await asyncio.sleep(1.5)
-        except Exception as e:
-            print(f"[规则怪谈] 生成规则长图失败: {str(e)}")
-            step3_text = f"**{rules_title}**：\n"
-            for i, rule in enumerate(rules, 1):
-                step3_text += f"{i}. {rule}\n"
-            goal_prefix = "你的目标是" if game_mode == "单人" else "你们的目标是"
-            step3_text += f"\n**{goal_prefix}**：{win_condition}"
-            await self.send_text(step3_text)
-            await asyncio.sleep(0.5)
+        # 获取规则描述
+        rule_description = game_states.get(group_id, {}).get("rule_description")
+        await self._generate_and_send_rules(group_id, rules_title, rules, win_condition, game_mode, rule_description)
 
         if game_mode == "单人":
             user_info = self._get_user_info()
@@ -3852,6 +5614,8 @@ class RuleHorrorCommand(BaseCommand):
                     "reasoning_history": [],
                     "action_history": [],
                     "is_alive": True,
+                    "current_identity": game_states[group_id].get("player_identity", ""),
+                    "personal_rules": game_states[group_id].get("rules", []).copy(),
                     "physical_status": {
                         "health": 100,
                         "injury": "无",
@@ -3861,7 +5625,14 @@ class RuleHorrorCommand(BaseCommand):
                         "sanity": 100,
                         "state": "正常",
                         "emotion": "平静"
-                    }
+                    },
+                    "psychological_pressure": {
+                        "fear_level": 0,
+                        "anxiety_level": 0,
+                        "stress_level": 0
+                    },
+                    "inventory": [],
+                    "location": "入口"
                 }
                 self._save_game_state(group_id)
                 player_text = f"**玩家**：{user_name}\n"
@@ -3900,18 +5671,19 @@ class RuleHorrorCommand(BaseCommand):
                 await self.send_text(player_text)
                 await asyncio.sleep(0.5)
 
-        return True, "已开始游戏", True
+        return True, "已开始游戏", 2
 
-    async def _restore_game(self, group_id: str) -> Tuple[bool, Optional[str], bool]:
+    async def _restore_game(self, group_id: str) -> Tuple[bool, Optional[str], int]:
+
         """恢复存档游戏"""
         saved_state = self._load_game_state(group_id)
         if not saved_state:
             await self.send_text("没有找到存档。请先使用 `/rg 开始` 开始游戏。")
-            return False, "无存档", True
+            return False, "无存档", 2
 
         if not saved_state.get("game_active", False):
             await self.send_text("存档中的游戏已结束，无法恢复。请使用 `/rg 开始` 开始新游戏。")
-            return False, "游戏已结束", True
+            return False, "游戏已结束", 2
 
         game_states[group_id] = saved_state
 
@@ -3954,9 +5726,10 @@ class RuleHorrorCommand(BaseCommand):
             reply_text += f"- 使用 `/rg 结束` 结束游戏"
 
         await self.send_text(reply_text)
-        return True, "已恢复存档", True
+        return True, "已恢复存档", 2
 
-    async def _check_clear_condition(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> None:
+    async def _check_clear_condition(self, group_id: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> None:
+
         """检查玩家是否达成通关条件"""
         game_state = game_states.get(group_id, {})
         
@@ -3968,22 +5741,7 @@ class RuleHorrorCommand(BaseCommand):
         if not players:
             return
         
-        players_info = []
-        all_reasoning = []
-        all_actions = []
-        alive_players = []
-        
-        for pid, p_data in players.items():
-            players_info.append({
-                "name": p_data["name"],
-                "is_alive": p_data["is_alive"],
-                "reasoning_count": len(p_data["reasoning_history"]),
-                "action_count": len(p_data["action_history"])
-            })
-            all_reasoning.extend(p_data["reasoning_history"])
-            all_actions.extend(p_data["action_history"])
-            if p_data["is_alive"]:
-                alive_players.append(p_data["name"])
+        players_info, all_reasoning, all_actions, alive_players = self._collect_players_info(players)
         
         prompt = f"""
 你是一个规则怪谈裁判。请根据所有玩家的推理和行动，判断玩家是否达成通关条件。
@@ -4014,22 +5772,9 @@ class RuleHorrorCommand(BaseCommand):
         if not llm_response:
             return
         
-        try:
-            result = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                    print(f"[规则怪谈] 成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 提取JSON后仍然解析失败: {e2}")
-                    return
-            else:
-                return
+        result = self._parse_llm_json_response(llm_response, "检查通关条件")
+        if not result:
+            return
         
         if result.get("cleared") == "是":
             game_state["has_cleared"] = True
@@ -4044,7 +5789,8 @@ class RuleHorrorCommand(BaseCommand):
             )
             await self.send_text(reply_text)
 
-    async def _continue_to_perfect(self, group_id: str, api_url: str, api_key: str, model_list: list, current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], bool]:
+    async def _continue_to_perfect(self, group_id: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float) -> Tuple[bool, Optional[str], int]:
+
         """继续探索完美结局"""
         game_state = game_states.get(group_id, {})
         
@@ -4052,24 +5798,9 @@ class RuleHorrorCommand(BaseCommand):
         
         if not players:
             await self.send_text("没有玩家参与游戏，无法继续探索。")
-            return False, "无玩家", True
+            return False, "无玩家", 2
         
-        players_info = []
-        all_reasoning = []
-        all_actions = []
-        alive_players = []
-        
-        for pid, p_data in players.items():
-            players_info.append({
-                "name": p_data["name"],
-                "is_alive": p_data["is_alive"],
-                "reasoning_count": len(p_data["reasoning_history"]),
-                "action_count": len(p_data["action_history"])
-            })
-            all_reasoning.extend(p_data["reasoning_history"])
-            all_actions.extend(p_data["action_history"])
-            if p_data["is_alive"]:
-                alive_players.append(p_data["name"])
+        players_info, all_reasoning, all_actions, alive_players = self._collect_players_info(players)
         
         prompt = f"""
 你是一个规则怪谈裁判。请根据所有玩家的推理和行动，判断玩家是否达成完美结局。
@@ -4107,34 +5838,22 @@ class RuleHorrorCommand(BaseCommand):
         llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
             await self.send_text("调用LLM API失败，请稍后再试。")
-            return False, "LLM API调用失败", True
+            return False, "LLM API调用失败", 2
 
-        try:
-            result = json.loads(llm_response)
-        except json.JSONDecodeError as e:
-            print(f"[规则怪谈] JSON解析失败: {e}")
-            print(f"[规则怪谈] 尝试提取JSON部分...")
-            
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                    print(f"[规则怪谈] 成功提取JSON")
-                except json.JSONDecodeError as e2:
-                    print(f"[规则怪谈] 提取JSON后仍然解析失败: {e2}")
-                    await self.send_text("判定完美结局失败，返回格式不正确。")
-                    return False, "JSON解析失败", True
-            else:
-                await self.send_text("判定完美结局失败，返回格式不正确。")
-                return False, "JSON解析失败", True
+        result = self._parse_llm_json_response(llm_response, "判定完美结局")
+        if not result:
+            await self.send_text("判定完美结局失败，返回格式不正确。")
+            return False, "JSON解析失败", 2
 
         if not isinstance(result, dict):
             print(f"[规则怪谈] result不是字典类型: {type(result)}, 内容: {result}")
             await self.send_text("判定完美结局失败，返回格式不正确。")
-            return False, "JSON解析失败", True
+            return False, "JSON解析失败", 2
 
         game_state["game_active"] = False
         self._save_game_state(group_id)
+        
+        reply_text = ""
         
         if result.get("perfect") == "是":
             try:
@@ -4215,14 +5934,6 @@ class RuleHorrorCommand(BaseCommand):
                 except Exception as e:
                     print(f"[规则怪谈] 删除场景结构长图失败: {str(e)}")
             
-            plot_image_path = game_state.get("plot_image_path")
-            if plot_image_path and os.path.exists(plot_image_path):
-                try:
-                    os.remove(plot_image_path)
-                    print(f"[规则怪谈] 已删除剧情导入长图：{plot_image_path}")
-                except Exception as e:
-                    print(f"[规则怪谈] 删除剧情导入长图失败: {str(e)}")
-            
             multiplayer_start_image_path = game_state.get("multiplayer_start_image_path")
             if multiplayer_start_image_path and os.path.exists(multiplayer_start_image_path):
                 try:
@@ -4260,7 +5971,7 @@ class RuleHorrorCommand(BaseCommand):
             self._save_game_state(group_id)
         
         await self.send_text(reply_text)
-        return True, "已检查完美结局", True
+        return True, "已检查完美结局", 2
 
     def _generate_plot_image(self, scene_name, background, player_identity, core_symbols=None, output_path=None):
         """生成剧情导入长图（黑暗背景+鲜红字体）
@@ -4275,20 +5986,22 @@ class RuleHorrorCommand(BaseCommand):
         Returns:
             生成的图片路径
         """
+        _ = core_symbols
         
         # 尝试加载中文字体
+
         try:
             font_title = ImageFont.truetype("msyh.ttc", 36)
             font_subtitle = ImageFont.truetype("msyh.ttc", 28)
             font_normal = ImageFont.truetype("msyh.ttc", 20)
             font_small = ImageFont.truetype("msyh.ttc", 16)
-        except:
+        except Exception:
             try:
                 font_title = ImageFont.truetype("simhei.ttf", 36)
                 font_subtitle = ImageFont.truetype("simhei.ttf", 28)
                 font_normal = ImageFont.truetype("simhei.ttf", 20)
                 font_small = ImageFont.truetype("simhei.ttf", 16)
-            except:
+            except Exception:
                 font_title = ImageFont.load_default()
                 font_subtitle = ImageFont.load_default()
                 font_normal = ImageFont.load_default()
@@ -4388,12 +6101,12 @@ class RuleHorrorCommand(BaseCommand):
             font_title = ImageFont.truetype("msyh.ttc", 32)
             font_subtitle = ImageFont.truetype("msyh.ttc", 24)
             font_normal = ImageFont.truetype("msyh.ttc", 18)
-        except:
+        except Exception:
             try:
                 font_title = ImageFont.truetype("simhei.ttf", 32)
                 font_subtitle = ImageFont.truetype("simhei.ttf", 24)
                 font_normal = ImageFont.truetype("simhei.ttf", 18)
-            except:
+            except Exception:
                 font_title = ImageFont.load_default()
                 font_subtitle = ImageFont.load_default()
                 font_normal = ImageFont.load_default()
@@ -4537,7 +6250,9 @@ class RuleHorrorCommand(BaseCommand):
         Returns:
             处理后的img和draw对象
         """
+        _ = font_normal
         if sanity >= 30 or sanity == 0:
+
             return img, draw
         
         width, height = img.size
@@ -4572,10 +6287,28 @@ class RuleHorrorCommand(BaseCommand):
             line_width = int(2 + 3 * insanity_level)
             draw.line([(50, y), (width - 50, y)], fill=(255, 0, 0), width=line_width)
         
-        # 效果3：模糊效果（根据insanity_level控制模糊程度）
-        blur_radius = int(1 + 3 * insanity_level)
-        img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-        draw = ImageDraw.Draw(img)
+        # 效果3：黑色涂抹效果（模拟文字被涂抹）
+        num_black_scribbles = int(2 + 4 * insanity_level)
+        for _ in range(num_black_scribbles):
+            x1 = random.randint(50, width - 50)
+            y1 = random.randint(100, height - 100)
+            scribble_width = int(30 + 80 * insanity_level)
+            scribble_height = int(8 + 15 * insanity_level)
+            x2 = x1 + scribble_width
+            y2 = y1 + scribble_height
+            draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
+        
+        # 效果4：红色涂抹效果（模拟血迹涂抹）
+        num_red_scribbles = int(2 + 5 * insanity_level)
+        for _ in range(num_red_scribbles):
+            x1 = random.randint(50, width - 50)
+            y1 = random.randint(100, height - 100)
+            scribble_width = int(40 + 90 * insanity_level)
+            scribble_height = int(12 + 18 * insanity_level)
+            x2 = x1 + scribble_width
+            y2 = y1 + scribble_height
+            alpha = int(100 + 155 * insanity_level)
+            draw.rectangle([x1, y1, x2, y2], fill=(200, 0, 0, alpha))
         
         return img, draw
 
@@ -4604,12 +6337,16 @@ class RuleHorrorCommand(BaseCommand):
             insanity_level = (10 - sanity) / 10.0 * 0.33 + 0.67
         
         # 效果1：插入乱码符号（根据insanity_level控制数量）
-        symbols = ['#', '@', '$', '%', '^', '&', '*', '!', '?', '~']
-        num_insertions = int(1 + 3 * insanity_level)
+        symbols = ['#', '@', '$', '%', '^', '&', '*', '!', '?', '~', '×', '÷', '※', '※', '●', '■', '◆', '★']
+        chinese_garbled = ['乱', '码', '崩', '坏', '死', '亡', '恐', '惧', '绝', '望', '疯', '狂']
+        num_insertions = int(2 + 5 * insanity_level)
         text_list = list(text)
         for _ in range(num_insertions):
             pos = random.randint(0, len(text_list))
-            text_list.insert(pos, random.choice(symbols))
+            if random.random() < 0.3:
+                text_list.insert(pos, random.choice(chinese_garbled))
+            else:
+                text_list.insert(pos, random.choice(symbols))
         text = ''.join(text_list)
         
         # 效果2：重复词语（针对中文，根据insanity_level控制重复次数）
@@ -4617,7 +6354,7 @@ class RuleHorrorCommand(BaseCommand):
         if words:
             word_to_repeat = random.choice(words)
             if len(word_to_repeat) >= 2:
-                repeat_count = int(2 + 2 * insanity_level)
+                repeat_count = int(2 + 3 * insanity_level)
                 text = text.replace(word_to_repeat, word_to_repeat * repeat_count, 1)
         
         # 效果3：字符错位（随机交换相邻字符，根据insanity_level控制交换频率）
@@ -4630,9 +6367,216 @@ class RuleHorrorCommand(BaseCommand):
                 text_list[i], text_list[i + 1] = text_list[i + 1], text_list[i]
         text = ''.join(text_list)
         
+        # 效果4：文字缺失（随机删除部分文字字符，根据insanity_level控制删除数量）
+        if insanity_level > 0.33:
+            text_list = list(text)
+            num_deletions = int(len(text_list) * (0.05 + 0.15 * insanity_level))
+            for _ in range(num_deletions):
+                if len(text_list) > 0:
+                    pos = random.randint(0, len(text_list) - 1)
+                    text_list.pop(pos)
+            text = ''.join(text_list)
+        
         return text
 
-    def _generate_rules_image(self, rules_title, rules, win_condition, game_mode="单人", output_path=None, sanity=100):
+    async def _send_image_from_path(self, image_path: str, fallback_text: Optional[str] = None) -> bool:
+        """从本地图片路径读取并发送。
+
+        `send_image` 需要 base64 字符串；若发送失败则可回退到文本。
+        """
+        try:
+            with open(image_path, "rb") as img_file:
+                image_base64 = base64.b64encode(img_file.read()).decode("ascii")
+
+            sent = await self.send_image(image_base64)
+            if isinstance(sent, bool):
+                if not sent and fallback_text:
+                    await self.send_text(fallback_text)
+                return bool(sent)
+
+            # 兼容某些适配器返回意外值（如QQ号等）
+            print(f"[规则怪谈] send_image返回了意外值: {sent} (类型: {type(sent)})")
+            if fallback_text:
+                await self.send_text(fallback_text)
+            return False
+
+        except Exception as e:
+            print(f"[规则怪谈] 发送图片失败: {str(e)}")
+            if fallback_text:
+                await self.send_text(fallback_text)
+            return False
+
+    def _generate_info_image(self, title: str, content: List[str], output_prefix: str = "info", output_path: Optional[str] = None) -> str:
+        """生成信息类长图（用于身份变化 / 环境更新等），黑底红字，避免刷屏。"""
+
+        def _normalize_text(text: Optional[str]) -> str:
+            if text is None:
+                return ""
+            return str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+        # 字体
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 36)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 26)
+            font_normal = ImageFont.truetype("msyh.ttc", 20)
+        except Exception:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 36)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 26)
+                font_normal = ImageFont.truetype("simhei.ttf", 20)
+            except Exception:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+
+        width = 900
+        margin = 60
+        title_height = 80
+        line_length = width - 2 * margin
+
+        # 临时画布用于测量
+        temp_img = Image.new("RGB", (width, 100), color="#0a0a0a")
+        temp_draw = ImageDraw.Draw(temp_img)
+
+        def _measure_line_height(font, extra_spacing: int) -> int:
+            bbox = temp_draw.textbbox((0, 0), "国", font=font)
+            return int(bbox[3] - bbox[1]) + extra_spacing
+
+        line_height_subtitle = _measure_line_height(font_subtitle, extra_spacing=12)
+        line_height_normal = _measure_line_height(font_normal, extra_spacing=10)
+
+        def wrap_text(text: str, font, max_width: int, draw) -> List[str]:
+            text = _normalize_text(text)
+            if not text:
+                return []
+
+            lines: List[str] = []
+            for paragraph in text.split("\n"):
+                if paragraph == "":
+                    lines.append("")
+                    continue
+                current = ""
+                for ch in paragraph:
+                    test = current + ch
+                    bbox = draw.textbbox((0, 0), test, font=font)
+                    if (bbox[2] - bbox[0]) <= max_width:
+                        current = test
+                    else:
+                        if current:
+                            lines.append(current)
+                        current = ch
+                if current:
+                    lines.append(current)
+            return lines
+
+        def wrap_text_with_prefix(prefix: str, text: str, font, max_width: int, draw) -> List[str]:
+            prefix = _normalize_text(prefix)
+            text = _normalize_text(text)
+
+            if not text:
+                return [prefix]
+
+            prefix_bbox = draw.textbbox((0, 0), prefix, font=font)
+            prefix_width = prefix_bbox[2] - prefix_bbox[0]
+            first_line_max = max(10, max_width - prefix_width)
+
+            out: List[str] = []
+            first_line = True
+            for paragraph in text.split("\n"):
+                if paragraph == "":
+                    out.append(prefix if first_line else "")
+                    first_line = False
+                    continue
+
+                idx = 0
+                while idx < len(paragraph):
+                    limit = first_line_max if first_line else max_width
+                    current = ""
+                    while idx < len(paragraph):
+                        ch = paragraph[idx]
+                        test = current + ch
+                        bbox = draw.textbbox((0, 0), test, font=font)
+                        if (bbox[2] - bbox[0]) <= limit:
+                            current = test
+                            idx += 1
+                        else:
+                            break
+
+                    if first_line:
+                        out.append(prefix + current)
+                        first_line = False
+                    else:
+                        out.append(current)
+
+                    if current == "" and idx < len(paragraph):
+                        out.append(paragraph[idx])
+                        idx += 1
+
+            return out
+
+        # 扁平化内容并按风格分配字体
+        raw_lines: List[str] = []
+        for item in content:
+            for line in _normalize_text(item).split("\n"):
+                raw_lines.append(line)
+
+        render_lines: List[tuple[str, Any]] = []
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped == "":
+                render_lines.append(("", font_normal))
+                continue
+
+            # 章节标题
+            if stripped.startswith("【") and stripped.endswith("】"):
+                for wrapped in wrap_text(stripped, font_subtitle, line_length, temp_draw):
+                    render_lines.append((wrapped, font_subtitle))
+                continue
+
+            # bullet 处理
+            if stripped.startswith("- "):
+                bullet_text = stripped[2:]
+                for wrapped in wrap_text_with_prefix("- ", bullet_text, font_normal, line_length, temp_draw):
+                    render_lines.append((wrapped, font_normal))
+                continue
+
+            # 默认
+            for wrapped in wrap_text(line, font_normal, line_length, temp_draw):
+                render_lines.append((wrapped, font_normal))
+
+        # 计算高度
+        total_height = margin * 2 + title_height + 30
+        for text, font in render_lines:
+            total_height += line_height_subtitle if font is font_subtitle else line_height_normal
+        total_height += 30
+
+        img = Image.new("RGB", (width, total_height), color="#0a0a0a")
+        draw = ImageDraw.Draw(img)
+
+        # 标题居中
+        title_text = _normalize_text(title)
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_x = (width - (title_bbox[2] - title_bbox[0])) // 2
+        draw.text((title_x, margin), title_text, fill="#8B0000", font=font_title)
+        draw.line([(margin, margin + title_height), (width - margin, margin + title_height)], fill="#8B0000", width=2)
+
+        current_y = margin + title_height + 30
+        for text, font in render_lines:
+            color = "#DC143C" if font is font_subtitle else "#FF0000"
+            draw.text((margin, current_y), text, fill=color, font=font)
+            current_y += line_height_subtitle if font is font_subtitle else line_height_normal
+
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f"{output_prefix}_{timestamp}.png")
+
+        img.save(output_path, "PNG")
+        print(f"[规则怪谈] 信息长图已生成：{output_path}")
+        return output_path
+
+    def _generate_rules_image(self, rules_title, rules, win_condition, game_mode="单人", output_path=None, sanity=100, rule_description=None):
+
         """生成规则长图（黑暗背景+鲜红字体）
         
         Args:
@@ -4641,6 +6585,8 @@ class RuleHorrorCommand(BaseCommand):
             win_condition: 通关条件
             game_mode: 游戏模式（单人/多人）
             output_path: 输出图片路径，如果为None则自动生成
+            sanity: 理智值（用于理智崩坏效果）
+            rule_description: 规则描述（从入场长图移过来的内容）
         
         Returns:
             生成的图片路径
@@ -4651,12 +6597,12 @@ class RuleHorrorCommand(BaseCommand):
             font_title = ImageFont.truetype("msyh.ttc", 36)
             font_subtitle = ImageFont.truetype("msyh.ttc", 28)
             font_normal = ImageFont.truetype("msyh.ttc", 20)
-        except:
+        except Exception:
             try:
                 font_title = ImageFont.truetype("simhei.ttf", 36)
                 font_subtitle = ImageFont.truetype("simhei.ttf", 28)
                 font_normal = ImageFont.truetype("simhei.ttf", 20)
-            except:
+            except Exception:
                 font_title = ImageFont.load_default()
                 font_subtitle = ImageFont.load_default()
                 font_normal = ImageFont.load_default()
@@ -4665,62 +6611,149 @@ class RuleHorrorCommand(BaseCommand):
         margin = 60
         title_height = 80
         section_height = 50
-        line_height = 30
         # 分割线长度
         line_length = 900 - 2 * margin
-        # 每行字符数（根据字体大小估算，确保文本宽度与分割线一致）
-        char_per_line = 38
         
-        # 创建临时图片用于计算文本宽度
-        temp_img = Image.new('RGB', (1, 1), color='#0a0a0a')
+        # 创建临时图片用于计算文本宽度（使用足够大的尺寸）
+        temp_img = Image.new('RGB', (1000, 100), color='#0a0a0a')
         temp_draw = ImageDraw.Draw(temp_img)
         
-        # 计算规则需要的行数
-        rule_lines = []
-        for i, rule in enumerate(rules, 1):
-            rule_text = f"{i}. {rule}"
-            for j in range(0, len(rule_text), char_per_line):
-                rule_lines.append(rule_text[j:j+char_per_line])
+        def _normalize_text(text: Optional[str]) -> str:
+            if text is None:
+                return ""
+            # 统一换行符，避免 `draw.text()` 把同一“行”渲染成多行导致 y 累加不足出现重叠
+            return str(text).replace("\r\n", "\n").replace("\r", "\n")
+        
+        def _measure_line_height(font, extra_spacing: int = 10) -> int:
+            bbox = temp_draw.textbbox((0, 0), "国", font=font)
+            return int(bbox[3] - bbox[1]) + extra_spacing
+
+        
+        line_height_title = _measure_line_height(font_title, extra_spacing=14)
+        line_height_subtitle = _measure_line_height(font_subtitle, extra_spacing=12)
+        line_height_normal = _measure_line_height(font_normal, extra_spacing=10)
+        
+        def wrap_text(text: str, font, max_width: int, draw) -> List[str]:
+            """按像素宽度自动换行，并显式处理 \n。"""
+            text = _normalize_text(text)
+            if not text:
+                return []
+            
+            lines: List[str] = []
+            for paragraph in text.split("\n"):
+                if paragraph == "":
+                    # 保留空行
+                    lines.append("")
+                    continue
+                current_line = ""
+                for ch in paragraph:
+                    test_line = current_line + ch
+                    bbox = draw.textbbox((0, 0), test_line, font=font)
+                    text_width = bbox[2] - bbox[0]
+                    if text_width <= max_width:
+                        current_line = test_line
+                    else:
+                        if current_line:
+                            lines.append(current_line)
+                        current_line = ch
+                if current_line:
+                    lines.append(current_line)
+            return lines
+        
+        def wrap_text_with_prefix(prefix: str, text: str, font, max_width: int, draw) -> List[str]:
+            """第一行带 prefix，且第一行宽度用 (max_width - prefix_width)。"""
+            prefix = _normalize_text(prefix)
+            text = _normalize_text(text)
+            
+            if not text:
+                return [prefix]
+            
+            prefix_bbox = draw.textbbox((0, 0), prefix, font=font)
+            prefix_width = prefix_bbox[2] - prefix_bbox[0]
+            first_line_max = max(10, max_width - prefix_width)
+            
+            out: List[str] = []
+            first_line = True
+            for paragraph in text.split("\n"):
+                if paragraph == "":
+                    out.append(prefix if first_line else "")
+                    first_line = False
+                    continue
+                idx = 0
+                while idx < len(paragraph):
+                    limit = first_line_max if first_line else max_width
+                    current = ""
+                    while idx < len(paragraph):
+                        ch = paragraph[idx]
+                        test = current + ch
+                        bbox = draw.textbbox((0, 0), test, font=font)
+                        if (bbox[2] - bbox[0]) <= limit:
+                            current = test
+                            idx += 1
+                        else:
+                            break
+                    if first_line:
+                        out.append(prefix + current)
+                        first_line = False
+                    else:
+                        out.append(current)
+                    if current == "" and idx < len(paragraph):
+                        # 极端情况下单字符都放不下，避免死循环
+                        out.append(paragraph[idx])
+                        idx += 1
+            return out
+        
+        print(f"[规则怪谈] line_length: {line_length}")
+        
+        # 判断是否使用规则描述（环境演化系统开启）
+        use_description = bool(rule_description)
+        
+        # 计算规则描述需要的行数（如果有）
+        description_lines: List[str] = []
+        if use_description:
+            description_lines = wrap_text(rule_description, font_normal, line_length, temp_draw)
+            
+            print(f"[规则怪谈] 规则描述行数: {len(description_lines)}")
+            for i, line in enumerate(description_lines[:3]):  # 打印前3行用于调试
+                print(f"[规则怪谈] 第{i+1}行: {line[:50]}...")
+        
+        # 计算规则需要的行数（仅在没有规则描述时）
+        rule_lines: List[str] = []
+        if not use_description:
+            for i, rule in enumerate(rules, 1):
+                rule_text = f"{i}. {_normalize_text(rule)}"
+                rule_lines.extend(wrap_text(rule_text, font_normal, line_length, temp_draw))
         
         # 计算通关条件需要的行数
         goal_prefix = "你的目标是" if game_mode == "单人" else "你们的目标是"
-        goal_lines = []
-        
-        # 计算前缀的宽度
         prefix_text = f"{goal_prefix}："
-        prefix_bbox = temp_draw.textbbox((0, 0), prefix_text, font=font_subtitle)
-        prefix_width = prefix_bbox[2] - prefix_bbox[0]
-        
-        # 计算剩余可用宽度
-        remaining_width = line_length - prefix_width
-        
-        # 计算剩余宽度能容纳的字符数
-        sample_text = "测" * 100
-        sample_bbox = temp_draw.textbbox((0, 0), sample_text, font=font_subtitle)
-        char_width = (sample_bbox[2] - sample_bbox[0]) / 100
-        max_chars_per_line = int(remaining_width / char_width)
-        
-        # 第一行：前缀 + win_condition的第一部分
-        if len(win_condition) <= max_chars_per_line:
-            goal_lines.append(f"{prefix_text}{win_condition}")
-        else:
-            goal_lines.append(f"{prefix_text}{win_condition[:max_chars_per_line]}")
-            # 后续行：只显示win_condition的剩余部分
-            remaining_text = win_condition[max_chars_per_line:]
-            for i in range(0, len(remaining_text), char_per_line):
-                goal_lines.append(remaining_text[i:i+char_per_line])
+        goal_lines: List[str] = wrap_text_with_prefix(prefix_text, win_condition, font_subtitle, line_length, temp_draw)
+
         
         # 理智崩坏模式（sanity=0）：只显示规则内容，不显示标题和标签
         is_insane_mode = (sanity == 0)
         
         # 计算总高度
+        insane_line_step = line_height_subtitle + 5
+        
         if is_insane_mode:
-            # 理智崩坏模式：只显示规则，不显示标题和通关条件
-            total_height = (margin * 2 + len(rule_lines) * line_height + 50)
+            # 理智崩坏模式：只显示规则或描述，不显示标题和通关条件
+            if use_description:
+                total_height = (margin * 2 + len(description_lines) * insane_line_step + 50)
+            else:
+                total_height = (margin * 2 + len(rule_lines) * insane_line_step + 50)
         else:
-            total_height = (margin * 2 + title_height + section_height + 
-                           len(rule_lines) * line_height + section_height + 
-                           len(goal_lines) * line_height + 50)
+            # 正常模式
+            if use_description:
+                # 有规则描述：标题 + 描述 + 通关条件
+                total_height = (margin * 2 + title_height + section_height +
+                               len(description_lines) * line_height_normal + section_height +
+                               len(goal_lines) * line_height_subtitle + 50)
+            else:
+                # 无规则描述：标题 + 规则列表 + 通关条件
+                total_height = (margin * 2 + title_height + section_height +
+                               len(rule_lines) * line_height_normal + section_height +
+                               len(goal_lines) * line_height_subtitle + 50)
         
         # 创建图片（黑暗背景）
         width = 900
@@ -4731,15 +6764,20 @@ class RuleHorrorCommand(BaseCommand):
         
         # 理智崩坏模式：只显示规则内容，不显示标题和标签
         if is_insane_mode:
-            # 直接显示规则内容
-            for line in rule_lines:
-                # 移除序号前缀
-                if line.startswith(("1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. ", "8. ", "9. ", "10. ")):
-                    display_line = line.split(". ", 1)[1] if ". " in line else line
-                else:
-                    display_line = line
-                draw.text((margin, current_y), display_line, fill='#8B0000', font=font_subtitle)
-                current_y += line_height
+            # 直接显示规则或描述内容
+            if use_description:
+                for line in description_lines:
+                    draw.text((margin, current_y), line, fill='#8B0000', font=font_subtitle)
+                    current_y += insane_line_step
+            else:
+                for line in rule_lines:
+                    # 移除序号前缀
+                    if line.startswith(("1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. ", "8. ", "9. ", "10. ")):
+                        display_line = line.split(". ", 1)[1] if ". " in line else line
+                    else:
+                        display_line = line
+                    draw.text((margin, current_y), display_line, fill='#8B0000', font=font_subtitle)
+                    current_y += insane_line_step
         else:
             # 正常模式
             # 绘制标题（动态居中）
@@ -4760,20 +6798,30 @@ class RuleHorrorCommand(BaseCommand):
             # 绘制分隔线
             draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#8B0000', width=2)
             
-            # 绘制规则
             current_y = margin + 110
-            for line in rule_lines:
-                # 对规则文本应用理智崩坏效果
-                distorted_line = self._distort_text(line, sanity)
-                
-                # 文字错位效果
-                if sanity < 30 and random.random() < 0.3:
-                    offset_x = random.randint(-3, 3)
-                    offset_y = random.randint(-2, 2)
-                    draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#FF0000', font=font_normal)
-                else:
-                    draw.text((margin, current_y), distorted_line, fill='#FF0000', font=font_normal)
-                current_y += line_height
+            
+            # 根据是否有规则描述，显示不同内容
+            if use_description:
+                # 有规则描述：只显示规则描述
+                current_y += 15  # 轻微留白，让文本更自然
+                for line in description_lines:
+                    draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+                    current_y += line_height_normal
+
+            else:
+                # 无规则描述：显示规则列表
+                for line in rule_lines:
+                    # 对规则文本应用理智崩坏效果
+                    distorted_line = self._distort_text(line, sanity)
+                    
+                    # 文字错位效果
+                    if sanity < 30 and random.random() < 0.3:
+                        offset_x = random.randint(-3, 3)
+                        offset_y = random.randint(-2, 2)
+                        draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#FF0000', font=font_normal)
+                    else:
+                        draw.text((margin, current_y), distorted_line, fill='#FF0000', font=font_normal)
+                    current_y += line_height_normal
             
             # 绘制通关条件
             current_y += 30
@@ -4790,7 +6838,8 @@ class RuleHorrorCommand(BaseCommand):
                     draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#DC143C', font=font_subtitle)
                 else:
                     draw.text((margin, current_y), distorted_line, fill='#DC143C', font=font_subtitle)
-                current_y += line_height
+                current_y += line_height_subtitle
+
         
         # 应用理智崩坏的视觉扭曲效果
         img, draw = self._apply_sanity_distortion(img, draw, sanity, font_normal)
@@ -4822,12 +6871,12 @@ class RuleHorrorCommand(BaseCommand):
             font_title = ImageFont.truetype("msyh.ttc", 36)
             font_subtitle = ImageFont.truetype("msyh.ttc", 28)
             font_normal = ImageFont.truetype("msyh.ttc", 20)
-        except:
+        except Exception:
             try:
                 font_title = ImageFont.truetype("simhei.ttf", 36)
                 font_subtitle = ImageFont.truetype("simhei.ttf", 28)
                 font_normal = ImageFont.truetype("simhei.ttf", 20)
-            except:
+            except Exception:
                 font_title = ImageFont.load_default()
                 font_subtitle = ImageFont.load_default()
                 font_normal = ImageFont.load_default()
@@ -4884,6 +6933,127 @@ class RuleHorrorCommand(BaseCommand):
         
         return output_path
 
+    def _generate_npc_guidance_image(self, npc_name, npc_role, npc_attitude, npc_behavior, npc_dialogue, output_path=None):
+        """生成开场长图（黑暗背景+鲜红字体）
+        
+        Args:
+            npc_name: NPC姓名
+            npc_role: NPC角色
+            npc_attitude: NPC态度
+            npc_behavior: NPC行为描述
+            npc_dialogue: NPC对话内容
+            output_path: 输出图片路径，如果为None则自动生成
+        
+        Returns:
+            生成的图片路径
+        """
+        
+        try:
+            font_title = ImageFont.truetype("msyh.ttc", 36)
+            font_subtitle = ImageFont.truetype("msyh.ttc", 24)
+            font_normal = ImageFont.truetype("msyh.ttc", 18)
+        except Exception:
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 36)
+                font_subtitle = ImageFont.truetype("simhei.ttf", 24)
+                font_normal = ImageFont.truetype("simhei.ttf", 18)
+            except Exception:
+                font_title = ImageFont.load_default()
+                font_subtitle = ImageFont.load_default()
+                font_normal = ImageFont.load_default()
+        
+        margin = 60
+        title_height = 80
+        section_height = 50
+        line_height = 30
+        line_length = 900 - 2 * margin
+        
+        # 创建临时图片用于计算文本宽度
+        temp_img = Image.new('RGB', (1, 1), color='#0a0a0a')
+        temp_draw = ImageDraw.Draw(temp_img)
+        
+        _ = npc_attitude
+
+        content_lines = []
+        
+        content_lines.append(f"人物：{npc_name} ({npc_role})")
+        content_lines.append("")
+
+
+        
+        content_lines.append(npc_behavior)
+        content_lines.append("")
+        
+        content_lines.append(npc_dialogue)
+        content_lines.append("")
+        
+        # 移除规则描述部分，已经移到规则长图中
+        
+        text_lines = []
+        for line in content_lines:
+            if line == "":
+                text_lines.append("")
+            else:
+                if not isinstance(line, str):
+                    line = str(line) if line is not None else ""
+                # 按照实际文本宽度换行
+                current_line = []
+                current_width = 0
+                for char in line:
+                    char_bbox = temp_draw.textbbox((0, 0), char, font=font_normal)
+                    char_width = char_bbox[2] - char_bbox[0]
+                    if current_width + char_width <= line_length:
+                        current_line.append(char)
+                        current_width += char_width
+                    else:
+                        if current_line:
+                            text_lines.append(''.join(current_line))
+                        current_line = [char]
+                        current_width = char_width
+                if current_line:
+                    text_lines.append(''.join(current_line))
+        
+        total_height = margin * 2 + title_height + len(text_lines) * line_height + 50
+        
+        width = 900
+        img = Image.new('RGB', (width, total_height), color='#0a0a0a')
+        draw = ImageDraw.Draw(img)
+        
+        title_text = "入场"
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, margin), title_text, fill='#8B0000', font=font_title)
+        
+        draw.line([(margin, margin + title_height), (width - margin, margin + title_height)], fill='#8B0000', width=2)
+        
+        current_y = margin + title_height + 30
+        for line in text_lines:
+            if line.startswith("人物："):
+                draw.text((margin, current_y), line, fill='#DC143C', font=font_subtitle)
+            else:
+                draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+            current_y += line_height
+
+        
+        if output_path is None:
+            os.makedirs(TEMP_IMAGES_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(TEMP_IMAGES_DIR, f'npc_guidance_{timestamp}.png')
+        
+        try:
+            img.save(output_path, 'PNG')
+            print(f"[规则怪谈] 开场长图已生成：{output_path}")
+            if os.path.exists(output_path):
+                print(f"[规则怪谈] 图片文件确认存在")
+            else:
+                print(f"[规则怪谈] 警告：图片文件不存在！")
+        except Exception as e:
+            print(f"[规则怪谈] 保存图片失败：{str(e)}")
+            raise
+        
+        return output_path
+
     def _generate_ending_image(self, ending, truth_revealed, win_condition_met, resolve_condition_met, survivors, hidden_truth, action_summary="", is_single_player=False, is_forced_end=False, reason="", output_path=None):
         """生成结局长图（黑暗背景+鲜红字体）
         
@@ -4900,17 +7070,19 @@ class RuleHorrorCommand(BaseCommand):
         Returns:
             生成的图片路径
         """
+        _ = is_single_player, reason
         
         try:
+
             font_title = ImageFont.truetype("msyh.ttc", 40)
             font_subtitle = ImageFont.truetype("msyh.ttc", 28)
             font_normal = ImageFont.truetype("msyh.ttc", 20)
-        except:
+        except Exception:
             try:
                 font_title = ImageFont.truetype("simhei.ttf", 40)
                 font_subtitle = ImageFont.truetype("simhei.ttf", 28)
                 font_normal = ImageFont.truetype("simhei.ttf", 20)
-            except:
+            except Exception:
                 font_title = ImageFont.load_default()
                 font_subtitle = ImageFont.load_default()
                 font_normal = ImageFont.load_default()
@@ -5019,12 +7191,12 @@ class RuleHorrorCommand(BaseCommand):
             font_title = ImageFont.truetype("msyh.ttc", 36)
             font_subtitle = ImageFont.truetype("msyh.ttc", 24)
             font_normal = ImageFont.truetype("msyh.ttc", 18)
-        except:
+        except Exception:
             try:
                 font_title = ImageFont.truetype("simhei.ttf", 36)
                 font_subtitle = ImageFont.truetype("simhei.ttf", 24)
                 font_normal = ImageFont.truetype("simhei.ttf", 18)
-            except:
+            except Exception:
                 font_title = ImageFont.load_default()
                 font_subtitle = ImageFont.load_default()
                 font_normal = ImageFont.load_default()
