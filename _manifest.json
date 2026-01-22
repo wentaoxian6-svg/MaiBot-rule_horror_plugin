@@ -11,7 +11,7 @@
   "homepage_url": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
   "repository_url": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
   "host_application": {
-    "min_version": "0.12.0"
+    "min_version": "0.12.2"
   },
   "keywords": [
     "规则怪谈",
@@ -24,5 +24,5 @@
     "Entertainment & Interaction",
     "Content Generation"
   ],
-  "id": "岚影鸿夜.MaiBot-rule_horror_plugin"
+  "id": "wentaoxian6-svg.MaiBot-rule_horror_plugin"
 }

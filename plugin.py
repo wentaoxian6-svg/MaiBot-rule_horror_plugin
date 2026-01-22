@@ -2460,7 +2460,7 @@ class RuleHorrorCommand(BaseCommand):
   "found_items": ["发现的物品列表（如果有）"],
   "item_details": {{
     "item_name": "物品名称",
-    "item_type": "物品类型（线索/工具/其他）",
+    "item_type": "物品类型（线索/工具/物资/其他）",
     "item_description": "物品的详细描述",
     "observation_hint": "物品的观察描述（被污染版本：充满诱导性、暗示真相的美好）",
     "is_key_item": "是否为关键物品（是/否）。关键物品是能够触发规则变异的重要物品，如：带有奇怪符号的物品、与场景历史相关的物品、暗示真相的物品等。只有极少数物品应该是关键物品。"
@@ -2603,6 +2603,19 @@ class RuleHorrorCommand(BaseCommand):
 - 理智值恢复上限为100，请确保不超过此值
 - 理智值恢复应该合理，不要频繁或过度恢复
 - 理智值恢复应该在行动反馈中简要说明原因
+- **特殊机制**：当压力等级和焦虑等级同时大于60时，理智值降低速度大幅增加（每次行动额外降低8-15点）
+
+**疲劳等级规则（非常重要）：**
+- 疲劳等级根据体力值自动更新：
+  * 体力值 76-100：无
+  * 体力值 51-75：轻微
+  * 体力值 26-50：中度
+  * 体力值 1-25：严重
+  * 体力值 0：极度
+- 玩家可以通过休息来降低疲劳等级和恢复体力值
+- 休息会恢复10-20点体力值，并降低一级疲劳等级
+- 休息需要花费15分钟时间
+- 当体力值为0时，玩家进入极度虚弱状态，任何行动所需时间将大幅增加（例如从5分钟增加到15分钟）
 
 如果玩家理智值较低，描述中应该包含幻觉、错觉、混乱的感知等元素。
 
@@ -2630,7 +2643,7 @@ class RuleHorrorCommand(BaseCommand):
   "found_items": ["发现的物品列表（如果有）"],
   "item_details": {{
     "item_name": "物品名称",
-    "item_type": "物品类型（线索/工具/其他）",
+    "item_type": "物品类型（线索/工具/物资/其他）",
     "item_description": "物品的详细描述",
     "observation_hint": "物品的观察描述（令人不安的细节或暗示，如：'你注意到病历单上医生的签名，似乎与入口处名牌上的名字相同。'）",
     "is_key_item": "是否为关键物品（是/否）。关键物品是能够触发规则变异的重要物品，如：带有奇怪符号的物品、与场景历史相关的物品、暗示真相的物品等。只有极少数物品应该是关键物品。"
@@ -2641,6 +2654,14 @@ class RuleHorrorCommand(BaseCommand):
 
 **发现的物品要求（非常重要）：**
 - 如果生成物品，请优先考虑能推进剧情或暗示背景的"线索"，而非实用工具
+- 可以适当生成一些基础物资（如水、食物），让玩家能够恢复状态
+- 基础物资类物品示例：
+  * "一瓶矿泉水，标签上印着模糊的生产日期"
+  * "半瓶水，瓶口有轻微的污渍"
+  * "一块压缩饼干，包装有些破损"
+  * "一包巧克力，已经融化了一部分"
+  * "一个苹果，表面有些许斑点"
+  * "一罐午餐肉，罐头边缘有些锈迹"
 - 线索类物品示例：
   * "一张泛黄的病历单，部分字迹被污渍掩盖"
   * "半本写满疯狂呓语的日记"
@@ -2710,6 +2731,8 @@ class RuleHorrorCommand(BaseCommand):
         player_data["mental_status"] = mental_status
         player_data["psychological_pressure"] = psychological_pressure
         player_data["location"] = new_location
+        
+        await self._update_fatigue_and_sanity(player_data, health, stress_level, anxiety_level)
         
         environment_system = self._get_or_create_environment_system()
         if environment_system and game_state.get("environment_evolution"):
@@ -3244,7 +3267,7 @@ class RuleHorrorCommand(BaseCommand):
   "found_items": ["发现的物品列表（如果有）"],
   "item_details": {{
     "item_name": "物品名称",
-    "item_type": "物品类型（线索/工具/其他）",
+    "item_type": "物品类型（线索/工具/物资/其他）",
     "item_description": "物品的详细描述",
     "observation_hint": "物品的观察描述（被污染版本：充满诱导性、暗示真相的美好）"
   }},
@@ -3404,7 +3427,7 @@ class RuleHorrorCommand(BaseCommand):
   "found_items": ["发现的物品列表（如果有）"],
   "item_details": {{
     "item_name": "物品名称",
-    "item_type": "物品类型（线索/工具/其他）",
+    "item_type": "物品类型（线索/工具/物资/其他）",
     "item_description": "物品的详细描述",
     "observation_hint": "物品的观察描述（令人不安的细节或暗示，如：'你注意到病历单上医生的签名，似乎与入口处名牌上的名字相同。'）",
     "is_key_item": "是否为关键物品（是/否）。关键物品是能够触发规则变异的重要物品，如：带有奇怪符号的物品、与场景历史相关的物品、暗示真相的物品等。只有极少数物品应该是关键物品。"
@@ -3415,6 +3438,14 @@ class RuleHorrorCommand(BaseCommand):
 
 **发现的物品要求（非常重要）：**
 - 如果生成物品，请优先考虑能推进剧情或暗示背景的"线索"，而非实用工具
+- 可以适当生成一些基础物资（如水、食物），让玩家能够恢复状态
+- 基础物资类物品示例：
+  * "一瓶矿泉水，标签上印着模糊的生产日期"
+  * "半瓶水，瓶口有轻微的污渍"
+  * "一块压缩饼干，包装有些破损"
+  * "一包巧克力，已经融化了一部分"
+  * "一个苹果，表面有些许斑点"
+  * "一罐午餐肉，罐头边缘有些锈迹"
 - 线索类物品示例：
   * "一张泛黄的病历单，部分字迹被污渍掩盖"
   * "半本写满疯狂呓语的日记"
@@ -3480,6 +3511,8 @@ class RuleHorrorCommand(BaseCommand):
             player_data["mental_status"] = mental_status
             player_data["psychological_pressure"] = psychological_pressure
             player_data["location"] = new_location
+            
+            await self._update_fatigue_and_sanity(player_data, health, stress_level, anxiety_level)
             
             environment_system = self._get_or_create_environment_system()
             if environment_system and game_state.get("environment_evolution") and is_action_player:
@@ -3997,6 +4030,228 @@ class RuleHorrorCommand(BaseCommand):
         except (json.JSONDecodeError, Exception) as e:
             print(f"[规则怪谈] 协作规则检测失败: {e}")
 
+    def _update_fatigue_and_sanity(self, player_data: dict, health: int, stress_level: int, anxiety_level: int) -> None:
+        """更新疲劳等级和理智值"""
+        physical_status = player_data.get("physical_status", {})
+        mental_status = player_data.get("mental_status", {})
+        psychological_pressure = player_data.get("psychological_pressure", {})
+        
+        current_fatigue = physical_status.get("fatigue", "无")
+        fatigue_levels = ["无", "轻微", "中度", "严重", "极度"]
+        
+        if current_fatigue not in fatigue_levels:
+            current_fatigue = "无"
+        
+        current_fatigue_index = fatigue_levels.index(current_fatigue)
+        
+        if health == 0:
+            new_fatigue = "极度"
+        elif health <= 25:
+            new_fatigue = "严重"
+        elif health <= 50:
+            new_fatigue = "中度"
+        elif health <= 75:
+            new_fatigue = "轻微"
+        else:
+            new_fatigue = "无"
+        
+        new_fatigue_index = fatigue_levels.index(new_fatigue)
+        
+        if new_fatigue_index > current_fatigue_index:
+            physical_status["fatigue"] = new_fatigue
+            player_data["physical_status"] = physical_status
+        
+        if stress_level > 60 and anxiety_level > 60:
+            current_sanity = mental_status.get("sanity", 100)
+            sanity_loss = random.randint(8, 15)
+            new_sanity = max(0, current_sanity - sanity_loss)
+            mental_status["sanity"] = new_sanity
+            player_data["mental_status"] = mental_status
+
+    async def _check_and_use_item(self, group_id: str, user_id: str, action: str) -> bool:
+        """检查并使用物品（水或食物）"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        
+        if user_id not in players:
+            return False
+        
+        player_data = players[user_id]
+        inventory = player_data.get("inventory", [])
+        
+        if not inventory:
+            return False
+        
+        action_lower = action.lower()
+        
+        water_keywords = ["喝水", "喝", "饮用", "水", "矿泉水", "瓶装水", "水杯", "饮水", "喝水水", "喝口水", "喝瓶水", "喝饮料", "喝果汁", "喝牛奶", "喝可乐", "喝汽水"]
+        food_keywords = ["吃", "食用", "食物", "面包", "饼干", "巧克力", "能量棒", "罐头", "水果", "苹果", "香蕉", "糖果", "零食", "饭", "吃点东西", "吃点", "吃面包", "吃饼干", "吃巧克力", "吃能量棒", "吃罐头", "吃水果", "吃苹果", "吃香蕉", "吃糖果", "吃零食", "吃饭", "吃压缩饼干", "吃午餐肉", "吃蛋糕", "吃点心", "吃坚果", "吃香肠", "吃火腿"]
+        
+        used_water = False
+        used_food = False
+        
+        for keyword in water_keywords:
+            if keyword in action_lower:
+                used_water = True
+                break
+        
+        for keyword in food_keywords:
+            if keyword in action_lower:
+                used_food = True
+                break
+        
+        if not used_water and not used_food:
+            return False
+        
+        item_index = -1
+        item_name = ""
+        item_to_use = None
+        
+        if used_water:
+            for i, item in enumerate(inventory):
+                if isinstance(item, dict):
+                    item_name = item.get("name", "")
+                else:
+                    item_name = str(item)
+                
+                if any(keyword in item_name.lower() for keyword in ["水", "矿泉水", "瓶装水", "水杯", "饮料", "果汁", "牛奶", "可乐", "汽水"]):
+                    item_index = i
+                    item_to_use = item
+                    break
+        elif used_food:
+            for i, item in enumerate(inventory):
+                if isinstance(item, dict):
+                    item_name = item.get("name", "")
+                else:
+                    item_name = str(item)
+                
+                if any(keyword in item_name.lower() for keyword in ["食物", "面包", "饼干", "巧克力", "能量棒", "罐头", "水果", "苹果", "香蕉", "糖果", "零食", "饭", "压缩饼干", "午餐肉", "蛋糕", "点心", "坚果", "香肠", "火腿"]):
+                    item_index = i
+                    item_to_use = item
+                    break
+        
+        if item_index == -1:
+            return False
+        
+        psychological_pressure = player_data.get("psychological_pressure", {})
+        physical_status = player_data.get("physical_status", {})
+        
+        effect_text = ""
+        
+        if used_water:
+            stress_reduction = random.randint(3, 5)
+            anxiety_reduction = random.randint(3, 5)
+            
+            current_stress = psychological_pressure.get("stress_level", 0)
+            current_anxiety = psychological_pressure.get("anxiety_level", 0)
+            
+            new_stress = max(0, current_stress - stress_reduction)
+            new_anxiety = max(0, current_anxiety - anxiety_reduction)
+            
+            psychological_pressure["stress_level"] = new_stress
+            psychological_pressure["anxiety_level"] = new_anxiety
+            
+            effect_text = f"你喝了{item_name}，感到一阵清凉。压力等级降低了{stress_reduction}点，焦虑等级降低了{anxiety_reduction}点。"
+        
+        elif used_food:
+            health_recovery = random.randint(3, 5)
+            
+            current_health = physical_status.get("health", 100)
+            new_health = min(100, current_health + health_recovery)
+            
+            actual_recovery = new_health - current_health
+            physical_status["health"] = new_health
+            
+            effect_text = f"你吃了{item_name}，感到体力恢复了一些。体力值回复了{actual_recovery}点。"
+        
+        player_data["psychological_pressure"] = psychological_pressure
+        player_data["physical_status"] = physical_status
+        
+        inventory.pop(item_index)
+        player_data["inventory"] = inventory
+        players[user_id] = player_data
+        game_state["players"] = players
+        
+        await self.send_text(f"**使用物品**\n\n{effect_text}\n\n{item_name}已从物品栏中移除。")
+        
+        return True
+
+    async def _check_and_rest(self, group_id: str, user_id: str, action: str) -> bool:
+        """检查并执行休息"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        
+        if user_id not in players:
+            return False
+        
+        player_data = players[user_id]
+        
+        action_lower = action.lower()
+        
+        rest_keywords = ["休息", "歇息", "休息一下", "歇一下", "休息会儿", "歇会儿", "休息片刻", "歇息片刻", "休息一会", "歇息一会", "休息片刻", "坐下休息", "坐下歇息", "躺下休息", "躺下歇息", "休息恢复", "歇息恢复", "休息恢复体力", "歇息恢复体力"]
+        
+        is_resting = False
+        for keyword in rest_keywords:
+            if keyword in action_lower:
+                is_resting = True
+                break
+        
+        if not is_resting:
+            return False
+        
+        physical_status = player_data.get("physical_status", {})
+        mental_status = player_data.get("mental_status", {})
+        
+        current_health = physical_status.get("health", 100)
+        current_fatigue = physical_status.get("fatigue", "无")
+        
+        fatigue_levels = ["无", "轻微", "中度", "严重", "极度"]
+        if current_fatigue not in fatigue_levels:
+            current_fatigue = "无"
+        
+        current_fatigue_index = fatigue_levels.index(current_fatigue)
+        
+        health_recovery = random.randint(10, 20)
+        new_health = min(100, current_health + health_recovery)
+        actual_health_recovery = new_health - current_health
+        
+        if current_fatigue_index > 0:
+            new_fatigue = fatigue_levels[current_fatigue_index - 1]
+            physical_status["fatigue"] = new_fatigue
+            fatigue_reduced = True
+        else:
+            fatigue_reduced = False
+        
+        physical_status["health"] = new_health
+        player_data["physical_status"] = physical_status
+        
+        rest_text = f"你休息了一会儿，感到体力恢复了一些。体力值回复了{actual_health_recovery}点。"
+        
+        if fatigue_reduced:
+            rest_text += f" 疲劳等级从{current_fatigue}降低到了{new_fatigue}。"
+        
+        time_system = game_state.get("time_system", {})
+        elapsed_minutes = time_system.get("elapsed_minutes", 0) + 15
+        time_system["elapsed_minutes"] = elapsed_minutes
+        
+        if elapsed_minutes < 60:
+            time_system["current_time"] = "深夜"
+            time_system["time_description"] = "午夜时分，周围一片死寂"
+        elif elapsed_minutes < 180:
+            time_system["current_time"] = "凌晨"
+            time_system["time_description"] = "黎明前的黑暗，空气中弥漫着不安"
+        else:
+            time_system["current_time"] = "黎明"
+            time_system["time_description"] = "东方泛起鱼肚白，但黑暗仍未完全消散"
+        
+        game_state["time_system"] = time_system
+        players[user_id] = player_data
+        game_state["players"] = players
+        
+        await self.send_text(f"**休息**\n\n{rest_text}\n\n休息花费了15分钟。")
+        
+        return True
+
     async def _record_action(self, group_id: str, action: str, api_url: str, api_key: str, model_list: List[str], current_model_index: int, temperature: float, env_api_url: str, env_api_key: str, env_model_list: List[str], env_current_model_index: int, env_temperature: float) -> Tuple[bool, Optional[str], int]:
 
 
@@ -4052,7 +4307,15 @@ class RuleHorrorCommand(BaseCommand):
         
         time_system = game_state.get("time_system", {})
         
-        elapsed_minutes = time_system.get("elapsed_minutes", 0) + 5
+        physical_status = player_data.get("physical_status", {})
+        fatigue = physical_status.get("fatigue", "无")
+        
+        if fatigue == "极度":
+            time_increment = 15
+        else:
+            time_increment = 5
+        
+        elapsed_minutes = time_system.get("elapsed_minutes", 0) + time_increment
         time_system["elapsed_minutes"] = elapsed_minutes
         
         if elapsed_minutes < 60:
@@ -4106,6 +4369,16 @@ class RuleHorrorCommand(BaseCommand):
                 "time": time_system.get("current_time", "深夜"),
                 "location": player_data.get("location", "未知")
             })
+        
+        item_used = await self._check_and_use_item(group_id, user_id, action)
+        if item_used:
+            self._save_game_state(group_id)
+            return True, "已使用物品", 2
+        
+        rest_used = await self._check_and_rest(group_id, user_id, action)
+        if rest_used:
+            self._save_game_state(group_id)
+            return True, "已休息", 2
         
         if game_state.get("game_mode") == "单人":
             await self._process_single_player_action(

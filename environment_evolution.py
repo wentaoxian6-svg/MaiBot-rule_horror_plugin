@@ -67,8 +67,15 @@ class EnvironmentEvolutionSystem:
         if not game_state:
             return []
         
-        prompt = f"""
-你是一位规则怪谈游戏设计师。请为以下场景生成3-5个NPC角色。
+        num_npcs = random.randint(3, 5)
+        all_npcs = []
+        existing_roles = []
+        
+        for i in range(num_npcs):
+            existing_roles_text = ", ".join(existing_roles) if existing_roles else "无"
+            
+            prompt = f"""
+你是一位规则怪谈游戏设计师。请为以下场景生成1个NPC角色。
 
 场景类型：{scene_type}
 建筑类型：{building_type}
@@ -77,9 +84,11 @@ class EnvironmentEvolutionSystem:
 规则：{json.dumps(game_state.get('rules', []), ensure_ascii=False)}
 隐藏真相：{game_state.get('hidden_truth', '')}
 
+已生成的NPC角色：{existing_roles_text}
+
 **NPC设计要求：**
 
-1. **角色多样性**：NPC应该有不同的身份和角色（如：医生、护士、病人、保安、清洁工等）
+1. **角色多样性**：NPC应该有不同的身份和角色（如：医生、护士、病人、保安、清洁工等），请避免与已生成的NPC角色重复
 2. **性格特征**：每个NPC应该有独特的性格特征
 3. **行为模式**：描述NPC的日常行为和活动规律
 4. **与真相的关系**：每个NPC与隐藏真相的关系（知情者、受害者、加害者、旁观者等）
@@ -110,24 +119,31 @@ class EnvironmentEvolutionSystem:
 }}
 
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
-        """
-        
-        llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
-        if not llm_response:
-            print("[环境演化] 生成NPC失败：LLM API调用失败")
-            return []
-        
-        result = self._parse_llm_json_response(llm_response, "生成NPC")
-        if not result:
-            print("[环境演化] 生成NPC失败：JSON解析失败")
-            return []
-        
-        npcs = result.get("npcs", [])
+            """
+            
+            llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
+            if not llm_response:
+                print(f"[环境演化] 生成第{i+1}个NPC失败：LLM API调用失败")
+                continue
+            
+            result = self._parse_llm_json_response(llm_response, "生成NPC")
+            if not result:
+                print(f"[环境演化] 生成第{i+1}个NPC失败：JSON解析失败")
+                continue
+            
+            npcs = result.get("npcs", [])
+            if npcs:
+                for npc in npcs:
+                    role = npc.get("role", "")
+                    if role and role not in existing_roles:
+                        existing_roles.append(role)
+                all_npcs.extend(npcs)
+                print(f"[环境演化] 成功生成第{i+1}个NPC")
         
         if game_state.get("environment_evolution"):
-            game_state["environment_evolution"]["npcs"] = npcs
+            game_state["environment_evolution"]["npcs"] = all_npcs
         
-        return npcs
+        return all_npcs
     
     async def generate_complete_rules(self, group_id: str, scene_name: str,
                                           player_identity: str, building_type: str,
