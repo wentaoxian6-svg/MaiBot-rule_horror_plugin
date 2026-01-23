@@ -3090,14 +3090,7 @@ class RuleHorrorCommand(BaseCommand):
                         print(f"[规则怪谈] 记录后台环境事件失败: {str(hidden_e)}")
 
 
-                    if env_lines:
-                        try:
-                            image_path = self._generate_info_image("环境更新", env_lines, output_prefix="environment_update")
-                            await self._send_image_from_path(image_path, fallback_text="\n".join(env_lines))
-                            await asyncio.sleep(0.5)
-                        except Exception as img_e:
-                            print(f"[规则怪谈] 生成/发送环境更新长图失败: {str(img_e)}")
-                            await self.send_text("\n".join(env_lines))
+                    # 环境更新信息仅记录在后台，在玩家行动中体现，不再单独发送长图
 
 
 
@@ -3894,14 +3887,7 @@ class RuleHorrorCommand(BaseCommand):
                         print(f"[规则怪谈] 记录后台环境事件失败: {str(hidden_e)}")
 
 
-                    if env_lines:
-                        try:
-                            image_path = self._generate_info_image("环境更新", env_lines, output_prefix="environment_update")
-                            await self._send_image_from_path(image_path, fallback_text="\n".join(env_lines))
-                            await asyncio.sleep(0.5)
-                        except Exception as img_e:
-                            print(f"[规则怪谈] 生成/发送环境更新长图失败: {str(img_e)}")
-                            await self.send_text("\n".join(env_lines))
+                    # 多人模式：环境更新信息仅记录在后台，在玩家行动中体现，不再单独发送长图
 
             except Exception as e:
                 print(f"[规则怪谈] 更新环境状态失败: {str(e)}")
