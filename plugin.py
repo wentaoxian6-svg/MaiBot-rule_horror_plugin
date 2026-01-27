@@ -3505,7 +3505,7 @@ class RuleHorrorCommand(BaseCommand):
             player_data["psychological_pressure"] = psychological_pressure
             player_data["location"] = new_location
             
-            await self._update_fatigue_and_sanity(player_data, health, stress_level, anxiety_level)
+            self._update_fatigue_and_sanity(player_data, health, stress_level, anxiety_level)
             
             environment_system = self._get_or_create_environment_system()
             if environment_system and game_state.get("environment_evolution") and is_action_player:
