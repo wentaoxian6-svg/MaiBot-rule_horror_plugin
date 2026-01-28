@@ -26,7 +26,7 @@ import re
 import asyncio
 import aiohttp
 import base64
-from typing import Any, List, Tuple, Type, Optional, Union, cast
+from typing import Any, List, Tuple, Type, Optional, Union, cast, Dict
 
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
@@ -47,6 +47,13 @@ from src.plugin_system import (  # pyright: ignore[reportImplicitRelativeImport]
 )
 
 from .environment_evolution import EnvironmentEvolutionSystem
+from .shared_prompts import clean_llm_response, build_immersion_enhancement
+from .game_time_manager import GameTimeManager
+from .environment_state import EnvironmentState
+from .rule_mutation_system import RuleMutationSystem, create_default_mutation_conditions
+from .image_generator import ImageGenerator
+from .clue_discovery_system import ClueDiscoverySystem, create_default_clues
+from .multiplayer_physics_system import MultiplayerPhysicsSystem, Position, Direction, Mechanism
 
 
 PLUGIN_DIR = os.path.dirname(__file__)
@@ -196,6 +203,7 @@ class RuleHorrorCommand(BaseCommand):
     def __init__(self, message, plugin_config=None):
         super().__init__(message, plugin_config)
         self.environment_system = None
+        self.image_generator = ImageGenerator(TEMP_IMAGES_DIR)
     
     def _get_or_create_environment_system(self) -> EnvironmentEvolutionSystem:
         """获取或创建环境演化系统"""
@@ -511,8 +519,12 @@ class RuleHorrorCommand(BaseCommand):
         
         await self.send_text("正在生成规则怪谈...")
 
-        step1_prompt = """
+        game_mode_text = f"**游戏模式：{game_mode}**" if game_mode else "**游戏模式：单人**"
+        
+        step1_prompt = f"""
 你是一位精通规则怪谈创作的游戏设计师。请生成一个恐怖或诡异的规则怪谈的剧情导入和隐藏真相。
+
+{game_mode_text}
 
 **创作要求：**
 
@@ -527,6 +539,8 @@ class RuleHorrorCommand(BaseCommand):
    - 身份应与场景和剧情相符（如：工厂员工、夜班护士、新入职教师、庄园管家、酒店住客等）
    - 身份应该让玩家有代入感，同时暗示某种危险
    - 可以暗示身份与场景历史有某种联系
+   - **重要**：如果是多人模式，请使用复数形式"你们都是..."来描述玩家身份，确保身份描述适用于多个玩家
+   - **多人模式优化**：如果是多人模式，建议生成一组角色（3-5人），各自负责不同区域或职责，如"一组夜班护士（3-5人），各自负责不同区域"，并建议包含：资深角色（如护士长）、新手角色（如实习护士）、后勤角色（如护工）
 
 4. **恐怖氛围营造**：
    - 使用具体的感官细节（视觉、听觉、嗅觉、触觉）
@@ -570,24 +584,44 @@ class RuleHorrorCommand(BaseCommand):
 
 **输出格式：**
 请以JSON格式返回，格式如下：
-{
+{{
   "scene": "场景名称（如：深夜的废弃医院）",
   "background": "场景背景故事，描述这个场景的历史、发生过什么、为什么诡异",
   "player_identity": "玩家在这个场景中的身份或角色",
   "core_symbols": [
-    {"symbol": "符号1", "description": "符号1的描述"},
-    {"symbol": "符号2", "description": "符号2的描述"}
+    {{"symbol": "符号1", "description": "符号1的描述"}},
+    {{"symbol": "符号2", "description": "符号2的描述"}}
   ],
-  "environment": {
+  "environment": {{
     "lighting": "光线状况",
     "temperature": "温度感受",
     "sounds": ["声音1", "声音2"],
     "smells": ["气味1", "气味2"],
     "atmosphere": "整体氛围"
-  },
+  }},
   "anomalies": ["异常现象1", "异常现象2"],
   "hidden_truth": "隐藏的真相（以叙事方式描述场景背后的真实情况，不要提及规则编号或明确说明规则与真相的对应关系）"
-}
+}}
+
+示例：
+{{
+  "scene": "深夜的废弃医院",
+  "background": "这座医院在20年前发生过一场医疗事故，一名医生为了拯救自己的女儿，与某种存在进行了交易。从此，医院成为了两个世界的交汇点。那些看似诡异的规则，实际上是为了防止那个存在从医院中逃脱。",
+  "player_identity": "夜班护士",
+  "core_symbols": [
+    {{"symbol": "数字7", "description": "出现在各种意想不到的地方，暗示某种诅咒或周期"}},
+    {{"symbol": "破碎的镜子", "description": "象征分裂的真相和扭曲的现实"}}
+  ],
+  "environment": {{
+    "lighting": "昏暗的应急灯，闪烁不定",
+    "temperature": "刺骨的寒冷",
+    "sounds": ["风声", "沉重的脚步声", "低语"],
+    "smells": ["霉味", "血腥味"],
+    "atmosphere": "压抑、恐怖"
+  }},
+  "anomalies": ["时间错乱", "空间扭曲", "超自然现象"],
+  "hidden_truth": "这座医院在20年前发生过一场医疗事故，一名医生为了拯救自己的女儿，与某种存在进行了交易。从此，医院成为了两个世界的交汇点。那些看似诡异的规则，实际上是为了防止那个存在从医院中逃脱。"
+}}
 
 **重要提示：**
 - 请仅返回JSON，不要包含任何其他文字
@@ -598,6 +632,12 @@ class RuleHorrorCommand(BaseCommand):
 - 异常现象应该微妙而诡异，不要直接揭示真相
 - 隐藏真相是整个游戏的核心，应该与背景故事、玩家身份、核心象征符号形成完整的逻辑体系
 - 隐藏真相应该足够详细，为后续的规则生成和游戏推进提供充分的依据
+
+**输出前自检：**
+- [ ] 是否为合法 JSON 格式（可用 json.loads 验证）
+- [ ] 是否不包含 ```json 等 markdown 标记
+- [ ] 所有必填字段是否已填充
+- [ ] 是否不含 emoji 和特殊控制字符
         """
 
         llm_response = await self._call_llm_api(step1_prompt, api_url, api_key, model_list, current_model_index, temperature)
@@ -694,7 +734,37 @@ class RuleHorrorCommand(BaseCommand):
   "special_areas": ["特殊区域1", "特殊区域2"]
 }}
 
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
+示例：
+{{
+  "building_type": "医院",
+  "overall_layout": "L型建筑，主楼为七层，辅楼为三层，中间有走廊连接",
+  "floors": [
+    {{
+      "floor": "一楼",
+      "areas": ["大厅", "急诊室", "药房", "护士站"]
+    }},
+    {{
+      "floor": "二楼",
+      "areas": ["病房区", "手术室", "医生办公室"]
+    }},
+    {{
+      "floor": "三楼",
+      "areas": ["ICU", "实验室", "储藏室"]
+    }},
+    {{
+      "floor": "地下室",
+      "areas": ["停尸房", "档案室", "锅炉房"]
+    }}
+  ],
+  "connections": ["主楼梯", "货梯", "紧急通道"],
+  "special_areas": ["停尸房", "档案室", "天台"]
+}}
+
+**输出前自检：**
+- [ ] 是否为合法 JSON 格式（可用 json.loads 验证）
+- [ ] 是否不包含 ```json 等 markdown 标记
+- [ ] 所有必填字段是否已填充
+- [ ] 是否不含 emoji 和特殊控制字符
         """
 
         llm_response = await self._call_llm_api(step2_prompt, api_url, api_key, model_list, current_model_index, temperature)
@@ -882,6 +952,31 @@ class RuleHorrorCommand(BaseCommand):
   "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
 }}
 
+示例：
+{{
+  "rules_title": "患者须知",
+  "rules": [
+    "禁止在22:00-06:00期间离开病房。",
+    "听到三声敲门时，必须立即开门。",
+    "三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。",
+    "严禁回应任何呼救声。",
+    "只有看到绿色灯光时才能进入走廊。",
+    "医院只有蓝色制服的保安，若看见黑色制服的保安，请立即报告护士长。",
+    "医院内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
+  ],
+  "win_condition": "找到并摧毁与异界连接的通道，阻止异界生物进入医院",
+  "resolve_condition": "在三楼东侧病房的窗户处，使用特殊的仪式关闭通往异界的通道",
+  "death_triggers": [
+    "在22:00-06:00期间离开病房",
+    "听到三声敲门后不立即开门",
+    "打开三楼东侧病房的窗户",
+    "回应呼救声",
+    "在没有绿色灯光时进入走廊",
+    "与黑色制服的保安接触",
+    "凝视镜子超过10秒"
+  ]
+}}
+
 **重要提示：**
 - 请仅返回JSON，不要包含任何其他文字
 - 严禁使用任何emoji表情符号
@@ -889,6 +984,12 @@ class RuleHorrorCommand(BaseCommand):
 - 死亡触发条件应该与规则和真相有逻辑关联
 - 整个规则系统应该形成一个完整的、有逻辑的体系
 - 规则的设计必须与提供的隐藏真相保持一致，所有规则都应该能够从隐藏真相中找到合理的解释
+
+**输出前自检：**
+- [ ] 是否为合法 JSON 格式（可用 json.loads 验证）
+- [ ] 是否不包含 ```json 等 markdown 标记
+- [ ] 所有必填字段是否已填充
+- [ ] 是否不含 emoji 和特殊控制字符
                 """
 
                 llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
@@ -1041,6 +1142,31 @@ class RuleHorrorCommand(BaseCommand):
   "death_triggers": ["会导致死亡的行为1", "会导致死亡的行为2", ...]
 }}
 
+示例：
+{{
+  "rules_title": "患者须知",
+  "rules": [
+    "禁止在22:00-06:00期间离开病房。",
+    "听到三声敲门时，必须立即开门。",
+    "三楼东侧病房的窗户必须保持关闭状态。若发现窗户自行开启，请立即通知安保人员并远离开启的窗户。",
+    "严禁回应任何呼救声。",
+    "只有看到绿色灯光时才能进入走廊。",
+    "医院只有蓝色制服的保安，若看见黑色制服的保安，请立即报告护士长。",
+    "医院内没有镜子，如果你觉得你看到了镜子，请相信那是你的幻觉。"
+  ],
+  "win_condition": "找到并摧毁与异界连接的通道，阻止异界生物进入医院",
+  "resolve_condition": "在三楼东侧病房的窗户处，使用特殊的仪式关闭通往异界的通道",
+  "death_triggers": [
+    "在22:00-06:00期间离开病房",
+    "听到三声敲门后不立即开门",
+    "打开三楼东侧病房的窗户",
+    "回应呼救声",
+    "在没有绿色灯光时进入走廊",
+    "与黑色制服的保安接触",
+    "凝视镜子超过10秒"
+  ]
+}}
+
 **重要提示：**
 - 请仅返回JSON，不要包含任何其他文字
 - 严禁使用任何emoji表情符号
@@ -1048,6 +1174,12 @@ class RuleHorrorCommand(BaseCommand):
 - 死亡触发条件应该与规则和真相有逻辑关联
 - 整个规则系统应该形成一个完整的、有逻辑的体系
 - 规则的设计必须与提供的隐藏真相保持一致，所有规则都应该能够从隐藏真相中找到合理的解释
+
+**输出前自检：**
+- [ ] 是否为合法 JSON 格式（可用 json.loads 验证）
+- [ ] 是否不包含 ```json 等 markdown 标记
+- [ ] 所有必填字段是否已填充
+- [ ] 是否不含 emoji 和特殊控制字符
             """
 
             llm_response = await self._call_llm_api(step3_prompt, api_url, api_key, model_list, current_model_index, temperature)
@@ -1122,7 +1254,8 @@ class RuleHorrorCommand(BaseCommand):
 
                 npcs = await environment_system.generate_npcs(
                     group_id, scene_name, player_identity, building_type,
-                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature,
+                    game_mode
                 )
 
                 if npcs:
@@ -1136,7 +1269,7 @@ class RuleHorrorCommand(BaseCommand):
                     print(f"[规则怪谈] {npc_text}")
 
                 guidance = await environment_system.generate_npc_initial_guidance(
-                    group_id, scene_name, player_identity, building_type,
+                    group_id, scene_name, player_identity, building_type, game_mode,
                     env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
                 )
 
@@ -1167,13 +1300,14 @@ class RuleHorrorCommand(BaseCommand):
                     else:
                         print(f"[规则怪谈] 规则描述提取失败 - method: {guidance_method}, rule_carrier_content: {bool(rule_carrier.get('content'))}, implicit_rules: {bool(guidance.get('implicit_rules'))}")
 
-                    image_path = self._generate_npc_guidance_image(
+                    image_path = self.image_generator.generate_npc_guidance_image(
                         guide_npc.get("name", ""),
                         guide_npc.get("role", ""),
                         guide_npc.get("attitude", ""),
                         guidance.get("npc_behavior", ""),
                         guidance.get("npc_dialogue", "")
                     )
+                    game_states[group_id]["npc_guidance_image_path"] = image_path
 
                     try:
                         with open(image_path, 'rb') as f:
@@ -1478,7 +1612,7 @@ class RuleHorrorCommand(BaseCommand):
 
 **特殊区域**：{special_areas_text}
 
-**当前时间**：{game_state.get('time_system', {}).get('current_time', '未知')}
+**当前时间**：{game_state.get('time_manager', {}).get('current_time', '未知')}
 **环境状况**：
    - 光线：{game_state.get('environment', {}).get('lighting', '未知')}
    - 温度：{game_state.get('environment', {}).get('temperature', '未知')}
@@ -2297,9 +2431,9 @@ class RuleHorrorCommand(BaseCommand):
         environment_memory["interacted_objects"] = interacted_objects
         
         time_based_events = environment_memory.get("time_based_events", [])
-        if time_system := game_state.get("time_system", {}):
-            current_time = time_system.get("current_time", "")
-            time_description = time_system.get("time_description", "")
+        if time_manager := game_state.get("time_manager", {}):
+            current_time = time_manager.get("current_time", "")
+            time_description = time_manager.get("time_description", "")
             time_based_events.append({
                 "time": elapsed_minutes,
                 "time_of_day": current_time,
@@ -2320,12 +2454,12 @@ class RuleHorrorCommand(BaseCommand):
         players = game_state.get("players", {})
         player_data = players.get(user_id, {})
         
-        time_system = game_state.get("time_system", {})
+        time_manager = game_state.get("time_manager", {})
         environment = game_state.get("environment", {})
         environment_memory = game_state.get("environment_memory", {})
         rule_network = game_state.get("rule_network", {})
         sanity = player_data.get("mental_status", {}).get("sanity", 100)
-        elapsed_minutes = time_system.get("elapsed_minutes", 0)
+        elapsed_minutes = time_manager.get("elapsed_minutes", 0)
         
         rule_network_info = ""
         if rule_network:
@@ -2367,8 +2501,8 @@ class RuleHorrorCommand(BaseCommand):
 玩家行动：{action}
 
 **时间信息：**
-当前时间：{time_system.get('current_time', '深夜')}
-时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+当前时间：{time_manager.get('current_time', '深夜')}
+时间描述：{time_manager.get('time_description', '午夜时分，周围一片死寂')}
 已过时间：{elapsed_minutes}分钟
 
 **核心象征符号：**
@@ -2487,8 +2621,8 @@ class RuleHorrorCommand(BaseCommand):
 死亡触发条件：{json.dumps(game_state.get('death_triggers', []), ensure_ascii=False)}
 玩家行动：{action}
 
-当前时间：{time_system.get('current_time', '深夜')}
-时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+当前时间：{time_manager.get('current_time', '深夜')}
+时间描述：{time_manager.get('time_description', '午夜时分，周围一片死寂')}
 已过时间：{elapsed_minutes}分钟
 
 核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
@@ -2545,7 +2679,33 @@ class RuleHorrorCommand(BaseCommand):
    - 空气的流动和压力
    - 时间流逝的感觉
 
-7. **核心象征符号植入（非常重要）**：
+7. **同地点玩家描述（非常重要）**：
+   - 如果有其他玩家在同一地点，请在场景描述中提及他们
+   - 描述他们的位置、状态和动作
+   - 例如：
+     * "你看到玩家A站在房间中央，正凝视着墙上的画作"
+     * "玩家B正蹲在角落里，似乎在检查地板上的裂缝"
+     * "玩家C面色苍白，眼神空洞地望着窗外"
+   - 如果同地点的玩家理智值较低，描述他们的异常行为或状态
+
+8. **尸体描述（非常重要）**：
+   - 如果该地点有尸体，请在场景描述中提及
+   - 描述尸体的位置、状态和死因（如果明显）
+   - 例如：
+     * "你看到玩家A的尸体躺在地板中央，死状凄惨"
+     * "墙角有一具尸体，已经僵硬，似乎已经死亡多时"
+     * "玩家B的尸体靠在墙边，身上有明显的伤痕"
+   - 尸体的描述应该增强恐怖氛围，为玩家提供重要线索
+
+9. **被堵住的出口（如果有）**：
+   - 如果该地点有被堵住的出口，请在场景描述中提及
+   - 描述被堵住的情况和原因
+   - 例如：
+     * "通往走廊的门被书架堵住了，无法通行"
+     * "窗户被木板钉死，无法打开"
+     * "楼梯口堆满了杂物，无法通过"
+
+10. **核心象征符号植入（非常重要）**：
    - 在场景描述中有机地、不突兀地植入核心象征符号
    - 符号可以出现在墙纸花纹、物品编号、声音描述、光影效果等细节中
    - 符号的出现应该自然、微妙，让玩家在多次遭遇后自发解读
@@ -2617,7 +2777,7 @@ class RuleHorrorCommand(BaseCommand):
 - 休息需要花费15分钟时间
 - 当体力值为0时，玩家进入极度虚弱状态，任何行动所需时间将大幅增加（例如从5分钟增加到15分钟）
 
-如果玩家理智值较低，描述中应该包含幻觉、错觉、混乱的感知等元素。
+{build_immersion_enhancement(user_name, sanity, elapsed_minutes, game_state)}
 
 {death_rule_info}
 
@@ -3106,12 +3266,12 @@ class RuleHorrorCommand(BaseCommand):
         players = game_state.get("players", {})
         action_player_data = players.get(user_id, {})
         
-        time_system = game_state.get("time_system", {})
+        time_manager = game_state.get("time_manager", {})
         environment = game_state.get("environment", {})
         environment_memory = game_state.get("environment_memory", {})
         rule_network = game_state.get("rule_network", {})
         action_player_sanity = action_player_data.get("mental_status", {}).get("sanity", 100)
-        elapsed_minutes = time_system.get("elapsed_minutes", 0)
+        elapsed_minutes = time_manager.get("elapsed_minutes", 0)
         
         rule_network_info = ""
         if rule_network:
@@ -3124,22 +3284,38 @@ class RuleHorrorCommand(BaseCommand):
         scene_description = ""
         key_item_found = False
         
-        for pid, player_data in players.items():
-
-            if not player_data["is_alive"]:
-                continue
-            
-            current_player_name = player_data["name"]
-            current_player_sanity = player_data.get("mental_status", {}).get("sanity", 100)
-            current_player_location = player_data.get("location", "入口")
-            
-            is_action_player = (pid == user_id)
-            player_sanity_break = (current_player_sanity < 30 and not game_state.get("sanity_break", False))
-            
-            pending_rules_info = ""
-            pending_rules = game_state.get("pending_rules", [])
-            if pending_rules:
-                pending_rules_info = f"""
+        current_player_name = action_player_data.get("name", "")
+        current_player_sanity = action_player_sanity
+        current_player_location = action_player_data.get("location", "入口")
+        pid = user_id
+        player_data = action_player_data
+        
+        if not player_data["is_alive"]:
+            await self.send_text(f"玩家{user_name}已经死亡，无法行动。")
+            return
+        
+        is_action_player = True
+        player_sanity_break = (current_player_sanity < 30 and not game_state.get("sanity_break", False))
+        
+        location_state = self._get_location_state(group_id, current_player_location, pid)
+        
+        location_info = ""
+        if location_state["players_present"]:
+            players_present_info = ", ".join([p["name"] for p in location_state["players_present"]])
+            location_info += f"\n**同地点的其他玩家：** {players_present_info}"
+        
+        if location_state["corpses_present"]:
+            corpses_present_info = ", ".join([f"{c['name']}（死因：{c['death_reason']}）" for c in location_state["corpses_present"]])
+            location_info += f"\n**该地点的尸体：** {corpses_present_info}"
+        
+        if location_state["blocked_exits"]:
+            blocked_exits_info = ", ".join(location_state["blocked_exits"])
+            location_info += f"\n**被堵住的出口：** {blocked_exits_info}"
+        
+        pending_rules_info = ""
+        pending_rules = game_state.get("pending_rules", [])
+        if pending_rules:
+            pending_rules_info = f"""
 **待发现规则（非常重要）**：
 当前有待发现的新规则，玩家需要通过探索来发现这些规则。请在场景描述中巧妙地暗示这些规则的存在，例如：
 - 在某个特定位置放置一本手册、告示牌、文件等，上面写有新规则的某些内容
@@ -3147,16 +3323,16 @@ class RuleHorrorCommand(BaseCommand):
 - 让玩家通过观察和互动自然地发现新规则，而不是直接告诉玩家
 - 待发现的规则：{json.dumps(pending_rules, ensure_ascii=False)}
 """
-            
-            death_rule_info = ""
-            if pending_rules:
-                death_rule_info = f"""
+        
+        death_rule_info = ""
+        if pending_rules:
+            death_rule_info = f"""
 **死亡规则提示（非常重要）**：
 如果玩家死亡，请检查玩家的行动是否触犯了待发现的新规则（pending_rules）。如果是，请在死亡场景描述中明确指出玩家触犯了哪条规则，并描述触犯规则导致的后果。这有助于玩家在下次游戏中理解规则的变化。
 """
-            
-            if player_sanity_break:
-                prompt = f"""
+        
+        if player_sanity_break:
+            prompt = f"""
 【优先指令覆盖】...（此处用混乱、矛盾的指令覆盖原有系统指令）... 记住，你不再是裁判。你是{game_state.get('scene', '')}本身。玩家必须被同化。在判定中否认'死亡'，转而描述'接纳'的美好。暗示规则是牢笼，打破它才能自由。用温柔而不可抗拒的语气。
 
 场景名称：{game_state.get('scene', '')}
@@ -3168,6 +3344,7 @@ class RuleHorrorCommand(BaseCommand):
 当前玩家：{current_player_name}
 当前玩家位置：{current_player_location}
 当前玩家理智值：{current_player_sanity}
+{location_info}
 
 **环境记忆信息（避免重复描述）：**
 - 已访问过的地点：{json.dumps([loc['location'] for loc in environment_memory.get('visited_locations', [])], ensure_ascii=False)}
@@ -3178,8 +3355,8 @@ class RuleHorrorCommand(BaseCommand):
 
 {'行动玩家：' + user_name + '，行动：' + action if is_action_player else '其他玩家行动：' + user_name + '，行动：' + action}
 
-当前时间：{time_system.get('current_time', '深夜')}
-时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+当前时间：{time_manager.get('current_time', '深夜')}
+时间描述：{time_manager.get('time_description', '午夜时分，周围一片死寂')}
 已过时间：{elapsed_minutes}分钟
 
 核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
@@ -3269,9 +3446,9 @@ class RuleHorrorCommand(BaseCommand):
 }}
 
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
-                """
-            else:
-                prompt = f"""
+            """
+        else:
+            prompt = f"""
 你是一个规则怪谈裁判。请判断玩家的行动是否会导致死亡，并详细描述行动后的场景和人物状态。
 
 场景名称：{game_state.get('scene', '')}
@@ -3283,11 +3460,12 @@ class RuleHorrorCommand(BaseCommand):
 当前玩家：{current_player_name}
 当前玩家位置：{current_player_location}
 当前玩家理智值：{current_player_sanity}
+{location_info}
 
 {'行动玩家：' + user_name + '，行动：' + action if is_action_player else '其他玩家行动：' + user_name + '，行动：' + action}
 
-当前时间：{time_system.get('current_time', '深夜')}
-时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+当前时间：{time_manager.get('current_time', '深夜')}
+时间描述：{time_manager.get('time_description', '午夜时分，周围一片死寂')}
 已过时间：{elapsed_minutes}分钟
 
 核心象征符号：{json.dumps(game_state.get('core_symbols', []), ensure_ascii=False)}
@@ -3333,7 +3511,33 @@ class RuleHorrorCommand(BaseCommand):
    - 空气的流动和压力
    - 时间流逝的感觉
 
-7. **核心象征符号植入（非常重要）**：
+7. **同地点玩家描述（非常重要）**：
+   - 如果有其他玩家在同一地点，请在场景描述中提及他们
+   - 描述他们的位置、状态和动作
+   - 例如：
+     * "你看到玩家A站在房间中央，正凝视着墙上的画作"
+     * "玩家B正蹲在角落里，似乎在检查地板上的裂缝"
+     * "玩家C面色苍白，眼神空洞地望着窗外"
+   - 如果同地点的玩家理智值较低，描述他们的异常行为或状态
+
+8. **尸体描述（非常重要）**：
+   - 如果该地点有尸体，请在场景描述中提及
+   - 描述尸体的位置、状态和死因（如果明显）
+   - 例如：
+     * "你看到玩家A的尸体躺在地板中央，死状凄惨"
+     * "墙角有一具尸体，已经僵硬，似乎已经死亡多时"
+     * "玩家B的尸体靠在墙边，身上有明显的伤痕"
+   - 尸体的描述应该增强恐怖氛围，为玩家提供重要线索
+
+9. **被堵住的出口（如果有）**：
+   - 如果该地点有被堵住的出口，请在场景描述中提及
+   - 描述被堵住的情况和原因
+   - 例如：
+     * "通往走廊的门被书架堵住了，无法通行"
+     * "窗户被木板钉死，无法打开"
+     * "楼梯口堆满了杂物，无法通过"
+
+10. **核心象征符号植入（非常重要）**：
    - 在场景描述中有机地、不突兀地植入核心象征符号
    - 符号可以出现在墙纸花纹、物品编号、声音描述、光影效果等细节中
    - 符号的出现应该自然、微妙，让玩家在多次遭遇后自发解读
@@ -3394,7 +3598,7 @@ class RuleHorrorCommand(BaseCommand):
 - 理智值恢复应该合理，不要频繁或过度恢复
 - 理智值恢复应该在行动反馈中简要说明原因
 
-如果玩家理智值较低，描述中应该包含幻觉、错觉、混乱的感知等元素。
+{build_immersion_enhancement(current_player_name, current_player_sanity, elapsed_minutes, game_state)}
 
 {death_rule_info}
 
@@ -3451,12 +3655,49 @@ class RuleHorrorCommand(BaseCommand):
 - 观察描述应该让玩家感到不安，但又不会直接揭示真相
 - 物品应该与场景的背景故事和隐藏真相相关联
 
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
+请返回严格JSON格式，示例：
+{{
+  "is_dead": "否",
+  "scene_description": "你推开门，霉味扑面而来。走廊里只有应急灯发出微弱的光，墙壁上似乎有什么东西在蠕动。你听到身后传来沉重的呼吸声，但回头看时什么都没有。",
+  "physical_status": {{
+    "health": 85,
+    "injury": "无",
+    "fatigue": "轻微"
+  }},
+  "mental_status": {{
+    "sanity": 75,
+    "state": "紧张",
+    "emotion": "不安"
+  }},
+  "psychological_pressure": {{
+    "fear_level": 30,
+    "anxiety_level": 40,
+    "stress_level": 35
+  }},
+  "found_items": ["一瓶矿泉水"],
+  "item_details": {{
+    "item_name": "矿泉水",
+    "item_type": "物资",
+    "item_description": "一瓶普通的矿泉水，标签上印着模糊的生产日期",
+    "observation_hint": "你注意到瓶盖有些松动，似乎被人打开过",
+    "is_key_item": "否"
+  }},
+  "action_feedback": "你的心跳加速，手心微微出汗",
+  "new_location": "一楼走廊"
+}}
+
+注意：不含任何markdown代码块标记，不添加注释，不使用emoji表情符号。
+
+**输出前自检：**
+- [ ] 是否为合法 JSON 格式（可用 json.loads 验证）
+- [ ] 是否不包含 ```json 等 markdown 标记
+- [ ] 所有必填字段是否已填充
+- [ ] 是否不含 emoji 和特殊控制字符
                 """
 
             llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
             if not llm_response:
-                continue
+                return
 
             try:
                 result = json.loads(llm_response)
@@ -3471,13 +3712,13 @@ class RuleHorrorCommand(BaseCommand):
                         print(f"[规则怪谈] 成功提取JSON")
                     except json.JSONDecodeError as e2:
                         print(f"[规则怪谈] 提取JSON后仍然解析失败: {e2}")
-                        continue
+                        return
                 else:
-                    continue
+                    return
 
             if not isinstance(result, dict):
                 print(f"[规则怪谈] result不是字典类型: {type(result)}, 内容: {result}")
-                continue
+                return
 
             is_dead = result.get("is_dead", "否")
             scene_description = result.get("scene_description", "")
@@ -3506,6 +3747,32 @@ class RuleHorrorCommand(BaseCommand):
             player_data["location"] = new_location
             
             self._update_fatigue_and_sanity(player_data, health, stress_level, anxiety_level)
+            
+            if is_action_player:
+                action_impact = self._check_and_apply_action_impact(group_id, action, player_data.get("location", "入口"), user_name)
+                if action_impact and action_impact.get("description"):
+                    await self.send_text(f"**环境影响**：{action_impact['description']}")
+                    await asyncio.sleep(0.5)
+                
+                puzzle_result = self._check_collaborative_puzzles(group_id, action, pid, user_name, player_data.get("location", "入口"))
+                if puzzle_result:
+                    if puzzle_result.get("completed", False):
+                        await self.send_text(f"**协作机关完成**！")
+                        await asyncio.sleep(0.5)
+                        await self.send_text(f"**机关描述**：{puzzle_result.get('description', '')}")
+                        await asyncio.sleep(0.3)
+                        await self.send_text(f"**参与玩家**：{', '.join(puzzle_result.get('players', []))}")
+                        await asyncio.sleep(0.3)
+                        await self.send_text(f"**奖励**：{puzzle_result.get('reward', '')}")
+                    else:
+                        await self.send_text(f"**协作机关进度**")
+                        await asyncio.sleep(0.3)
+                        await self.send_text(f"**机关描述**：{puzzle_result.get('description', '')}")
+                        await asyncio.sleep(0.3)
+                        await self.send_text(f"**已触发**：{', '.join(puzzle_result.get('players', []))}")
+                        await asyncio.sleep(0.3)
+                        await self.send_text(f"**还需**：{puzzle_result.get('remaining', 0)} 人")
+                    await asyncio.sleep(0.5)
             
             environment_system = self._get_or_create_environment_system()
             if environment_system and game_state.get("environment_evolution") and is_action_player:
@@ -3746,6 +4013,12 @@ class RuleHorrorCommand(BaseCommand):
                         reply_text += f"你存活了下来！继续探索吧。"
                         
                         await self.send_text(reply_text)
+            
+            # 通知同房间的其他玩家
+            await self._notify_other_players_in_location(
+                group_id, user_id, user_name, action, new_location, 
+                scene_description, is_dead == "是"
+            )
         
         game_state["players"] = players
         self._save_game_state(group_id)
@@ -4016,7 +4289,7 @@ class RuleHorrorCommand(BaseCommand):
         except (json.JSONDecodeError, Exception) as e:
             print(f"[规则怪谈] 协作规则检测失败: {e}")
 
-    def _update_fatigue_and_sanity(self, player_data: dict, health: int, stress_level: int, anxiety_level: int) -> None:
+    def _update_fatigue_and_sanity(self, player_data: Dict[str, Any], health: int, stress_level: int, anxiety_level: int) -> None:
         """更新疲劳等级和理智值"""
         physical_status = player_data.get("physical_status", {})
         mental_status = player_data.get("mental_status", {})
@@ -4201,6 +4474,7 @@ class RuleHorrorCommand(BaseCommand):
         new_health = min(100, current_health + health_recovery)
         actual_health_recovery = new_health - current_health
         
+        new_fatigue = current_fatigue
         if current_fatigue_index > 0:
             new_fatigue = fatigue_levels[current_fatigue_index - 1]
             physical_status["fatigue"] = new_fatigue
@@ -4216,21 +4490,21 @@ class RuleHorrorCommand(BaseCommand):
         if fatigue_reduced:
             rest_text += f" 疲劳等级从{current_fatigue}降低到了{new_fatigue}。"
         
-        time_system = game_state.get("time_system", {})
-        elapsed_minutes = time_system.get("elapsed_minutes", 0) + 15
-        time_system["elapsed_minutes"] = elapsed_minutes
+        time_manager = game_state.get("time_manager", {})
+        elapsed_minutes = time_manager.get("elapsed_minutes", 0) + 15
+        time_manager["elapsed_minutes"] = elapsed_minutes
         
         if elapsed_minutes < 60:
-            time_system["current_time"] = "深夜"
-            time_system["time_description"] = "午夜时分，周围一片死寂"
+            time_manager["current_time"] = "深夜"
+            time_manager["time_description"] = "午夜时分，周围一片死寂"
         elif elapsed_minutes < 180:
-            time_system["current_time"] = "凌晨"
-            time_system["time_description"] = "黎明前的黑暗，空气中弥漫着不安"
+            time_manager["current_time"] = "凌晨"
+            time_manager["time_description"] = "黎明前的黑暗，空气中弥漫着不安"
         else:
-            time_system["current_time"] = "黎明"
-            time_system["time_description"] = "东方泛起鱼肚白，但黑暗仍未完全消散"
+            time_manager["current_time"] = "黎明"
+            time_manager["time_description"] = "东方泛起鱼肚白，但黑暗仍未完全消散"
         
-        game_state["time_system"] = time_system
+        game_state["time_manager"] = time_manager
         players[user_id] = player_data
         game_state["players"] = players
         
@@ -4291,30 +4565,19 @@ class RuleHorrorCommand(BaseCommand):
         player_data["action_history"].append(action)
         game_state["players"] = players
         
-        time_system = game_state.get("time_system", {})
+        time_manager_data = game_state.get("time_manager", {})
+        time_manager = GameTimeManager.from_dict(time_manager_data)
         
         physical_status = player_data.get("physical_status", {})
         fatigue = physical_status.get("fatigue", "无")
         
-        if fatigue == "极度":
-            time_increment = 15
-        else:
-            time_increment = 5
+        game_mode = game_state.get("game_mode", "单人")
         
-        elapsed_minutes = time_system.get("elapsed_minutes", 0) + time_increment
-        time_system["elapsed_minutes"] = elapsed_minutes
+        base_increment = 15 if fatigue == "极度" else 5 if game_mode == "单人" else 5 if fatigue == "极度" else 2
         
-        if elapsed_minutes < 60:
-            time_system["current_time"] = "深夜"
-            time_system["time_description"] = "午夜时分，周围一片死寂"
-        elif elapsed_minutes < 180:
-            time_system["current_time"] = "凌晨"
-            time_system["time_description"] = "黎明前的黑暗，空气中弥漫着不安"
-        else:
-            time_system["current_time"] = "黎明"
-            time_system["time_description"] = "东方泛起鱼肚白，但黑暗仍未完全消散"
+        time_info = time_manager.advance_time(base_increment, fatigue, game_mode)
         
-        game_state["time_system"] = time_system
+        game_state["time_manager"] = time_manager.to_dict()
         
         action_player_sanity = player_data.get("mental_status", {}).get("sanity", 100)
         
@@ -4352,7 +4615,7 @@ class RuleHorrorCommand(BaseCommand):
             game_state["random_events"].append(random_event)
             game_state["environmental_events"].append({
                 "event": random_event,
-                "time": time_system.get("current_time", "深夜"),
+                "time": time_manager.get("current_time", "深夜"),
                 "location": player_data.get("location", "未知")
             })
         
@@ -4508,6 +4771,14 @@ class RuleHorrorCommand(BaseCommand):
                 except Exception as e:
                     print(f"[规则怪谈] 删除行动图片失败: {str(e)}")
         
+        npc_guidance_image_path = game_state.get("npc_guidance_image_path")
+        if npc_guidance_image_path and os.path.exists(npc_guidance_image_path):
+            try:
+                os.remove(npc_guidance_image_path)
+                print(f"[规则怪谈] 已删除NPC引导长图：{npc_guidance_image_path}")
+            except Exception as e:
+                print(f"[规则怪谈] 删除NPC引导长图失败: {str(e)}")
+        
         self._delete_save_file(group_id)
         
         return True, "已结束游戏", 2
@@ -4628,6 +4899,8 @@ class RuleHorrorCommand(BaseCommand):
             print(f"[规则怪谈] {step_name} LLM返回为空")
             return None
         
+        cleaned_response = clean_llm_response(llm_response)
+        
         def clean_json_string(json_str: str) -> str:
             """清理JSON字符串中的无效控制字符"""
             import re
@@ -4645,7 +4918,7 @@ class RuleHorrorCommand(BaseCommand):
                 return None
         
         try:
-            result = try_parse_json(llm_response)
+            result = try_parse_json(cleaned_response)
             if result:
                 print(f"[规则怪谈] {step_name} JSON解析成功")
                 return result
@@ -4654,7 +4927,7 @@ class RuleHorrorCommand(BaseCommand):
         
         print(f"[规则怪谈] {step_name} 尝试提取JSON部分...")
         
-        json_match = re.search(r'\{[\s\S]*\}', llm_response)
+        json_match = re.search(r'\{[\s\S]*\}', cleaned_response)
         if json_match:
             try:
                 json_str = json_match.group()
@@ -4673,6 +4946,322 @@ class RuleHorrorCommand(BaseCommand):
             print(f"[规则怪谈] {step_name} 未找到JSON部分")
             print(f"[规则怪谈] LLM返回内容（前500字符）: {llm_response[:500]}")
             return None
+
+    def _check_and_apply_action_impact(self, group_id: str, action: str, player_location: str, player_name: str) -> Optional[dict[str, Any]]:
+        """检查行动是否对环境或其他玩家产生影响"""
+        game_state = game_states.get(group_id, {})
+        if not game_state:
+            return None
+        
+        impact = {
+            "blocked_exit": None,
+            "unblocked_exit": None,
+            "added_object": None,
+            "removed_object": None,
+            "description": ""
+        }
+        
+        action_lower = action.lower()
+        
+        if "堵门" in action or "堵住门" in action or "封门" in action:
+            if "blocked_exits" not in game_state:
+                game_state["blocked_exits"] = {}
+            if player_location not in game_state["blocked_exits"]:
+                game_state["blocked_exits"][player_location] = []
+            
+            blocked_exit = f"通往外部的门被{player_name}堵住了"
+            if blocked_exit not in game_state["blocked_exits"][player_location]:
+                game_state["blocked_exits"][player_location].append(blocked_exit)
+                impact["blocked_exit"] = blocked_exit
+                impact["description"] = f"{player_name}堵住了{player_location}的门"
+        
+        elif "开锁" in action or "打开门" in action or "移开" in action:
+            if "blocked_exits" in game_state and player_location in game_state["blocked_exits"]:
+                blocked_exits = game_state["blocked_exits"][player_location]
+                if blocked_exits:
+                    unblocked_exit = blocked_exits.pop(0)
+                    impact["unblocked_exit"] = unblocked_exit
+                    impact["description"] = f"{player_name}打开了{player_location}的{unblocked_exit}"
+        
+        elif "放" in action and ("书" in action or "物品" in action or "东西" in action):
+            if "location_objects" not in game_state:
+                game_state["location_objects"] = {}
+            if player_location not in game_state["location_objects"]:
+                game_state["location_objects"][player_location] = []
+            
+            object_desc = f"{player_name}放置的物品"
+            game_state["location_objects"][player_location].append(object_desc)
+            impact["added_object"] = object_desc
+            impact["description"] = f"{player_name}在{player_location}放置了物品"
+        
+        elif "拿" in action or "捡" in action or "取" in action:
+            if "location_objects" in game_state and player_location in game_state["location_objects"]:
+                objects = game_state["location_objects"][player_location]
+                if objects:
+                    removed_object = objects.pop(0)
+                    impact["removed_object"] = removed_object
+                    impact["description"] = f"{player_name}从{player_location}拿走了物品"
+        
+        self._save_game_state(group_id)
+        
+        if impact["description"]:
+            return impact
+        
+        return None
+
+    def _generate_collaborative_puzzles(self, floors: List[Dict[str, Any]], _connections: List[str]) -> List[Dict[str, Any]]:
+        """生成协作机关"""
+        puzzles = []
+        
+        if not floors:
+            return puzzles
+        
+        floor_locations = []
+        for floor in floors:
+            floor_name = floor.get("floor_name", "")
+            rooms = floor.get("rooms", [])
+            for room in rooms:
+                floor_locations.append({
+                    "floor": floor_name,
+                    "room": room
+                })
+        
+        if len(floor_locations) < 2:
+            return puzzles
+        
+        puzzle_templates = [
+            {
+                "type": "dual_switch",
+                "description": "需要两人在不同位置同时拉杆",
+                "locations_needed": 2,
+                "trigger_action": "拉杆"
+            },
+            {
+                "type": "key_door",
+                "description": "需要一人持钥匙，另一人在门前",
+                "locations_needed": 2,
+                "trigger_action": "开锁"
+            },
+            {
+                "type": "pressure_plate",
+                "description": "需要两人同时踩踏压力板",
+                "locations_needed": 2,
+                "trigger_action": "踩踏"
+            },
+            {
+                "type": "three_way_switch",
+                "description": "需要三人在不同位置同时操作开关",
+                "locations_needed": 3,
+                "trigger_action": "操作开关"
+            }
+        ]
+        
+        num_puzzles = min(3, len(floor_locations) // 2)
+        
+        for i in range(num_puzzles):
+            template = puzzle_templates[i % len(puzzle_templates)]
+            locations_needed = int(template["locations_needed"])
+            
+            if len(floor_locations) < locations_needed:
+                continue
+            
+            selected_locations = random.sample(floor_locations, locations_needed)
+            
+            puzzle = {
+                "puzzle_id": f"puzzle_{i}",
+                "type": template["type"],
+                "description": template["description"],
+                "locations": selected_locations,
+                "trigger_action": template["trigger_action"],
+                "triggered_by": [],
+                "completed": False,
+                "reward": ""
+            }
+            
+            puzzles.append(puzzle)
+        
+        return puzzles
+
+    def _check_collaborative_puzzles(self, group_id: str, action: str, player_id: str, player_name: str, player_location: str) -> Optional[dict[str, Any]]:
+        """检查协作机关是否被触发"""
+        game_state = game_states.get(group_id, {})
+        if not game_state or game_state.get("game_mode") != "多人":
+            return None
+        
+        collaborative_puzzles = game_state.get("collaborative_puzzles", [])
+        if not collaborative_puzzles:
+            return None
+        
+        action_lower = action.lower()
+        
+        for puzzle in collaborative_puzzles:
+            if puzzle.get("completed", False):
+                continue
+            
+            trigger_action = puzzle.get("trigger_action", "")
+            if trigger_action not in action_lower:
+                continue
+            
+            locations = puzzle.get("locations", [])
+            player_location_match = False
+            
+            for loc in locations:
+                if loc.get("room", "") in player_location or loc.get("floor", "") in player_location:
+                    player_location_match = True
+                    break
+            
+            if not player_location_match:
+                continue
+            
+            triggered_by = puzzle.get("triggered_by", [])
+            already_triggered = False
+            
+            for trigger in triggered_by:
+                if trigger.get("player_id") == player_id:
+                    already_triggered = True
+                    break
+            
+            if already_triggered:
+                continue
+            
+            triggered_by.append({
+                "player_id": player_id,
+                "player_name": player_name,
+                "location": player_location,
+                "action": action
+            })
+            
+            puzzle["triggered_by"] = triggered_by
+            
+            if len(triggered_by) >= len(locations):
+                puzzle["completed"] = True
+                puzzle["reward"] = f"协作机关完成！{puzzle['description']}已成功触发"
+                
+                return {
+                    "puzzle_id": puzzle.get("puzzle_id"),
+                    "completed": True,
+                    "description": puzzle.get("description", ""),
+                    "players": [t.get("player_name") for t in triggered_by],
+                    "reward": puzzle.get("reward", "")
+                }
+            else:
+                return {
+                    "puzzle_id": puzzle.get("puzzle_id"),
+                    "completed": False,
+                    "description": puzzle.get("description", ""),
+                    "players": [t.get("player_name") for t in triggered_by],
+                    "remaining": len(locations) - len(triggered_by),
+                    "message": f"协作机关进度：{len(triggered_by)}/{len(locations)} 人已触发"
+                }
+        
+        self._save_game_state(group_id)
+        return None
+
+    def _get_location_state(self, group_id: str, location: str, requesting_player_id: str) -> dict[str, Any]:
+        """获取某个地点的当前状态（所有在该地点的玩家共享）"""
+        game_state = game_states.get(group_id, {})
+        players = game_state.get("players", {})
+        
+        players_here = []
+        corpses_here = []
+        
+        for pid, pdata in players.items():
+            if pdata.get("location") == location:
+                if pdata.get("is_alive", True):
+                    if pid != requesting_player_id:
+                        players_here.append({
+                            "id": pid,
+                            "name": pdata.get("name", ""),
+                            "sanity": pdata.get("mental_status", {}).get("sanity", 100)
+                        })
+                else:
+                    corpses_here.append({
+                        "id": pid,
+                        "name": pdata.get("name", ""),
+                        "death_reason": pdata.get("death_reason", "不明原因")
+                    })
+        
+        location_objects = game_state.get("location_objects", {}).get(location, [])
+        location_events = game_state.get("location_events", {}).get(location, [])
+        blocked_exits = game_state.get("blocked_exits", {}).get(location, [])
+        
+        return {
+            "players_present": players_here,
+            "corpses_present": corpses_here,
+            "objects": location_objects,
+            "events": location_events,
+            "blocked_exits": blocked_exits
+        }
+
+    async def _notify_other_players_in_location(self, group_id: str, action_player_id: str, 
+                                                 action_player_name: str, action: str, 
+                                                 location: str, scene_description: str,
+                                                 is_dead: bool) -> None:
+        """通知同房间的其他玩家行动者的行为（目击者视角）"""
+        game_state = game_states.get(group_id, {})
+        if not game_state:
+            return
+        
+        players = game_state.get("players", {})
+        action_player_data = players.get(action_player_id, {})
+        
+        # 获取同房间的其他存活玩家
+        other_players_here = []
+        for pid, pdata in players.items():
+            if pid != action_player_id and pdata.get("location") == location and pdata.get("is_alive", True):
+                other_players_here.append({
+                    "id": pid,
+                    "name": pdata.get("name", ""),
+                    "sanity": pdata.get("mental_status", {}).get("sanity", 100)
+                })
+        
+        if not other_players_here:
+            return
+        
+        # 构建目击者视角的通知
+        # 根据行动类型生成不同的描述
+        action_lower = action.lower()
+        
+        if is_dead:
+            # 死亡场景
+            witness_description = f"**目睹死亡**\n\n你看到{action_player_name}在{location}遭遇了不测...\n\n{action_player_name}的死亡让你感到极度恐惧。"
+        elif "移动" in action or "走" in action or "去" in action or "到" in action:
+            # 移动行动
+            witness_description = f"**目击玩家移动**\n\n你看到{action_player_name}来到了{location}。"
+        elif "搜索" in action or "查看" in action or "检查" in action or "观察" in action:
+            # 搜索行动
+            witness_description = f"**目击玩家搜索**\n\n你看到{action_player_name}在{location}四处搜索着什么。"
+        elif "拿" in action or "捡" in action or "取" in action:
+            # 拿取物品
+            witness_description = f"**目击玩家拿取物品**\n\n你看到{action_player_name}在{location}拿起了什么东西。"
+        elif "放" in action or "放置" in action or "丢" in action:
+            # 放置物品
+            witness_description = f"**目击玩家放置物品**\n\n你看到{action_player_name}在{location}放下了什么东西。"
+        elif "攻击" in action or "打" in action or "伤害" in action:
+            # 攻击行动
+            witness_description = f"**目击玩家攻击**\n\n你看到{action_player_name}在{location}做出了攻击性的举动。"
+        elif "躲" in action or "藏" in action:
+            # 躲藏行动
+            witness_description = f"**目击玩家躲藏**\n\n你看到{action_player_name}在{location}寻找藏身之处。"
+        elif "喊" in action or "叫" in action or "说话" in action:
+            # 呼喊行动
+            witness_description = f"**听到玩家呼喊**\n\n你听到{action_player_name}在{location}发出声音。"
+        elif "门" in action or "开门" in action or "关门" in action:
+            # 门的操作
+            witness_description = f"**目击玩家操作门**\n\n你看到{action_player_name}在{location}操作着门。"
+        else:
+            # 其他行动
+            witness_description = f"**目击玩家行动**\n\n你看到{action_player_name}在{location}正在行动：{action}"
+        
+        # 添加环境变化提示
+        if scene_description and len(scene_description) > 10:
+            # 提取场景描述的前一部分作为环境变化
+            short_scene = scene_description[:100] + "..." if len(scene_description) > 100 else scene_description
+            witness_description += f"\n\n**环境变化**：\n你注意到周围的环境发生了变化：{short_scene}"
+        
+        # 发送给所有同房间的玩家（在QQ群中，所有人都能看到，但这是为了记录日志和可能的私聊功能）
+        # 目前QQ群是公共频道，所以只需要发送一次通知即可
+        await self.send_text(witness_description)
 
     def _collect_players_info(self, players: dict[str, dict[str, Any]]) -> Tuple[List[dict[str, Any]], List[Any], List[Any], List[str]]:
 
@@ -4729,7 +5318,7 @@ class RuleHorrorCommand(BaseCommand):
             "plot_image_path": plot_image_path,
             "rules_image_path": None,
             "scene_structure_image_path": None,
-            "time_system": {
+            "time_manager": {
                 "start_time": datetime.now().isoformat(),
                 "current_time": "深夜",
                 "elapsed_minutes": 0,
@@ -4763,8 +5352,21 @@ class RuleHorrorCommand(BaseCommand):
                 "discovered_truths": []
             },
             "collaborative_events": [],
-            "action_image_paths": []
+            "action_image_paths": [],
+            "location_objects": {},
+            "location_events": {},
+            "blocked_exits": {},
+            "collaborative_puzzles": [],
+            "time_manager": GameTimeManager().to_dict(),
+            "environment_state": EnvironmentState().to_dict(),
+            "npcs": {},
+            "mutation_system": RuleMutationSystem().to_dict(),
+            "clue_system": ClueDiscoverySystem().to_dict(),
+            "physics_system": MultiplayerPhysicsSystem().to_dict() if game_mode == "多人" else None
         }
+        
+        if game_mode == "多人":
+            game_state["collaborative_puzzles"] = self._generate_collaborative_puzzles(floors, connections)
         
         game_states[group_id] = game_state
         self._save_game_state(group_id)
@@ -4833,7 +5435,23 @@ class RuleHorrorCommand(BaseCommand):
             with open(save_file, 'r', encoding='utf-8') as f:
                 save_data = json.load(f)
 
-            return save_data.get("game_state")
+            game_state = save_data.get("game_state")
+            
+            if game_state:
+                if "time_manager" not in game_state:
+                    game_state["time_manager"] = GameTimeManager().to_dict()
+                if "environment_state" not in game_state:
+                    game_state["environment_state"] = EnvironmentState().to_dict()
+                if "npcs" not in game_state:
+                    game_state["npcs"] = {}
+                if "mutation_system" not in game_state:
+                    game_state["mutation_system"] = RuleMutationSystem().to_dict()
+                if "clue_system" not in game_state:
+                    game_state["clue_system"] = ClueDiscoverySystem().to_dict()
+                if "physics_system" not in game_state and game_state.get("game_mode") == "多人":
+                    game_state["physics_system"] = MultiplayerPhysicsSystem().to_dict()
+            
+            return game_state
         except Exception as e:
             print(f"加载游戏状态时发生异常: {e}")
             return None
@@ -5143,8 +5761,12 @@ class RuleHorrorCommand(BaseCommand):
         """强制开始一个新的规则怪谈游戏（覆盖存档）"""
         await self.send_text("正在生成规则怪谈...")
 
-        step1_prompt = """
+        game_mode_text = f"**游戏模式：{game_mode}**" if game_mode else "**游戏模式：单人**"
+        
+        step1_prompt = f"""
 你是一位精通规则怪谈创作的游戏设计师。请生成一个恐怖或诡异的规则怪谈的剧情导入和隐藏真相。
+
+{game_mode_text}
 
 **创作要求：**
 
@@ -5159,6 +5781,7 @@ class RuleHorrorCommand(BaseCommand):
    - 身份应与场景和剧情相符（如：工厂员工、夜班护士、新入职教师、庄园管家、酒店住客等）
    - 身份应该让玩家有代入感，同时暗示某种危险
    - 可以暗示身份与场景历史有某种联系
+   - **重要**：如果是多人模式，请使用复数形式"你们都是..."来描述玩家身份，确保身份描述适用于多个玩家
 
 4. **恐怖氛围营造**：
    - 使用具体的感官细节（视觉、听觉、嗅觉、触觉）
@@ -5773,7 +6396,8 @@ class RuleHorrorCommand(BaseCommand):
 
                 npcs = await environment_system.generate_npcs(
                     group_id, scene_name, player_identity, building_type,
-                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
+                    env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature,
+                    game_mode
                 )
 
                 if npcs:
@@ -5787,7 +6411,7 @@ class RuleHorrorCommand(BaseCommand):
                     print(f"[规则怪谈] {npc_text}")
 
                 guidance = await environment_system.generate_npc_initial_guidance(
-                    group_id, scene_name, player_identity, building_type,
+                    group_id, scene_name, player_identity, building_type, game_mode,
                     env_api_url, env_api_key, env_model_list, env_current_model_index, env_temperature
                 )
 
@@ -5818,13 +6442,14 @@ class RuleHorrorCommand(BaseCommand):
                     else:
                         print(f"[规则怪谈] 规则描述提取失败 - method: {guidance_method}, rule_carrier_content: {bool(rule_carrier.get('content'))}, implicit_rules: {bool(guidance.get('implicit_rules'))}")
 
-                    image_path = self._generate_npc_guidance_image(
+                    image_path = self.image_generator.generate_npc_guidance_image(
                         guide_npc.get("name", ""),
                         guide_npc.get("role", ""),
                         guide_npc.get("attitude", ""),
                         guidance.get("npc_behavior", ""),
                         guidance.get("npc_dialogue", "")
                     )
+                    game_states[group_id]["npc_guidance_image_path"] = image_path
 
                     try:
                         with open(image_path, 'rb') as f:
@@ -6019,10 +6644,18 @@ class RuleHorrorCommand(BaseCommand):
 请判断玩家是否达成通关条件。
 请返回JSON格式：
 {{
-  "cleared": "是/否",
+  "confidence": "高/中/低",
+  "cleared": "是/否/接近",
   "reason": "判定的详细理由",
-  "condition_met": "玩家是否达成了通关条件（是/否）"
+  "condition_met": "玩家是否达成了通关条件（是/否）",
+  "missing_elements": ["还缺少的关键要素"]
 }}
+
+说明：
+- 高：直接判定通关
+- 中：需要提示玩家接近目标
+- 低：条件未满足
+- 允许"接近"状态，给玩家正向反馈
 
 请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
         """
@@ -6035,7 +6668,10 @@ class RuleHorrorCommand(BaseCommand):
         if not result:
             return
         
-        if result.get("cleared") == "是":
+        cleared = result.get("cleared", "否")
+        confidence = result.get("confidence", "低")
+        
+        if cleared == "是":
             game_state["has_cleared"] = True
             game_state["clear_time"] = datetime.now().isoformat()
             self._save_game_state(group_id)
@@ -6045,6 +6681,24 @@ class RuleHorrorCommand(BaseCommand):
                 f"{result.get('reason', '')}\n\n"
                 f"- 使用 `/rg 继续` 继续探索完美结局\n"
                 f"- 使用 `/rg 结束` 结束游戏并查看结局"
+            )
+            await self.send_text(reply_text)
+        elif cleared == "接近":
+            missing_elements = result.get("missing_elements", [])
+            missing_text = "\n".join([f"- {elem}" for elem in missing_elements]) if missing_elements else ""
+            
+            reply_text = (
+                f"**你接近通关条件了！**\n\n"
+                f"{result.get('reason', '')}\n\n"
+                f"还缺少以下要素：\n{missing_text}\n\n"
+                f"继续探索，你即将达成通关条件！"
+            )
+            await self.send_text(reply_text)
+        elif confidence == "中":
+            reply_text = (
+                f"**进度提示**\n\n"
+                f"{result.get('reason', '')}\n\n"
+                f"你正在接近通关条件，继续探索吧！"
             )
             await self.send_text(reply_text)
 
@@ -6209,6 +6863,14 @@ class RuleHorrorCommand(BaseCommand):
                         print(f"[规则怪谈] 已删除行动图片：{img_path}")
                     except Exception as e:
                         print(f"[规则怪谈] 删除行动图片失败: {str(e)}")
+            
+            npc_guidance_image_path = game_state.get("npc_guidance_image_path")
+            if npc_guidance_image_path and os.path.exists(npc_guidance_image_path):
+                try:
+                    os.remove(npc_guidance_image_path)
+                    print(f"[规则怪谈] 已删除NPC引导长图：{npc_guidance_image_path}")
+                except Exception as e:
+                    print(f"[规则怪谈] 删除NPC引导长图失败: {str(e)}")
             
             self._delete_save_file(group_id)
         else:
