@@ -1,9 +1,13 @@
+# pyright: reportDeprecated=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportMissingParameterType=false
+
 """
 规则变异的条件触发系统
 改用条件触发制，而非随机概率，增强叙事连贯性
 """
 
-from typing import Dict, List, Optional, Set
+from typing import Any
 from enum import Enum
 from dataclasses import dataclass
 
@@ -23,7 +27,7 @@ class MutationCondition:
     """变异条件"""
     condition_type: MutationTriggerType
     description: str
-    check_function: callable
+    check_function: Any  # callable type is complex, using Any for simplicity
     priority: int = 0
 
 
@@ -33,9 +37,9 @@ class MutationEvent:
     mutation_id: str
     trigger_type: MutationTriggerType
     trigger_reason: str
-    triggered_by: List[str]
+    triggered_by: list[str]
     triggered_at: int
-    mutation_details: Dict[str, any]
+    mutation_details: dict[str, Any]
 
 
 class RuleMutationSystem:
@@ -49,13 +53,13 @@ class RuleMutationSystem:
     """
     
     def __init__(self):
-        self.mutation_conditions: List[MutationCondition] = []
-        self.mutation_history: List[MutationEvent] = []
-        self.triggered_conditions: Set[str] = set()
-        self.violation_counts: Dict[str, int] = {}
-        self.location_visit_counts: Dict[str, int] = {}
-        self.item_discovery_counts: Dict[str, int] = {}
-        self.key_clues_found: Set[str] = set()
+        self.mutation_conditions: list[MutationCondition] = []
+        self.mutation_history: list[MutationEvent] = []
+        self.triggered_conditions: set[str] = set()
+        self.violation_counts: dict[str, int] = {}
+        self.location_visit_counts: dict[str, int] = {}
+        self.item_discovery_counts: dict[str, int] = {}
+        self.key_clues_found: set[str] = set()
         self.mutation_cooldown: int = 30
         self.last_mutation_time: int = -999
     
@@ -63,8 +67,8 @@ class RuleMutationSystem:
         """添加变异条件"""
         self.mutation_conditions.append(condition)
     
-    def check_conditions(self, game_state: Dict, player_action: Optional[str] = None, 
-                         game_time: int = 0) -> List[MutationCondition]:
+    def check_conditions(self, game_state: dict[str, Any], player_action: str | None = None,
+                         game_time: int = 0) -> list[MutationCondition]:
         """检查所有变异条件
         
         Args:
@@ -94,8 +98,8 @@ class RuleMutationSystem:
         
         return satisfied_conditions
     
-    def trigger_mutation(self, condition: MutationCondition, game_state: Dict, 
-                        game_time: int, triggered_by: List[str]) -> MutationEvent:
+    def trigger_mutation(self, condition: MutationCondition, game_state: dict[str, Any],
+                        game_time: int, triggered_by: list[str]) -> MutationEvent:
         """触发规则变异
         
         Args:
@@ -157,7 +161,7 @@ class RuleMutationSystem:
         """检查是否发现关键线索"""
         return clue_id in self.key_clues_found
     
-    def get_mutation_history(self) -> List[MutationEvent]:
+    def get_mutation_history(self) -> list[MutationEvent]:
         """获取变异历史"""
         return self.mutation_history
     
@@ -170,7 +174,7 @@ class RuleMutationSystem:
         self.key_clues_found.clear()
         self.last_mutation_time = -999
     
-    def to_dict(self) -> Dict[str, any]:
+    def to_dict(self) -> dict[str, Any]:
         """序列化为字典"""
         return {
             "mutation_history": [
@@ -191,9 +195,9 @@ class RuleMutationSystem:
             "key_clues_found": list(self.key_clues_found),
             "last_mutation_time": self.last_mutation_time
         }
-    
+
     @classmethod
-    def from_dict(cls, data: Dict[str, any]) -> 'RuleMutationSystem':
+    def from_dict(cls, data: dict[str, Any]) -> "RuleMutationSystem":
         """从字典反序列化"""
         system = cls()
         
@@ -219,11 +223,11 @@ class RuleMutationSystem:
         return system
 
 
-def create_default_mutation_conditions() -> List[MutationCondition]:
+def create_default_mutation_conditions() -> list[MutationCondition]:
     """创建默认的变异条件"""
-    conditions = []
-    
-    def check_environment_condition(game_state: Dict, player_action: Optional[str], 
+    conditions: list[MutationCondition] = []
+
+    def check_environment_condition(game_state: dict[str, Any], player_action: str | None,
                                     system: RuleMutationSystem) -> bool:
         """环境条件：特定时间+特定区域"""
         time_system = game_state.get("time_system", {})
@@ -247,7 +251,7 @@ def create_default_mutation_conditions() -> List[MutationCondition]:
         priority=1
     ))
     
-    def check_behavior_condition(game_state: Dict, player_action: Optional[str], 
+    def check_behavior_condition(game_state: dict[str, Any], player_action: str | None,
                                 system: RuleMutationSystem) -> bool:
         """行为条件：连续违反规则"""
         players = game_state.get("players", {})
@@ -279,7 +283,7 @@ def create_default_mutation_conditions() -> List[MutationCondition]:
         priority=2
     ))
     
-    def check_plot_condition(game_state: Dict, player_action: Optional[str], 
+    def check_plot_condition(game_state: dict[str, Any], player_action: str | None,
                             system: RuleMutationSystem) -> bool:
         """剧情条件：收集到关键线索"""
         key_clues = game_state.get("key_clues", [])
@@ -294,7 +298,7 @@ def create_default_mutation_conditions() -> List[MutationCondition]:
         priority=3
     ))
     
-    def check_time_condition(game_state: Dict, player_action: Optional[str], 
+    def check_time_condition(game_state: dict[str, Any], player_action: str | None,
                             system: RuleMutationSystem) -> bool:
         """时间条件：游戏时间超过阈值"""
         time_system = game_state.get("time_system", {})
@@ -309,7 +313,7 @@ def create_default_mutation_conditions() -> List[MutationCondition]:
         priority=4
     ))
     
-    def check_item_condition(game_state: Dict, player_action: Optional[str], 
+    def check_item_condition(game_state: dict[str, Any], player_action: str | None,
                             system: RuleMutationSystem) -> bool:
         """物品条件：发现关键物品"""
         players = game_state.get("players", {})
@@ -334,7 +338,7 @@ def create_default_mutation_conditions() -> List[MutationCondition]:
         priority=5
     ))
     
-    def check_location_condition(game_state: Dict, player_action: Optional[str], 
+    def check_location_condition(game_state: dict[str, Any], player_action: str | None,
                                  system: RuleMutationSystem) -> bool:
         """位置条件：多次访问同一位置"""
         players = game_state.get("players", {})

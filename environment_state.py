@@ -1,9 +1,13 @@
+# pyright: reportDeprecated=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportMissingParameterType=false
+
 """
 环境状态快照系统
 维护环境状态的持久化，确保世界的一致性
 """
 
-from typing import Dict, List, Optional, Set
+from typing import Any
 from enum import Enum
 
 
@@ -36,26 +40,26 @@ class EnvironmentState:
     """
     
     def __init__(self):
-        self.doors: Dict[str, DoorState] = {}
-        self.items: Dict[str, Dict[str, any]] = {}
-        self.lights: Dict[str, LightState] = {}
-        self.walls: Dict[str, Dict[str, any]] = {}
-        self.floors: Dict[str, Dict[str, any]] = {}
-        self.objects: Dict[str, Dict[str, any]] = {}
-        self.atmosphere: Dict[str, any] = {}
-        self.sounds: List[str] = []
-        self.smells: List[str] = {}
+        self.doors: dict[str, DoorState] = {}
+        self.items: dict[str, dict[str, Any]] = {}
+        self.lights: dict[str, LightState] = {}
+        self.walls: dict[str, dict[str, Any]] = {}
+        self.floors: dict[str, dict[str, Any]] = {}
+        self.objects: dict[str, dict[str, Any]] = {}
+        self.atmosphere: dict[str, Any] = {}
+        self.sounds: list[str] = []
+        self.smells: list[str] = []
         self.temperature: float = 20.0
         self.humidity: float = 50.0
         self.entropy_level: float = 0.0
-        self.changed_objects: Set[str] = set()
+        self.changed_objects: set[str] = set()
     
     def set_door_state(self, door_id: str, state: DoorState):
         """设置门的状态"""
         self.doors[door_id] = state
         self.changed_objects.add(door_id)
     
-    def get_door_state(self, door_id: str) -> Optional[DoorState]:
+    def get_door_state(self, door_id: str) -> DoorState | None:
         """获取门的状态"""
         return self.doors.get(door_id)
     
@@ -67,7 +71,7 @@ class EnvironmentState:
         self.items[item_id]["state"] = state
         self.changed_objects.add(item_id)
     
-    def get_item_info(self, item_id: str) -> Optional[Dict[str, any]]:
+    def get_item_info(self, item_id: str) -> dict[str, Any] | None:
         """获取物品信息"""
         return self.items.get(item_id)
     
@@ -76,7 +80,7 @@ class EnvironmentState:
         self.lights[light_id] = state
         self.changed_objects.add(light_id)
     
-    def get_light_state(self, light_id: str) -> Optional[LightState]:
+    def get_light_state(self, light_id: str) -> LightState | None:
         """获取灯光状态"""
         return self.lights.get(light_id)
     
@@ -129,12 +133,12 @@ class EnvironmentState:
         
         self.changed_objects.add(location_id)
     
-    def set_object_state(self, object_id: str, state: Dict[str, any]):
+    def set_object_state(self, object_id: str, state: dict[str, Any]):
         """设置物体状态"""
         self.objects[object_id] = state
         self.changed_objects.add(object_id)
-    
-    def get_object_state(self, object_id: str) -> Optional[Dict[str, any]]:
+
+    def get_object_state(self, object_id: str) -> dict[str, Any] | None:
         """获取物体状态"""
         return self.objects.get(object_id)
     
@@ -188,7 +192,7 @@ class EnvironmentState:
         else:
             return "环境即将崩溃"
     
-    def get_changes(self) -> Dict[str, any]:
+    def get_changes(self) -> dict[str, Any]:
         """获取所有变化的对象"""
         changes = {}
         for obj_id in self.changed_objects:
@@ -255,7 +259,7 @@ class EnvironmentState:
         """清除变化记录"""
         self.changed_objects.clear()
     
-    def to_dict(self) -> Dict[str, any]:
+    def to_dict(self) -> dict[str, Any]:
         """序列化为字典"""
         return {
             "doors": {k: v.value for k, v in self.doors.items()},
@@ -273,7 +277,7 @@ class EnvironmentState:
         }
     
     @classmethod
-    def from_dict(cls, data: Dict[str, any]) -> 'EnvironmentState':
+    def from_dict(cls, data: dict[str, Any]) -> "EnvironmentState":
         """从字典反序列化"""
         env = cls()
         

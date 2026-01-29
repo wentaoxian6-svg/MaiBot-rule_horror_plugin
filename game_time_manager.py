@@ -3,8 +3,7 @@
 统一管理游戏内时间流逝，避免使用真实时间导致的"上线即死亡"问题
 """
 
-from typing import Dict, Optional
-from datetime import datetime
+from typing import Any
 
 
 class GameTimeManager:
@@ -19,13 +18,13 @@ class GameTimeManager:
     
     def __init__(self):
         self.game_time: int = 0
-        self.last_action_time: Optional[int] = None
+        self.last_action_time: int | None = None
         self.time_phase: str = "深夜"
         self.time_description: str = "午夜时分，周围一片死寂"
         self.time_multiplier: float = 1.0
         self.action_count: int = 0
         
-    def advance_time(self, base_increment: int, fatigue_level: str = "无", game_mode: str = "单人") -> Dict[str, any]:
+    def advance_time(self, base_increment: int, fatigue_level: str = "无", game_mode: str = "单人") -> dict[str, Any]:
         """推进游戏时间
         
         Args:
@@ -96,7 +95,7 @@ class GameTimeManager:
         """重置时间倍率"""
         self.time_multiplier = 1.0
     
-    def get_time_info(self) -> Dict[str, any]:
+    def get_time_info(self) -> dict[str, Any]:
         """获取当前时间信息"""
         return {
             "elapsed_minutes": self.game_time,
@@ -106,7 +105,7 @@ class GameTimeManager:
             "time_multiplier": self.time_multiplier
         }
     
-    def to_dict(self) -> Dict[str, any]:
+    def to_dict(self) -> dict[str, Any]:
         """序列化为字典（用于存档）"""
         return {
             "game_time": self.game_time,
@@ -118,7 +117,7 @@ class GameTimeManager:
         }
     
     @classmethod
-    def from_dict(cls, data: Dict[str, any]) -> 'GameTimeManager':
+    def from_dict(cls, data: dict[str, Any]) -> 'GameTimeManager':
         """从字典反序列化（用于读档）"""
         manager = cls()
         manager.game_time = data.get("game_time", 0)
@@ -147,3 +146,16 @@ class GameTimeManager:
     def get_remaining_time(self, max_time: int = 420) -> int:
         """获取剩余时间（分钟）"""
         return max(0, max_time - self.game_time)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """模拟字典的get方法，用于兼容代码
+
+        Args:
+            key: 键名
+            default: 默认值
+
+        Returns:
+            对应的值或默认值
+        """
+        time_info = self.get_time_info()
+        return time_info.get(key, default)

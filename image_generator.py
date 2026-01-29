@@ -1,9 +1,14 @@
+# pyright: reportDeprecated=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportMissingParameterType=false
+# pyright: reportAny=false
+
 """
 图片生成工具类
 统一管理图片生成逻辑，消除重复代码
 """
 
-from typing import List, Dict, Optional, Tuple
+from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 import os
@@ -48,7 +53,7 @@ class ImageGenerator:
     
     def __init__(self, temp_images_dir: str):
         self.temp_images_dir = temp_images_dir
-        self.fonts: Dict[str, ImageFont.FreeTypeFont] = {}
+        self.fonts: dict[str, Any] = {}
         self._load_fonts()
     
     def _load_fonts(self):
@@ -63,7 +68,7 @@ class ImageGenerator:
         for font_name, size in font_configs:
             self.fonts[font_name] = self._load_font(size)
     
-    def _load_font(self, size: int) -> ImageFont.FreeTypeFont:
+    def _load_font(self, size: int) -> Any:
         """加载单个字体"""
         try:
             return ImageFont.truetype("msyh.ttc", size)
@@ -73,12 +78,12 @@ class ImageGenerator:
             except Exception:
                 return ImageFont.load_default()
     
-    def get_font(self, font_name: str) -> ImageFont.FreeTypeFont:
+    def get_font(self, font_name: str) -> Any:
         """获取字体"""
         return self.fonts.get(font_name, self.fonts["normal"])
     
-    def wrap_text(self, text: str, font: ImageFont.FreeTypeFont, 
-                  max_width: int) -> List[str]:
+    def wrap_text(self, text: str, font: Any,
+                  max_width: int) -> list[str]:
         """文本换行
         
         Args:
@@ -110,7 +115,7 @@ class ImageGenerator:
         
         return lines
     
-    def wrap_text_by_chars(self, text: str, char_per_line: int) -> List[str]:
+    def wrap_text_by_chars(self, text: str, char_per_line: int) -> list[str]:
         """按字符数换行
         
         Args:
@@ -125,7 +130,7 @@ class ImageGenerator:
             lines.append(text[i:i+char_per_line])
         return lines
     
-    def calculate_text_height(self, lines: List[str], line_height: int) -> int:
+    def calculate_text_height(self, lines: list[str], line_height: int) -> int:
         """计算文本总高度
         
         Args:
@@ -151,8 +156,8 @@ class ImageGenerator:
         """
         return Image.new('RGB', (width, height), color=background_color)
     
-    def draw_text(self, draw: ImageDraw.ImageDraw, text: str, 
-                  position: Tuple[int, int], font: ImageFont.FreeTypeFont,
+    def draw_text(self, draw: ImageDraw.ImageDraw, text: str,
+                  position: tuple[int, int], font: Any,
                   fill: str = COLORS["text_red"]) -> None:
         """绘制文本
         
@@ -166,7 +171,7 @@ class ImageGenerator:
         draw.text(position, text, fill=fill, font=font)
     
     def draw_centered_text(self, draw: ImageDraw.ImageDraw, text: str,
-                           y: int, width: int, font: ImageFont.FreeTypeFont,
+                           y: int, width: int, font: Any,
                            fill: str = COLORS["title_red"]) -> None:
         """绘制居中文本
         
@@ -183,8 +188,8 @@ class ImageGenerator:
         x = (width - text_width) // 2
         self.draw_text(draw, text, (x, y), font, fill)
     
-    def draw_line(self, draw: ImageDraw.ImageDraw, start: Tuple[int, int],
-                  end: Tuple[int, int], fill: str = COLORS["border_red"],
+    def draw_line(self, draw: ImageDraw.ImageDraw, start: tuple[int, int],
+                  end: tuple[int, int], fill: str = COLORS["border_red"],
                   width: int = 2) -> None:
         """绘制线条
         
@@ -197,10 +202,10 @@ class ImageGenerator:
         """
         draw.line([start, end], fill=fill, width=width)
     
-    def draw_rectangle(self, draw: ImageDraw.ImageDraw, 
-                       coords: Tuple[int, int, int, int],
-                       fill: Optional[str] = None,
-                       outline: Optional[str] = None,
+    def draw_rectangle(self, draw: ImageDraw.ImageDraw,
+                       coords: tuple[int, int, int, int],
+                       fill: str | None = None,
+                       outline: str | None = None,
                        width: int = 1) -> None:
         """绘制矩形
         
@@ -213,9 +218,9 @@ class ImageGenerator:
         """
         draw.rectangle(coords, fill=fill, outline=outline, width=width)
     
-    def generate_inventory_image(self, inventory_data: List, 
+    def generate_inventory_image(self, inventory_data: list[Any],
                                   player_name: str = "玩家",
-                                  output_path: Optional[str] = None) -> str:
+                                  output_path: str | None = None) -> str:
         """生成道具清单图片
         
         Args:
@@ -273,9 +278,9 @@ class ImageGenerator:
         
         return self._save_image(img, output_path, "inventory")
     
-    def generate_item_details_image(self, item_data: Dict,
+    def generate_item_details_image(self, item_data: dict[str, Any],
                                      player_name: str = "玩家",
-                                     output_path: Optional[str] = None) -> str:
+                                     output_path: str | None = None) -> str:
         """生成道具详情图片
         
         Args:
@@ -348,7 +353,7 @@ class ImageGenerator:
     def generate_npc_guidance_image(self, npc_name: str, npc_role: str,
                                     npc_attitude: str, npc_behavior: str,
                                     npc_dialogue: str,
-                                    output_path: Optional[str] = None) -> str:
+                                    output_path: str | None = None) -> str:
         """生成NPC引导图片
         
         Args:
@@ -410,7 +415,7 @@ class ImageGenerator:
         
         return self._save_image(img, output_path, "npc_guidance")
     
-    def _save_image(self, img: Image.Image, output_path: Optional[str], 
+    def _save_image(self, img: Image.Image, output_path: str | None,
                    prefix: str) -> str:
         """保存图片
         
@@ -431,9 +436,9 @@ class ImageGenerator:
         img.save(output_path)
         return output_path
     
-    def calculate_image_dimensions(self, content_lines: List[str], 
+    def calculate_image_dimensions(self, content_lines: list[str],
                                    title_height: int = 80,
-                                   extra_height: int = 50) -> Tuple[int, int]:
+                                   extra_height: int = 50) -> tuple[int, int]:
         """计算图片尺寸
         
         Args:
