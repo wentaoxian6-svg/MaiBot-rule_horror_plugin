@@ -40,6 +40,15 @@ class Player:
     action_history: list[dict[str, Any]] = field(default_factory=list)
     joined_at: datetime = field(default_factory=datetime.now)
     last_action_at: Optional[datetime] = None
+    # 新增字段
+    injury: str = "无伤"  # 受伤情况：无伤/轻伤/重伤/致命伤
+    state: str = "正常"   # 精神状态：正常/紧张/恐惧/崩溃/疯狂
+    emotion: str = "平静"  # 情绪：平静/焦虑/绝望/愤怒等
+    # 多人模式身份字段
+    identity: Optional[str] = None  # 玩家身份（多人模式）
+    identity_description: Optional[str] = None  # 身份描述
+    unique_rules: list[dict[str, Any]] = field(default_factory=list)  # 该身份特有的规则
+    exclusive_info: Optional[str] = None  # 该身份独有的信息
 
     def to_dict(self) -> dict[str, Any]:
         """转换为字典"""
@@ -59,6 +68,13 @@ class Player:
             "action_history": self.action_history,
             "joined_at": self.joined_at.isoformat(),
             "last_action_at": self.last_action_at.isoformat() if self.last_action_at else None,
+            "injury": self.injury,
+            "state": self.state,
+            "emotion": self.emotion,
+            "identity": self.identity,
+            "identity_description": self.identity_description,
+            "unique_rules": self.unique_rules,
+            "exclusive_info": self.exclusive_info,
         }
 
     @classmethod
@@ -82,6 +98,13 @@ class Player:
         player.joined_at = datetime.fromisoformat(data["joined_at"]) if "joined_at" in data else datetime.now()
         if data.get("last_action_at"):
             player.last_action_at = datetime.fromisoformat(data["last_action_at"])
+        player.injury = data.get("injury", "无伤")
+        player.state = data.get("state", "正常")
+        player.emotion = data.get("emotion", "平静")
+        player.identity = data.get("identity")
+        player.identity_description = data.get("identity_description")
+        player.unique_rules = data.get("unique_rules", [])
+        player.exclusive_info = data.get("exclusive_info")
         return player
 
 
@@ -102,24 +125,20 @@ class GameSession:
     core_symbols: list[dict[str, Any]] = field(default_factory=list)
     environment_state: dict[str, Any] = field(default_factory=dict)
     time_manager: dict[str, Any] = field(default_factory=dict)
+    scene_structure: dict[str, Any] = field(default_factory=dict)
+    npc_guidance: dict[str, Any] = field(default_factory=dict)
     hint_count: int = 3
     has_cleared: bool = False
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     ended_at: Optional[datetime] = None
-    
-    # 环境记忆系统
     environment_memory: dict[str, Any] = field(default_factory=lambda: {
         "visited_locations": [],
         "interacted_objects": [],
         "time_based_events": [],
     })
-    
-    # 规则变异系统
     rule_mutations: list[dict[str, Any]] = field(default_factory=list)
     last_mutation_time: Optional[datetime] = None
-    
-    # 规则网络系统
     rule_network: dict[str, Any] = field(default_factory=lambda: {
         "rule_connections": [],
         "collaborative_rules": [],
@@ -129,6 +148,34 @@ class GameSession:
         """添加玩家"""
         if len(self.players) >= 5 and self.game_mode == "多人":
             return False
+
+        # 给一个合理的起始位置（避免行动上下文里永远是“起始位置”，导致叙事割裂）
+        if getattr(player, "location", "起始位置") == "起始位置":
+            areas: list[str] = []
+            for fl in (self.scene_structure.get("floors") or []):
+                if isinstance(fl, dict):
+                    areas.extend([str(x) for x in (fl.get("areas") or fl.get("rooms") or [])])
+            areas.extend([str(x) for x in (self.scene_structure.get("special_areas") or [])])
+
+            prefer = [
+                "入口",
+                "门口",
+                "前台",
+                "收银",
+                "柜台",
+                "大厅",
+                "大堂",
+                "走廊",
+            ]
+            start_location = None
+            for kw in prefer:
+                hit = next((a for a in areas if kw in a), None)
+                if hit:
+                    start_location = hit
+                    break
+
+            player.location = start_location or (areas[0] if areas else (self.scene_name or "起始位置"))
+
         self.players[player.player_id] = player
         self.updated_at = datetime.now()
         return True
@@ -198,6 +245,8 @@ class GameSession:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "scene_structure": self.scene_structure,
+            "npc_guidance": self.npc_guidance,
             "environment_memory": self.environment_memory,
             "rule_mutations": self.rule_mutations,
             "last_mutation_time": self.last_mutation_time.isoformat() if self.last_mutation_time else None,
@@ -233,6 +282,8 @@ class GameSession:
             session.ended_at = datetime.fromisoformat(data["ended_at"])
         
         # 加载新增字段
+        session.scene_structure = data.get("scene_structure", {})
+        session.npc_guidance = data.get("npc_guidance", {})
         session.environment_memory = data.get("environment_memory", {
             "visited_locations": [],
             "interacted_objects": [],

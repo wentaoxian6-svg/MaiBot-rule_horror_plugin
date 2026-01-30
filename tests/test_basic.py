@@ -1,6 +1,6 @@
 """基础功能测试"""
+
 import pytest
-import asyncio
 from pathlib import Path
 import sys
 
@@ -10,7 +10,7 @@ sys.path.insert(0, str(project_root))
 
 from core.config.loader import load_config_from_file
 from core.game.models import Player, GameSession, PlayerStatus, GameStatus
-from core.llm.client import LLMClient
+
 
 
 class TestConfig:
@@ -102,8 +102,35 @@ class TestStateManager:
             await manager.stop()
 
 
+class TestLLMClient:
+    """LLM 客户端健壮性测试（不做真实联网调用）"""
+
+    def test_extract_message_content_none(self):
+        from core.llm.client import _extract_message_content
+
+        assert _extract_message_content({"content": None}) == ""
+
+    def test_extract_message_content_string(self):
+        from core.llm.client import _extract_message_content
+
+        assert _extract_message_content({"content": " hello "}) == " hello "
+
+    def test_extract_message_content_list_parts(self):
+        from core.llm.client import _extract_message_content
+
+        msg = {"content": [{"text": "你"}, {"text": "好"}, {"text": "！"}]}
+        assert _extract_message_content(msg) == "你好！"
+
+    def test_extract_message_content_dict_parts(self):
+        from core.llm.client import _extract_message_content
+
+        msg = {"content": {"parts": [{"text": "A"}, {"text": "B"}]}}
+        assert _extract_message_content(msg) == "AB"
+
+
 class TestSaveManager:
     """存档管理器测试"""
+
     
     @pytest.mark.asyncio
     async def test_save_and_load(self):

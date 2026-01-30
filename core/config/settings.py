@@ -2,21 +2,20 @@
 from __future__ import annotations
 
 import os
-from typing import List
 from pydantic import BaseModel, Field, field_validator
 
 
 class LLMConfig(BaseModel):
     """LLM API 配置"""
     api_url: str = Field(
-        default="http://rinkoai.com/v1/chat/completions",
+        default="https://rinkoai.com/v1/chat/completions",
         description="LLM API 地址 (OpenAI格式)"
     )
     api_key: str = Field(
         default="",
         description="LLM API 密钥"
     )
-    model_list: List[str] = Field(
+    model_list: list[str] = Field(
         default=["deepseek-ai/DeepSeek-V3"],
         description="LLM模型列表，按优先级排序"
     )
@@ -48,6 +47,12 @@ class LLMConfig(BaseModel):
         ge=1,
         le=50,
         description="最大并发请求数"
+    )
+    max_tokens: int = Field(
+        default=8000,
+        ge=100,
+        le=32000,
+        description="默认最大生成token数"
     )
 
     @field_validator("api_key")
@@ -92,7 +97,7 @@ class EnvironmentConfig(BaseModel):
     enabled: bool = Field(default=True, description="是否启用环境演变系统")
     api_url: str = Field(default="", description="环境演变系统LLM API地址，留空使用主配置")
     api_key: str = Field(default="", description="环境演变系统LLM API密钥，留空使用主配置")
-    model_list: List[str] = Field(
+    model_list: list[str] = Field(
         default=["deepseek-ai/DeepSeek-V3"],
         description="环境演变系统LLM模型列表"
     )

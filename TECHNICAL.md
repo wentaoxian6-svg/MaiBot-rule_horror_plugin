@@ -68,7 +68,7 @@ rule_horror_plugin-main/
 
 ### 2. 统一的行动处理架构（v2.1.0 新增）
 
-**设计目标**：让命令格式和自然语言输入使用相同的处理流程，确保功能一致性。
+**设计目标**：让命令格式和自然语言输入使用相同的处理流程，确保功能一致性；同时通过配置开关避免“非命令消息”误触发行动。
 
 **架构图**：
 ```
@@ -82,15 +82,17 @@ execute() 方法
 │   ↓
 │   ActionProcessor.process_action()
 │
-└─ 自然语言输入 (XXX)
+└─ 非命令消息 (XXX)
     ↓
-    _handle_natural_input()
+    结束口令识别（"结束" / "结束游戏"）
     ↓
-    关键词过滤 + 意图验证
+    _handle_结束()  ← 沉浸式结束
     ↓
-    ActionProcessor.process_action()  ← 统一处理！
-    
+    （否则）检查配置 plugin.enable_natural_language_action
     ↓
+    ├─ true  → _handle_natural_input()
+    └─ false → 忽略（避免误触发/剧透）
+
 ActionProcessor.process_action()
     ↓
 ├─ ItemManager.check_and_use_item() ✅ 物品使用
@@ -105,11 +107,12 @@ ActionProcessor.process_action()
 
 **关键改进**：
 - ✅ 两种输入方式都经过 `ActionProcessor.process_action()`
-- ✅ 自然语言输入也能触发物品使用、休息、规则变异等完整系统
+- ✅ 自然语言输入在开启后也能触发物品使用、休息、规则变异等完整系统
+- ✅ 默认关闭自然语言直接行动，降低误触发概率
 - ✅ 统一的行动处理逻辑，易于维护
-- ✅ 用户体验一致，避免混淆
 
 **自然语言输入的处理流程**：
+0. **开关检查**：仅当 `plugin.enable_natural_language_action = true` 时才会处理自然语言行动
 1. **关键词过滤**：检查是否包含行动关键词（走、去、看、拿、用、喝、吃、休息等）
 2. **意图验证**：使用 `IntentParser.is_valid_action()` 判断是否是有效游戏行动
 3. **统一处理**：调用 `ActionProcessor.process_action()` 处理行动
@@ -121,6 +124,7 @@ ActionProcessor.process_action()
 - `喝水` → 触发物品使用系统
 - `休息30分钟` → 触发休息系统（自定义时间）
 - `打开柜子` → 触发探索行动，可能发现关键物品并触发规则变异
+
 
 ### 3. 状态管理
 
@@ -215,7 +219,12 @@ class AsyncImageGenerator:
 - **理智值 < 40**：描述混乱、恐怖、充满幻觉和错觉
 - **理智值 = 0**：理智崩坏模式，直接对话、否认死亡、诱导打破规则
 
+**渲染/交互表现**：
+- 行动结果长图：`sanity == 0` 时进入“崩坏展示”，**即使本次判定死亡也会输出完整叙述**，并隐藏状态栏
+- 规则长图：`sanity == 0` 时只显示规则内容（不显示标题/标签），且会对规则文本做去重，避免重复行
+
 **理智值变化规则**：
+
 - 违反规则：-10到-30
 - 目睹恐怖场景：-5到-15
 - 发现真相线索：-3到-10

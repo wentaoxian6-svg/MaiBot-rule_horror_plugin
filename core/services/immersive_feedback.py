@@ -1,18 +1,28 @@
-"""沉浸式反馈系统 - 生成符合恐怖氛围的反馈"""
+"""沉浸式反馈系统
+
+根据玩家行动与当前游戏状态，生成具有恐怖氛围的沉浸式文本反馈。
+
+该文件曾被批量替换破坏（引号缺失、全角标点落入语法层等），此处按原意重写并保持对外接口：
+- FeedbackType
+- FeedbackResponse
+- ImmersiveFeedback（respond / generate_delayed_feedback / generate_sensory_description）
+"""
+
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
-from ..llm.client import LLMClient, LLMResponse
+from ..llm.client import LLMClient, get_default_max_tokens
 
 logger = logging.getLogger(__name__)
 
 
 class FeedbackType(Enum):
     """反馈类型枚举"""
+
     IMMEDIATE = "immediate"
     DELAYED = "delayed"
     SUBTLE = "subtle"
@@ -21,267 +31,246 @@ class FeedbackType(Enum):
 
 @dataclass
 class FeedbackResponse:
-    """反馈响应数据类"""
+    """反馈响应"""
+
     content: str
     feedback_type: FeedbackType
     delay_seconds: int = 0
     should_update_state: bool = False
-    state_updates: dict[str, Any] = None
-
-    def __post_init__(self):
-        if self.state_updates is None:
-            self.state_updates = {}
+    state_updates: dict[str, Any] = field(default_factory=dict)
 
 
 class ImmersiveFeedback:
-    """沉浸式反馈系统 - 生成符合恐怖氛围的反馈"""
+    """沉浸式反馈系统"""
 
-    def __init__(self, llm_client: Optional[LLMClient] = None):
-        self.llm_client = llm_client or LLMClient()
+    def __init__(self, llm_client: LLMClient | None = None):
+        self.llm_client: LLMClient = llm_client or LLMClient()
 
-    async def respond(
-        self,
-        action: dict[str, Any],
-        game_state: dict[str, Any],
-    ) -> FeedbackResponse:
-        """
-        根据行动生成沉浸式反馈
+    async def respond(self, action: dict[str, Any], game_state: dict[str, Any]) -> FeedbackResponse:
+        """根据行动生成即时反馈（若违反规则则偏向延迟反馈结构）"""
 
-        Args:
-            action: 玩家行动信息
-            game_state: 游戏状态
-
-        Returns:
-            FeedbackResponse 对象
-        """
-        violates_rule = action.get("violates_rule", False)
-
-        if violates_rule:
+        if bool(action.get("violates_rule", False)):
             return await self._generate_violation_feedback(action, game_state)
-        else:
-            return await self._generate_normal_feedback(action, game_state)
+        return await self._generate_normal_feedback(action, game_state)
 
     async def _generate_violation_feedback(
-        self,
-        action: dict[str, Any],
-        game_state: dict[str, Any],
+        self, action: dict[str, Any], game_state: dict[str, Any]
     ) -> FeedbackResponse:
-        """生成违反规则的反馈（延迟反馈）"""
-        system_prompt = """你是一个规则怪谈游戏的反馈生成器。当玩家违反规则时，你需要生成延迟反馈。
+        """生成违反规则的反馈（通常为“先正常后异常”的延迟结构）"""
 
-规则：
-1. 不要立即告诉玩家他们违反了规则
-2. 先给出看似正常的反馈
-3. 在后续的反馈中逐渐揭示异常
-4. 使用感官描述而非状态描述
-5. 营造不安和恐怖的氛围
-
-请以 JSON 格式返回：
-{
-    "content": "反馈内容",
-    "feedback_type": "immediate/delayed/subtle/overt",
-    "delay_seconds": 0,
-    "should_update_state": true/false,
-    "state_updates": {}
-}
-
-注意：
-- feedback_type 为 "delayed" 时，delay_seconds 应该大于 0
-- state_updates 可以包含玩家状态的变化（理智、体力等）
-- 使用克系、新怪谈（New Weird）、Liminal Space 风格"""
+        system_prompt = (
+            "你是规则怪谈游戏的反馈生成器。玩家可能违反了规则，但你不要立刻明说。\n"
+            "生成一条看似正常、但带有不安细节的反馈；必要时安排延迟揭示。\n\n"
+            "返回 JSON（不要 markdown，不要其他文字）：\n"
+            "{\n"
+            '  "content": "反馈内容（80-160字）",\n'
+            '  "feedback_type": "immediate/delayed/subtle/overt",\n'
+            '  "delay_seconds": 0,\n'
+            '  "should_update_state": true,\n'
+            '  "state_updates": {"sanity": -5, "health": 0}\n'
+            "}\n\n"
+            "规则：\n"
+            "- 若 feedback_type = delayed，则 delay_seconds > 0\n"
+            "- state_updates 可为空；如有变化，幅度要克制（理智 -1~-15，体力 -1~-20）\n"
+            "- 不要出现 emoji"
+        )
 
         user_prompt = self._build_feedback_prompt(action, game_state)
 
         try:
-            response = await self.llm_client.call(
+            resp = await self.llm_client.call(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.8,
-                max_tokens=400,
+                max_tokens=get_default_max_tokens(),
             )
-
-            result = response.parse_json()
-            return self._parse_feedback_response(result)
-
+            return self._parse_feedback_response(resp.parse_json())
         except Exception as e:
-            logger.error(f"生成违反规则反馈失败: {e}")
+            logger.error(f"生成违反规则反馈失败: {e}", exc_info=True)
+            # fallback：给一个“表面正常”的即时反馈，并安排稍后揭示
             return FeedbackResponse(
-                content="你执行了行动。一切看起来都很正常。",
-                feedback_type=FeedbackType.IMMEDIATE,
+                content="你完成了动作。周围似乎没有立刻发生变化，但某种细小的错位感在你脑后停留不去。",
+                feedback_type=FeedbackType.DELAYED,
                 delay_seconds=30,
                 should_update_state=False,
+                state_updates={},
             )
 
     async def _generate_normal_feedback(
-        self,
-        action: dict[str, Any],
-        game_state: dict[str, Any],
+        self, action: dict[str, Any], game_state: dict[str, Any]
     ) -> FeedbackResponse:
-        """生成正常行动的反馈"""
-        system_prompt = """你是一个规则怪谈游戏的反馈生成器。你需要为玩家的正常行动生成沉浸式反馈。
+        """生成正常行动反馈"""
 
-规则：
-1. 使用感官描述而非状态描述
-2. 营造紧张和不安的氛围
-3. 给出微妙的暗示和线索
-4. 根据行动的风险等级调整反馈的紧张程度
-5. 保持神秘感和不确定性
-
-请以 JSON 格式返回：
-{
-    "content": "反馈内容",
-    "feedback_type": "immediate/subtle/overt",
-    "delay_seconds": 0,
-    "should_update_state": true/false,
-    "state_updates": {}
-}
-
-注意：
-- feedback_type 为 "subtle" 时，给出微妙的暗示
-- feedback_type 为 "overt" 时，直接描述结果
-- state_updates 可以包含玩家状态的变化（理智、体力等）
-- 使用克系、新怪谈（New Weird）、Liminal Space 风格"""
+        system_prompt = (
+            "你是规则怪谈游戏的沉浸式反馈生成器。\n"
+            "对玩家的正常行动给出结果描写，允许加入微妙的不安暗示或线索。\n\n"
+            "返回 JSON（不要 markdown，不要其他文字）：\n"
+            "{\n"
+            '  "content": "反馈内容（80-180字）",\n'
+            '  "feedback_type": "immediate/subtle/overt",\n'
+            '  "delay_seconds": 0,\n'
+            '  "should_update_state": false,\n'
+            '  "state_updates": {}\n'
+            "}\n\n"
+            "规则：\n"
+            "- feedback_type = subtle 时，多写暗示；overt 时结果更直接\n"
+            "- 不要出现 emoji"
+        )
 
         user_prompt = self._build_feedback_prompt(action, game_state)
 
         try:
-            response = await self.llm_client.call(
+            resp = await self.llm_client.call(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.8,
-                max_tokens=400,
+                max_tokens=get_default_max_tokens(),
             )
-
-            result = response.parse_json()
-            return self._parse_feedback_response(result)
-
+            return self._parse_feedback_response(resp.parse_json())
         except Exception as e:
-            logger.error(f"生成正常反馈失败: {e}")
+            logger.error(f"生成正常反馈失败: {e}", exc_info=True)
             return FeedbackResponse(
-                content="你执行了行动。",
+                content="你执行了行动。空气里没有立刻给出答案，但你能感觉到某些细节被你触碰到了。",
                 feedback_type=FeedbackType.IMMEDIATE,
+                delay_seconds=0,
                 should_update_state=False,
+                state_updates={},
             )
 
-    def _build_feedback_prompt(
-        self,
-        action: dict[str, Any],
-        game_state: dict[str, Any],
-    ) -> str:
+    def _build_feedback_prompt(self, action: dict[str, Any], game_state: dict[str, Any]) -> str:
         """构建反馈提示词"""
+
         action_type = action.get("action_type", "unknown")
         target = action.get("target", "")
         description = action.get("description", "")
         risk_level = action.get("risk_level", 0.0)
         violates_rule = action.get("violates_rule", False)
+        violated_rule = action.get("violated_rule", "")
 
         scene_name = game_state.get("scene_name", "未知场景")
         background = game_state.get("background", "")
         player_status = game_state.get("player_status", {})
 
-        prompt = f"""当前场景：{scene_name}
+        return (
+            f"场景: {scene_name}\n"
+            f"背景: {background}\n\n"
+            "玩家行动:\n"
+            f"- 类型: {action_type}\n"
+            f"- 目标: {target}\n"
+            f"- 描述: {description}\n"
+            f"- 风险等级: {risk_level}\n"
+            f"- 违反规则: {violates_rule}\n"
+            f"- 违反的规则: {violated_rule}\n\n"
+            "玩家状态:\n"
+            f"- 理智: {player_status.get('sanity', 100)}/100\n"
+            f"- 体力: {player_status.get('health', 100)}/100\n"
+            f"- 位置: {player_status.get('location', '未知')}\n\n"
+            "请生成沉浸式反馈。"
+        )
 
-场景背景：
-{background}
+    def _parse_feedback_response(self, data: dict[str, Any]) -> FeedbackResponse:
+        """把 LLM JSON 转成 FeedbackResponse，并做兜底"""
 
-玩家行动：
-- 类型：{action_type}
-- 目标：{target}
-- 描述：{description}
-- 风险等级：{risk_level}
-- 违反规则：{violates_rule}
-
-玩家状态：
-- 理智：{player_status.get('sanity', 100)}/100
-- 体力：{player_status.get('health', 100)}/100
-- 位置：{player_status.get('location', '未知')}
-
-请生成沉浸式反馈。"""
-
-        return prompt
-
-    def _parse_feedback_response(self, result: dict[str, Any]) -> FeedbackResponse:
-        """将解析结果转换为 FeedbackResponse 对象"""
+        ft_raw = str(data.get("feedback_type", "immediate") or "immediate").lower().strip()
         try:
-            feedback_type_str = result.get("feedback_type", "immediate")
-            feedback_type = FeedbackType(feedback_type_str.lower())
-        except (ValueError, AttributeError):
+            feedback_type = FeedbackType(ft_raw)
+        except Exception:
             feedback_type = FeedbackType.IMMEDIATE
 
+        def _to_bool(v: Any) -> bool:
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in {"1", "true", "yes", "y", "是"}
+            return bool(v)
+
+        def _to_int(v: Any, default: int = 0) -> int:
+            try:
+                return int(v)
+            except Exception:
+                return default
+
+        delay_seconds = max(0, _to_int(data.get("delay_seconds", 0), 0))
+        should_update_state = _to_bool(data.get("should_update_state", False))
+        state_updates = data.get("state_updates", {})
+        if not isinstance(state_updates, dict):
+            state_updates = {}
+
+        # 规范更新幅度
+        if "sanity" in state_updates:
+            try:
+                state_updates["sanity"] = max(-30, min(15, int(state_updates["sanity"])))
+            except Exception:
+                state_updates.pop("sanity", None)
+        if "health" in state_updates:
+            try:
+                state_updates["health"] = max(-50, min(20, int(state_updates["health"])))
+            except Exception:
+                state_updates.pop("health", None)
+
+        # delayed 类型必须有延迟，否则给个默认延迟
+        if feedback_type == FeedbackType.DELAYED and delay_seconds <= 0:
+            delay_seconds = 30
+
+        content = str(data.get("content", "") or "").strip()
+        if not content:
+            content = "你完成了行动，但某些细节让你难以忽视。"
+
         return FeedbackResponse(
-            content=result.get("content", ""),
+            content=content,
             feedback_type=feedback_type,
-            delay_seconds=int(result.get("delay_seconds", 0)),
-            should_update_state=bool(result.get("should_update_state", False)),
-            state_updates=result.get("state_updates", {}),
+            delay_seconds=delay_seconds,
+            should_update_state=should_update_state,
+            state_updates=state_updates,
         )
 
     async def generate_delayed_feedback(
-        self,
-        original_action: dict[str, Any],
-        game_state: dict[str, Any],
+        self, original_action: dict[str, Any], game_state: dict[str, Any]
     ) -> FeedbackResponse:
-        """
-        生成延迟反馈（在玩家违反规则后的一段时间）
+        """生成延迟反馈（用于玩家违反规则后的一段时间揭示异常）"""
 
-        Args:
-            original_action: 原始行动
-            game_state: 游戏状态
-
-        Returns:
-            FeedbackResponse 对象
-        """
-        system_prompt = """你是一个规则怪谈游戏的延迟反馈生成器。玩家之前违反了规则，现在需要揭示异常。
-
-规则：
-1. 逐渐揭示异常
-2. 使用感官描述
-3. 营造恐怖和不安的氛围
-4. 给出玩家违反规则的暗示
-5. 保持神秘感
-
-请以 JSON 格式返回：
-{
-    "content": "反馈内容",
-    "feedback_type": "delayed",
-    "delay_seconds": 0,
-    "should_update_state": true/false,
-    "state_updates": {}
-}
-
-注意：
-- 这是延迟反馈，所以应该揭示之前的行动导致的异常
-- state_updates 可以包含玩家状态的变化（理智、体力等）
-- 使用克系、新怪谈（New Weird）、Liminal Space 风格"""
+        system_prompt = (
+            "你是规则怪谈游戏的延迟反馈生成器。玩家之前的行动可能触发了规则的惩罚或异常，现在需要逐渐揭示。\n"
+            "请输出一条更明显、更不安的反馈，但仍保持克制与暗示。\n\n"
+            "返回 JSON（不要 markdown，不要其他文字）：\n"
+            "{\n"
+            '  "content": "延迟反馈内容（100-220字）",\n'
+            '  "feedback_type": "delayed",\n'
+            '  "delay_seconds": 0,\n'
+            '  "should_update_state": true,\n'
+            '  "state_updates": {"sanity": -5}\n'
+            "}\n\n"
+            "规则：\n"
+            "- feedback_type 固定为 delayed\n"
+            "- delay_seconds 保持 0（因为这是现在要发送的文本）\n"
+            "- 不要出现 emoji"
+        )
 
         user_prompt = self._build_delayed_feedback_prompt(original_action, game_state)
 
         try:
-            response = await self.llm_client.call(
+            resp = await self.llm_client.call(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.9,
-                max_tokens=400,
+                max_tokens=get_default_max_tokens(),
             )
-
-            result = response.parse_json()
-            return self._parse_feedback_response(result)
-
+            return self._parse_feedback_response(resp.parse_json())
         except Exception as e:
-            logger.error(f"生成延迟反馈失败: {e}")
+            logger.error(f"生成延迟反馈失败: {e}", exc_info=True)
             return FeedbackResponse(
-                content="等等...有些不对劲。",
+                content="你忽然意识到之前的动作留下了某种‘回声’。它沿着墙角爬行，在你看不见的地方，把事情改写了一点点。",
                 feedback_type=FeedbackType.DELAYED,
+                delay_seconds=0,
                 should_update_state=True,
                 state_updates={"sanity": -5},
             )
 
     def _build_delayed_feedback_prompt(
-        self,
-        original_action: dict[str, Any],
-        game_state: dict[str, Any],
+        self, original_action: dict[str, Any], game_state: dict[str, Any]
     ) -> str:
         """构建延迟反馈提示词"""
+
         action_type = original_action.get("action_type", "unknown")
         target = original_action.get("target", "")
         description = original_action.get("description", "")
@@ -290,75 +279,46 @@ class ImmersiveFeedback:
         scene_name = game_state.get("scene_name", "未知场景")
         player_status = game_state.get("player_status", {})
 
-        prompt = f"""当前场景：{scene_name}
+        return (
+            f"场景: {scene_name}\n\n"
+            "玩家之前的行动:\n"
+            f"- 类型: {action_type}\n"
+            f"- 目标: {target}\n"
+            f"- 描述: {description}\n"
+            f"- 违反的规则: {violated_rule}\n\n"
+            "玩家当前状态:\n"
+            f"- 理智: {player_status.get('sanity', 100)}/100\n"
+            f"- 体力: {player_status.get('health', 100)}/100\n"
+            f"- 位置: {player_status.get('location', '未知')}\n\n"
+            "请生成延迟反馈，揭示之前行动导致的异常。"
+        )
 
-玩家之前的行动：
-- 类型：{action_type}
-- 目标：{target}
-- 描述：{description}
-- 违反的规则：{violated_rule}
+    async def generate_sensory_description(self, target: str, game_state: dict[str, Any]) -> str:
+        """生成某个目标的感官描写（纯文本）"""
 
-玩家当前状态：
-- 理智：{player_status.get('sanity', 100)}/100
-- 体力：{player_status.get('health', 100)}/100
-
-现在需要揭示之前的行动导致的异常。请生成延迟反馈。"""
-
-        return prompt
-
-    async def generate_sensory_description(
-        self,
-        target: str,
-        game_state: dict[str, Any],
-    ) -> str:
-        """
-        生成目标的感官描述
-
-        Args:
-            target: 目标对象
-            game_state: 游戏状态
-
-        Returns:
-            感官描述文本
-        """
-        system_prompt = """你是一个规则怪谈游戏的感官描述生成器。你需要为目标生成沉浸式的感官描述。
-
-规则：
-1. 使用多感官描述（视觉、听觉、触觉、嗅觉等）
-2. 营造不安和恐怖的氛围
-3. 给出微妙的暗示和线索
-4. 保持神秘感和不确定性
-5. 根据场景的恐怖程度调整描述的紧张程度
-
-请直接返回描述文本，不要使用 JSON 格式。
-
-注意：
-- 使用克系、新怪谈（New Weird）、Liminal Space 风格
-- 描述应该让玩家感到不安和好奇
-- 避免直接揭示真相，保持神秘感"""
-
+        system_prompt = (
+            "你是规则怪谈游戏的感官描写生成器。\n"
+            "请为给定目标生成一段多感官描写（80-160字），只输出纯文本。\n"
+            "要求：克制、细节、暗示，不要出现 emoji。"
+        )
         scene_name = game_state.get("scene_name", "未知场景")
         background = game_state.get("background", "")
 
-        prompt = f"""当前场景：{scene_name}
-
-场景背景：
-{background}
-
-目标：{target}
-
-请生成沉浸式的感官描述。"""
+        prompt = (
+            f"场景: {scene_name}\n"
+            f"背景: {background}\n"
+            f"目标: {target}\n\n"
+            "请输出感官描写。"
+        )
 
         try:
-            response = await self.llm_client.call(
+            resp = await self.llm_client.call(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 temperature=0.8,
-                max_tokens=300,
+                max_tokens=get_default_max_tokens(),
             )
-
-            return response.content.strip()
-
+            return resp.clean_content
         except Exception as e:
-            logger.error(f"生成感官描述失败: {e}")
-            return f"你看着{target}，感觉有些异样。"
+            logger.error(f"生成感官描述失败: {e}", exc_info=True)
+            return f"你看着{target}，细节像被刻意擦掉了一块，只剩下某种不合逻辑的空白。"

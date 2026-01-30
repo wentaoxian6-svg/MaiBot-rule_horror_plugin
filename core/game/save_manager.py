@@ -11,7 +11,7 @@ import threading
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from .models import GameSession
 from ..config import get_config
@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 class SaveManager:
     """存档管理器 - 单例模式"""
 
-    _instance: Optional[SaveManager] = None
-    _lock = threading.Lock()  # 使用threading.Lock而非asyncio.Lock
+    _instance: SaveManager | None = None
+    _lock: threading.Lock = threading.Lock()  # 使用threading.Lock而非asyncio.Lock
 
-    def __new__(cls, data_dir: Optional[str] = None) -> SaveManager:
+    def __new__(cls, data_dir: str | None = None) -> SaveManager:
         """单例模式（线程安全）"""
         if cls._instance is None:
             with cls._lock:
@@ -34,26 +34,27 @@ class SaveManager:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, data_dir: Optional[str] = None):
+    def __init__(self, data_dir: str | None = None):
         if hasattr(self, "_initialized"):
             return
 
-        self._initialized = True
+        self._initialized: bool = True
 
         if data_dir is None:
             # 默认数据目录
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             data_dir = os.path.join(base_dir, "data", "saves")
 
-        self.data_dir = Path(data_dir)
+        self.data_dir: Path = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir: Path = self.data_dir  # 别名，兼容旧代码
 
         self._config = get_config().save
         # 改为使用deque存储多个版本，避免数据丢失
         self._pending_saves: dict[str, deque[tuple[datetime, GameSession]]] = {}
-        self._save_lock = asyncio.Lock()
-        self._batch_task: Optional[asyncio.Task] = None
-        self._running = False
+        self._save_lock: asyncio.Lock = asyncio.Lock()
+        self._batch_task: asyncio.Task[Any] | None = None
+        self._running: bool = False
 
     async def start(self) -> None:
         """启动批量保存任务"""
@@ -176,7 +177,7 @@ class SaveManager:
         safe_id = "".join(c for c in group_id if c.isalnum() or c in "-_")
         return self.data_dir / f"save_{safe_id}"
 
-    async def load(self, group_id: str) -> Optional[GameSession]:
+    async def load(self, group_id: str) -> GameSession | None:
         """
         加载游戏会话
 
@@ -237,38 +238,54 @@ class SaveManager:
 
         return deleted
 
-    async def list_saves(self) -> list[dict]:
-        """
-        列出所有存档
+    async def list_saves(self) -> list[dict[str, Any]]:
+        """列出所有存档（包含默认存档与命名存档）
 
         Returns:
             存档信息列表
         """
-        saves = []
+        saves: list[dict[str, Any]] = []
 
         for file_path in self.data_dir.iterdir():
-            if file_path.suffix in [".json", ".gz"]:
-                try:
-                    if file_path.suffix == ".gz":
-                        with gzip.open(file_path, "rt", encoding="utf-8") as f:
-                            data = json.load(f)
-                    else:
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            data = json.load(f)
+            if not file_path.is_file():
+                continue
+            if file_path.suffix not in [".json", ".gz"]:
+                continue
 
-                    session = data.get("session", {})
-                    saves.append({
-                        "group_id": session.get("group_id", "unknown"),
-                        "scene_name": session.get("scene_name", "未知场景"),
-                        "game_mode": session.get("game_mode", "未知"),
-                        "status": session.get("status", "unknown"),
-                        "saved_at": data.get("saved_at", "unknown"),
-                        "player_count": len(session.get("players", {})),
-                    })
-                except Exception as e:
-                    logger.warning(f"读取存档信息失败 {file_path}: {e}")
+            try:
+                if file_path.suffix == ".gz":
+                    with gzip.open(file_path, "rt", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
 
-        return sorted(saves, key=lambda x: x["saved_at"], reverse=True)
+                session = data.get("session", {})
+                name = data.get("name")
+
+                # 未显式写入 name 的，按文件类型给一个友好的显示名
+                if not name:
+                    if file_path.name.startswith("save_"):
+                        name = "默认存档"
+                    elif file_path.name.startswith("named_"):
+                        name = "未命名"
+
+                saves.append({
+                    "group_id": session.get("group_id", "unknown"),
+                    "scene_name": session.get("scene_name", "未知场景"),
+                    "game_mode": session.get("game_mode", "未知"),
+                    "status": session.get("status", "unknown"),
+                    "saved_at": data.get("saved_at", "unknown"),
+                    "player_count": len(session.get("players", {})),
+                    "name": name,
+                    "file": file_path.name,
+                    "is_named": file_path.name.startswith("named_"),
+                })
+            except Exception as e:
+                logger.warning(f"读取存档信息失败 {file_path}: {e}")
+
+        # saved_at 是 ISO 字符串，按字符串排序即可满足时间倒序
+        return sorted(saves, key=lambda x: str(x.get("saved_at", "")), reverse=True)
 
     async def cleanup_old_saves(self, max_age_days: int = 30) -> int:
         """
@@ -297,17 +314,7 @@ class SaveManager:
         return cleaned
 
     async def save_with_name(self, group_id: str, session: GameSession, name: str) -> bool:
-        """
-        使用指定名称保存存档（用于手动存档）
-
-        Args:
-            group_id: 群组ID
-            session: 游戏会话
-            name: 存档名称
-
-        Returns:
-            是否保存成功
-        """
+        """使用指定名称保存存档（用于手动存档）"""
         try:
             save_data = {
                 "version": "2.1.0",
@@ -316,9 +323,10 @@ class SaveManager:
                 "session": session.to_dict(),
             }
 
-            # 构建文件路径（使用名称）
+            # 构建文件路径（Windows/跨平台安全）
+            safe_id = "".join(c for c in group_id if c.isalnum() or c in "-_")
             safe_name = "".join(c for c in name if c.isalnum() or c in "-_")
-            save_path = self.data_dir / f"named_{group_id}_{safe_name}.json"
+            save_path = self.data_dir / f"named_{safe_id}_{safe_name}.json"
 
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(save_data, f, ensure_ascii=False, indent=2)
@@ -330,19 +338,11 @@ class SaveManager:
             logger.error(f"手动存档失败 {group_id}: {e}")
             return False
 
-    async def load_with_name(self, group_id: str, name: str) -> Optional[GameSession]:
-        """
-        加载指定名称的存档
-
-        Args:
-            group_id: 群组ID
-            name: 存档名称
-
-        Returns:
-            游戏会话或 None
-        """
+    async def load_with_name(self, group_id: str, name: str) -> GameSession | None:
+        """加载指定名称的存档"""
+        safe_id = "".join(c for c in group_id if c.isalnum() or c in "-_")
         safe_name = "".join(c for c in name if c.isalnum() or c in "-_")
-        save_path = self.data_dir / f"named_{group_id}_{safe_name}.json"
+        save_path = self.data_dir / f"named_{safe_id}_{safe_name}.json"
 
         if not save_path.exists():
             return None
@@ -354,3 +354,61 @@ class SaveManager:
         except Exception as e:
             logger.error(f"加载命名存档失败 {group_id}/{name}: {e}")
             return None
+
+    async def delete_with_name(self, group_id: str, name: str) -> bool:
+        """删除指定名称的存档"""
+        safe_id = "".join(c for c in group_id if c.isalnum() or c in "-_")
+        safe_name = "".join(c for c in name if c.isalnum() or c in "-_")
+        save_path = self.data_dir / f"named_{safe_id}_{safe_name}.json"
+
+        if not save_path.exists():
+            return False
+
+        try:
+            save_path.unlink()
+            logger.info(f"删除命名存档: {group_id}/{name}")
+            return True
+        except Exception as e:
+            logger.error(f"删除命名存档失败 {group_id}/{name}: {e}")
+            return False
+
+    async def cleanup_ended_saves(self, group_id: str | None = None) -> int:
+        """清理已结束的存档
+
+        Args:
+            group_id: 仅清理该群组/用户的存档；None 表示清理全部
+
+        Returns:
+            清理的存档数量
+        """
+        cleaned = 0
+
+        for file_path in list(self.data_dir.iterdir()):
+            if not file_path.is_file():
+                continue
+            if file_path.suffix not in [".json", ".gz"]:
+                continue
+
+            try:
+                if file_path.suffix == ".gz":
+                    with gzip.open(file_path, "rt", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+
+                session = data.get("session", {})
+                if group_id is not None and session.get("group_id") != group_id:
+                    continue
+
+                if session.get("status") != "ended":
+                    continue
+
+                file_path.unlink()
+                cleaned += 1
+                logger.info(f"清理已结束存档: {file_path.name}")
+
+            except Exception as e:
+                logger.warning(f"清理已结束存档失败 {file_path}: {e}")
+
+        return cleaned

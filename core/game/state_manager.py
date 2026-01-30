@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Optional
+from typing import Any
 from datetime import datetime, timedelta
 
 from .models import GameSession, GameStatus
@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 class GameState:
     """游戏状态封装"""
     def __init__(self, group_id: str):
-        self.group_id = group_id
-        self.session: Optional[GameSession] = None
-        self.last_accessed = datetime.now()
-        self._lock = asyncio.Lock()
+        self.group_id: str = group_id
+        self.session: GameSession | None = None
+        self.last_accessed: datetime = datetime.now()
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def acquire(self) -> GameState:
         """获取锁"""
@@ -49,8 +49,8 @@ class GameState:
 class GameStateManager:
     """游戏状态管理器 - 单例模式"""
 
-    _instance: Optional[GameStateManager] = None
-    _lock = threading.Lock()  # 使用threading.Lock而非asyncio.Lock
+    _instance: GameStateManager | None = None
+    _lock: threading.Lock = threading.Lock()  # 使用threading.Lock而非asyncio.Lock
 
     def __new__(cls) -> GameStateManager:
         """单例模式（线程安全）"""
@@ -65,11 +65,11 @@ class GameStateManager:
         if hasattr(self, "_initialized"):
             return
 
-        self._initialized = True
+        self._initialized: bool = True
         self._states: dict[str, GameState] = {}
-        self._global_lock = asyncio.Lock()
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self._cleanup_interval = 300  # 5分钟清理一次
+        self._global_lock: asyncio.Lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[Any] | None = None
+        self._cleanup_interval: int = 300  # 5分钟清理一次
 
     async def start(self) -> None:
         """启动管理器"""
@@ -141,7 +141,7 @@ class GameStateManager:
             logger.error(f"获取状态超时: {group_id}")
             raise RuntimeError(f"获取状态超时: {group_id}")
 
-    async def get(self, group_id: str, timeout: float = 5.0) -> Optional[GameState]:
+    async def get(self, group_id: str, timeout: float = 5.0) -> GameState | None:
         """
         获取游戏状态（如果不存在则返回 None）
 

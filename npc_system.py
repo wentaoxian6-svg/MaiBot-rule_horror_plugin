@@ -80,6 +80,7 @@ class NPCMemory:
     """NPC记忆系统
 
     记录NPC与玩家的互动历史，形成"伪自由意志"
+    支持6维态度向量系统
     """
 
     def __init__(self):
@@ -87,12 +88,143 @@ class NPCMemory:
         self.player_locations: dict[str, list[dict[str, Any]]] = {}
         self.player_actions: dict[str, list[dict[str, Any]]] = {}
         self.player_attitudes: dict[str, NPCAttitude] = {}
+        
+        # 6维态度向量系统
+        self.player_affection: dict[str, float] = {}  # 好感度 (0-100)
+        self.player_suspicion: dict[str, float] = {}  # 怀疑度 (0-100)
+        self.player_fear: dict[str, float] = {}  # 恐惧度 (0-100)
+        self.player_trust: dict[str, float] = {}  # 信任度 (0-100)
+        self.player_hostility: dict[str, float] = {}  # 敌意度 (0-100)
+        self.player_dependence: dict[str, float] = {}  # 依赖度 (0-100)
+        
+        # 旧版兼容（保留）
         self.player_trust_levels: dict[str, float] = {}
         self.player_fear_levels: dict[str, float] = {}
         self.player_suspicion_levels: dict[str, float] = {}
+        
         self.last_seen_time: dict[str, int | None] = {}
         self.last_seen_location: dict[str, str | None] = {}
         self.total_interactions: int = 0
+    
+    def initialize_attitude_vector(self, player_id: str):
+        """初始化玩家的态度向量（初始值：好感度50、信任度50、其他0）"""
+        if player_id not in self.player_affection:
+            self.player_affection[player_id] = 50.0
+            self.player_suspicion[player_id] = 0.0
+            self.player_fear[player_id] = 0.0
+            self.player_trust[player_id] = 50.0
+            self.player_hostility[player_id] = 0.0
+            self.player_dependence[player_id] = 0.0
+    
+    def update_attitude_vector(self, player_id: str, 
+                              affection_delta: float = 0.0,
+                              suspicion_delta: float = 0.0,
+                              fear_delta: float = 0.0,
+                              trust_delta: float = 0.0,
+                              hostility_delta: float = 0.0,
+                              dependence_delta: float = 0.0):
+        """更新玩家的态度向量
+        
+        Args:
+            player_id: 玩家ID
+            affection_delta: 好感度变化
+            suspicion_delta: 怀疑度变化
+            fear_delta: 恐惧度变化
+            trust_delta: 信任度变化
+            hostility_delta: 敌意度变化
+            dependence_delta: 依赖度变化
+        """
+        self.initialize_attitude_vector(player_id)
+        
+        self.player_affection[player_id] = max(0.0, min(100.0, 
+            self.player_affection[player_id] + affection_delta))
+        self.player_suspicion[player_id] = max(0.0, min(100.0, 
+            self.player_suspicion[player_id] + suspicion_delta))
+        self.player_fear[player_id] = max(0.0, min(100.0, 
+            self.player_fear[player_id] + fear_delta))
+        self.player_trust[player_id] = max(0.0, min(100.0, 
+            self.player_trust[player_id] + trust_delta))
+        self.player_hostility[player_id] = max(0.0, min(100.0, 
+            self.player_hostility[player_id] + hostility_delta))
+        self.player_dependence[player_id] = max(0.0, min(100.0, 
+            self.player_dependence[player_id] + dependence_delta))
+    
+    def get_attitude_vector(self, player_id: str) -> dict[str, float]:
+        """获取玩家的态度向量"""
+        self.initialize_attitude_vector(player_id)
+        return {
+            "affection": self.player_affection[player_id],
+            "suspicion": self.player_suspicion[player_id],
+            "fear": self.player_fear[player_id],
+            "trust": self.player_trust[player_id],
+            "hostility": self.player_hostility[player_id],
+            "dependence": self.player_dependence[player_id]
+        }
+    
+    def check_extreme_attitude(self, player_id: str) -> dict[str, Any]:
+        """检查是否有极端态度（用于触发特殊事件）
+        
+        Returns:
+            {"has_extreme": bool, "extreme_type": str, "value": float}
+        """
+        self.initialize_attitude_vector(player_id)
+        
+        vector = self.get_attitude_vector(player_id)
+        
+        # 检查是否有任何维度达到极端值（>= 100 或 <= 0）
+        for dimension, value in vector.items():
+            if value >= 100.0:
+                return {
+                    "has_extreme": True,
+                    "extreme_type": f"{dimension}_max",
+                    "dimension": dimension,
+                    "value": value
+                }
+            elif value <= 0.0 and dimension in ["affection", "trust"]:
+                return {
+                    "has_extreme": True,
+                    "extreme_type": f"{dimension}_min",
+                    "dimension": dimension,
+                    "value": value
+                }
+        
+        return {"has_extreme": False}
+    
+    def check_attitude_contradiction(self, player_id: str) -> dict[str, Any]:
+        """检查态度矛盾（如：高好感度+高怀疑度）
+        
+        Returns:
+            {"has_contradiction": bool, "contradiction_type": str}
+        """
+        self.initialize_attitude_vector(player_id)
+        
+        vector = self.get_attitude_vector(player_id)
+        
+        # 高好感度 + 高怀疑度
+        if vector["affection"] > 70 and vector["suspicion"] > 60:
+            return {
+                "has_contradiction": True,
+                "contradiction_type": "affection_suspicion",
+                "description": "喜欢但怀疑"
+            }
+        
+        # 高信任度 + 高敌意度
+        if vector["trust"] > 70 and vector["hostility"] > 60:
+            return {
+                "has_contradiction": True,
+                "contradiction_type": "trust_hostility",
+                "description": "信任但敌对"
+            }
+        
+        # 高恐惧度 + 高依赖度
+        if vector["fear"] > 70 and vector["dependence"] > 60:
+            return {
+                "has_contradiction": True,
+                "contradiction_type": "fear_dependence",
+                "description": "害怕但依赖"
+            }
+        
+        return {"has_contradiction": False}
     
     def record_interaction(self, player_id: str, interaction_type: str, details: dict[str, Any], game_time: int):
         """记录与玩家的互动"""
@@ -223,6 +355,14 @@ class NPCMemory:
             "player_locations": self.player_locations,
             "player_actions": self.player_actions,
             "player_attitudes": {k: v.value for k, v in self.player_attitudes.items()},
+            # 6维态度向量
+            "player_affection": self.player_affection,
+            "player_suspicion": self.player_suspicion,
+            "player_fear": self.player_fear,
+            "player_trust": self.player_trust,
+            "player_hostility": self.player_hostility,
+            "player_dependence": self.player_dependence,
+            # 旧版兼容
             "player_trust_levels": self.player_trust_levels,
             "player_fear_levels": self.player_fear_levels,
             "player_suspicion_levels": self.player_suspicion_levels,
@@ -242,6 +382,15 @@ class NPCMemory:
         for player_id, attitude_str in data.get("player_attitudes", {}).items():
             memory.player_attitudes[player_id] = NPCAttitude(attitude_str)
         
+        # 6维态度向量
+        memory.player_affection = data.get("player_affection", {})
+        memory.player_suspicion = data.get("player_suspicion", {})
+        memory.player_fear = data.get("player_fear", {})
+        memory.player_trust = data.get("player_trust", {})
+        memory.player_hostility = data.get("player_hostility", {})
+        memory.player_dependence = data.get("player_dependence", {})
+        
+        # 旧版兼容
         memory.player_trust_levels = data.get("player_trust_levels", {})
         memory.player_fear_levels = data.get("player_fear_levels", {})
         memory.player_suspicion_levels = data.get("player_suspicion_levels", {})

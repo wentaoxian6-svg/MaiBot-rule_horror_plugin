@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from .config import LLMConfig, PluginConfig, EnvironmentConfig, SaveConfig, Config, get_config, set_config
 from .config.loader import load_config_from_file, reload_config
-from .llm import LLMClient, LLMResponse, LLMError, PromptBuilder
+from .llm import LLMClient, LLMResponse, LLMError, PromptBuilder, get_default_max_tokens
 from .game import GameStateManager, GameState, SaveManager, Player, GameSession, GameStatus, PlayerStatus
 from .content import AsyncImageGenerator, TextFormatter
 
@@ -23,6 +23,7 @@ __all__ = [
     "LLMResponse",
     "LLMError",
     "PromptBuilder",
+    "get_default_max_tokens",
     # 游戏管理
     "GameStateManager",
     "GameState",

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
-from ..llm.client import LLMClient
+from ...npc_system import NPCMemory, NPCAttitude
+from ..llm.client import LLMClient, get_default_max_tokens
+
 from ..game.models import Player, GameSession
 from .item_manager import ItemManager
 
@@ -18,26 +20,26 @@ class ActionResult:
         description: str,
         sanity_change: int = 0,
         health_change: int = 0,
-        discovered_clues: list[str] = None,
-        triggered_event: Optional[str] = None,
+        discovered_clues: list[str] | None = None,
+        triggered_event: str | None = None,
         is_fatal: bool = False,
-        violated_rule: Optional[str] = None,
+        violated_rule: str | None = None,
     ):
-        self.description = description
-        self.sanity_change = sanity_change
-        self.health_change = health_change
-        self.discovered_clues = discovered_clues or []
-        self.triggered_event = triggered_event
-        self.is_fatal = is_fatal
-        self.violated_rule = violated_rule
+        self.description: str = description
+        self.sanity_change: int = sanity_change
+        self.health_change: int = health_change
+        self.discovered_clues: list[str] = discovered_clues or []
+        self.triggered_event: str | None = triggered_event
+        self.is_fatal: bool = is_fatal
+        self.violated_rule: str | None = violated_rule
 
 
 class ActionProcessor:
     """行动处理器 - 处理玩家行动"""
 
-    def __init__(self, llm_client: Optional[LLMClient] = None):
-        self.llm_client = llm_client or LLMClient()
-        self.item_manager = ItemManager()
+    def __init__(self, llm_client: LLMClient | None = None):
+        self.llm_client: LLMClient = llm_client or LLMClient()
+        self.item_manager: ItemManager = ItemManager()
 
     async def process_action(
         self,
@@ -104,11 +106,20 @@ class ActionProcessor:
                 violated_rule=None,
             )
         
+        # NPC交互：按“是否在场 + 态度/记忆 + 玩家语气/行为”做动态判定
+        npc_result = self._maybe_handle_npc_interaction(action, player, session)
+        if npc_result is not None:
+            return npc_result
+
+
+
+
         # 构建上下文
         context = self._build_context(player, session)
         
         # 调用LLM判定行动结果
         result_data = await self._judge_action(action, context)
+
         
         # 检查是否发现关键物品
         key_item_found = False
@@ -168,8 +179,178 @@ class ActionProcessor:
         
         logger.info(f"行动处理完成: 理智{result.sanity_change:+d}, 体力{result.health_change:+d}, 关键物品={key_item_found}")
         return result
-    
+
+    def _maybe_handle_npc_interaction(self, action: str, player: Player, session: GameSession) -> ActionResult | None:
+        """尝试处理 NPC 交互。
+
+        目标：
+        - 不再“硬编码 NPC 永远回答/永远知道一切”。
+        - NPC 是否回应、回应多少、是否回避，取决于：在场性 + 态度/记忆 + 玩家语气。
+        - 行为结果会推进 `environment_state.known_rule_indices`，形成可追踪的客观变化。
+        """
+        if not action.strip():
+            return None
+
+        talk_keywords = ["询问", "问", "打听", "请教", "搭话", "对话", "交谈", "叫住", "喊", "招呼"]
+        if not any(k in action for k in talk_keywords):
+            return None
+
+        env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
+        npcs = env_state.get("npcs", []) if isinstance(env_state.get("npcs", []), list) else []
+        if not npcs:
+            return None
+
+        player_loc = str(player.location or "")
+
+        def npc_loc(npc: dict[str, Any]) -> str:
+            return str(npc.get("current_location") or npc.get("location") or npc.get("home_location") or "")
+
+        # 选择目标NPC：优先匹配名字，其次取同地点的第一个
+        target: dict[str, Any] | None = None
+        for npc in npcs:
+            if not isinstance(npc, dict):
+                continue
+            name = str(npc.get("name") or "")
+            if name and name in action:
+                target = npc
+                break
+
+        if target is None:
+            same_place = [npc for npc in npcs if isinstance(npc, dict) and npc_loc(npc) == player_loc]
+            target = same_place[0] if same_place else None
+
+        if target is None:
+            # 玩家在聊天但附近没有任何NPC
+            return None
+
+        name = str(target.get("name") or session.npc_guidance.get("npc_name") or "NPC")
+        loc = npc_loc(target) or "附近"
+
+        # 不在场：允许玩家“喊人”，但给出符合直觉的反馈
+        if player_loc and npc_loc(target) and npc_loc(target) != player_loc:
+            return ActionResult(description=f"你朝{loc}的方向叫了叫{name}，回应只有回声。你此刻在{player_loc}，而他不在这里。")
+
+        # 载入/初始化记忆
+        mem = NPCMemory.from_dict(target.get("memory", {}) if isinstance(target.get("memory"), dict) else {})
+        pid = str(player.player_id)
+        mem.initialize_attitude_vector(pid)
+
+        # 语气/方式对态度的即时影响
+        polite = any(k in action for k in ["请", "麻烦", "您好", "劳驾", "拜托", "求"]) 
+        aggressive = any(k in action for k in ["滚", "闭嘴", "威胁", "砸", "杀", "打", "逼", "掐"]) 
+
+        # 计算帮助意愿
+        vec = mem.get_attitude_vector(pid)
+        affection = float(vec.get("affection", 50.0))
+        trust = float(vec.get("trust", 50.0))
+        suspicion = float(vec.get("suspicion", 0.0))
+        hostility = float(vec.get("hostility", 0.0))
+        fear = float(vec.get("fear", 0.0))
+
+        score = (affection + trust) - (suspicion + hostility * 1.2 + fear * 0.8)
+        if polite:
+            score += 8
+        if aggressive:
+            score -= 25
+
+        attitude = mem.get_attitude(pid)
+
+        # 是否在问规则
+        ask_rule_keywords = ["规则", "规矩", "守则", "注意事项", "剩下", "其他", "还有", "没说完", "补充"]
+        asking_rules = any(k in action for k in ask_rule_keywords)
+
+        # 根据分数决定：0=拒绝/回避，1=少量，2=中等，3=较多
+        if hostility >= 60 or score < -20 or attitude in {NPCAttitude.HOSTILE}:
+            help_level = 0
+        elif suspicion >= 70 or score < 10 or attitude in {NPCAttitude.SUSPICIOUS}:
+            help_level = 0
+        elif score < 45:
+            help_level = 1
+        elif score < 85:
+            help_level = 2
+        else:
+            help_level = 3
+
+        # 更新态度向量（记录这次互动带来的变化）
+        if aggressive:
+            mem.update_attitude_vector(pid, hostility_delta=10, trust_delta=-10, suspicion_delta=8)
+        elif polite:
+            mem.update_attitude_vector(pid, trust_delta=5, affection_delta=3, suspicion_delta=-2)
+        else:
+            # 中性互动：轻微降低陌生感
+            mem.update_attitude_vector(pid, trust_delta=1)
+
+        # 记录互动
+        game_time = 0
+        if isinstance(session.time_manager, dict):
+            game_time = int(session.time_manager.get("elapsed_minutes", 0) or 0)
+        mem.record_interaction(pid, "talk", {"action": action, "location": player_loc}, game_time)
+
+        # 写回 NPC 记忆
+        target["memory"] = mem.to_dict()
+
+        if not asking_rules:
+            # 普通搭话：依据态度给一句“像人”的回应（不强行输出规则）
+            if help_level == 0:
+                if attitude == NPCAttitude.HOSTILE:
+                    text = f"你试着向{loc}的{name}搭话。他抬眼看了你一下，目光像钉子：『别挡路。』"
+                elif attitude == NPCAttitude.SUSPICIOUS:
+                    text = f"你试着向{loc}的{name}搭话。他没有立刻回答，只反问：『你问这个干什么？』"
+                else:
+                    text = f"你试着向{loc}的{name}搭话。他像是在听远处的动静，只敷衍地嗯了一声。"
+            else:
+                npc_dialogue = str((session.npc_guidance or {}).get("npc_dialogue") or "").strip()
+                if npc_dialogue:
+                    text = f"你试着向{loc}的{name}搭话。{name}低声道：『{npc_dialogue}』"
+                else:
+                    text = f"你试着向{loc}的{name}搭话。他压低嗓音：『别大声。这里不喜欢热闹。』"
+            return ActionResult(description=text)
+
+        # 询问规则：根据态度决定是否补充“新的已知规则”
+        known: list[int] = []
+        if isinstance(env_state.get("known_rule_indices"), list):
+            known = [int(x) for x in env_state.get("known_rule_indices", []) if isinstance(x, int)]
+
+        all_rules: list[str] = [r.get("text", str(r)) for r in (session.rules or [])]
+        unknown = [i for i in range(len(all_rules)) if i not in set(known)]
+
+        if help_level == 0 or not unknown:
+            if attitude == NPCAttitude.HOSTILE:
+                text = f"你压低声音向{loc}的{name}问起规矩。他的手指停在台面上，冷冷地敲了两下：『我没义务教你。』"
+            elif attitude == NPCAttitude.SUSPICIOUS:
+                text = f"你压低声音向{loc}的{name}问起规矩。他盯着你看了几秒：『你先把刚才那几条记牢。问太多，容易出事。』"
+            else:
+                text = f"你压低声音向{loc}的{name}问起规矩。他摇了摇头：『现在不方便。』"
+            return ActionResult(description=text)
+
+        reveal_count = min(help_level, len(unknown))
+        newly = unknown[:reveal_count]
+        known2 = sorted(set(known + newly))
+        env_state["known_rule_indices"] = known2
+
+        def cn_num(n: int) -> str:
+            table = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+            return table[n - 1] if 1 <= n <= len(table) else str(n)
+
+        parts: list[str] = []
+        for j, idx in enumerate(newly, 1):
+            rule_text = all_rules[idx].strip()
+            if rule_text:
+                parts.append(f"第{cn_num(j)}，{rule_text}")
+
+        prefix = "你压低声音向{loc}的{name}问起剩下的规矩。".format(loc=loc, name=name)
+        if help_level >= 3:
+            mid = "他像是权衡了几秒，终于把话说得更明白："
+        elif help_level == 2:
+            mid = "他不耐烦地叹了口气，还是补了两句："
+        else:
+            mid = "他犹豫了一下，只补了一条："
+
+        text = f"{prefix}{mid}『{'；'.join(parts)}』"
+        return ActionResult(description=text)
+
     def _update_environment_memory(self, action: str, player: Player, session: GameSession) -> None:
+
         """更新环境记忆"""
         # 记录访问的位置
         if player.location:
@@ -270,7 +451,7 @@ class ActionProcessor:
             evaluation_response = await self.llm_client.call(
                 prompt=evaluation_prompt,
                 temperature=0.7,
-                max_tokens=500,
+                max_tokens=get_default_max_tokens(),
             )
             evaluation_data = evaluation_response.parse_json()
         except Exception as e:
@@ -317,7 +498,7 @@ class ActionProcessor:
             mutation_response = await self.llm_client.call(
                 prompt=mutation_prompt,
                 temperature=0.8,
-                max_tokens=600,
+                max_tokens=get_default_max_tokens(),
             )
             mutation_data = mutation_response.parse_json()
             
@@ -351,7 +532,52 @@ class ActionProcessor:
         return {}
 
     def _build_context(self, player: Player, session: GameSession) -> dict[str, Any]:
-        """构建行动判定上下文"""
+        """构建行动判定上下文（尽量保证“图里有什么，行动里也承认有什么”）"""
+
+        # 场景结构只传摘要，避免 prompt 过长
+        ss = session.scene_structure or {}
+        scene_structure_summary = {
+            "building_type": ss.get("building_type", ""),
+            "overall_layout": ss.get("overall_layout", ""),
+            "special_areas": ss.get("special_areas", [])[:8] if isinstance(ss.get("special_areas"), list) else ss.get("special_areas", []),
+        }
+
+        npc_guidance = session.npc_guidance or {}
+        npc_guidance_summary = {
+            "guidance_method": npc_guidance.get("guidance_method", ""),
+            "npc_name": npc_guidance.get("npc_name", ""),
+            "npc_role": npc_guidance.get("npc_role", ""),
+            "npc_attitude": npc_guidance.get("npc_attitude", ""),
+            "npc_behavior": npc_guidance.get("npc_behavior", ""),
+            "npc_dialogue": npc_guidance.get("npc_dialogue", ""),
+        }
+
+        env_state = session.environment_state or {}
+
+        # 优先基于结构化的 env_state['npcs'] 推断“当前在场NPC”，避免出现叙事割裂
+        npcs_present: list[dict[str, Any]] = []
+        if isinstance(env_state, dict):
+            npcs = env_state.get("npcs", [])
+            if isinstance(npcs, list):
+                for npc in npcs:
+                    if not isinstance(npc, dict):
+                        continue
+                    npc_location = str(npc.get("current_location") or npc.get("location") or "")
+                    if npc_location and npc_location == str(player.location or ""):
+                        npcs_present.append(
+                            {
+                                "name": npc.get("name", ""),
+                                "role": npc.get("role", ""),
+                                "attitude": npc.get("attitude", ""),
+                                "location": npc_location,
+                                "danger_level": npc.get("danger_level", ""),
+                            }
+                        )
+
+            # 兼容旧字段：如果没有结构化NPC，就回退到 npcs_present
+            if not npcs_present and isinstance(env_state.get("npcs_present"), list):
+                npcs_present = env_state.get("npcs_present", [])
+
         return {
             "scene_name": session.scene_name,
             "background": session.background,
@@ -360,8 +586,14 @@ class ActionProcessor:
             "player_sanity": player.sanity,
             "player_health": player.health,
             "player_location": player.location,
+            "time": session.time_manager or {},
+            "scene_structure": scene_structure_summary,
+            "npc_guidance": npc_guidance_summary,
+            "npcs_present": npcs_present,
             "recent_actions": [a.get("action", "") for a in player.action_history[-3:]],
         }
+
+
 
     async def _judge_action(self, action: str, context: dict[str, Any]) -> dict[str, Any]:
         """使用LLM判定行动结果（支持理智值动态描述和关键物品系统）"""
@@ -489,7 +721,7 @@ class ActionProcessor:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.8,
-                max_tokens=800,
+                max_tokens=get_default_max_tokens(),
             )
             
             return response.parse_json()

@@ -2,21 +2,20 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
-from typing import Any, Optional
+
 
 try:
     import tomllib  # Python 3.11+
 except ImportError:
-    import tomli as tomllib  # Python 3.10
+    import tomli as tomllib  # Python 3.10  # pyright: ignore[reportMissingImports]
 
 from .settings import Config, LLMConfig, PluginConfig, EnvironmentConfig, SaveConfig, set_config
 
 logger = logging.getLogger(__name__)
 
 
-def load_config_from_file(config_path: Optional[str] = None) -> Config:
+def load_config_from_file(config_path: str | Path | None = None) -> Config:
     """
     从TOML文件加载配置
     
@@ -29,16 +28,16 @@ def load_config_from_file(config_path: Optional[str] = None) -> Config:
     if config_path is None:
         # 默认配置路径
         base_dir = Path(__file__).parent.parent.parent
-        config_path = base_dir / "config.toml"
+        config_file = base_dir / "config.toml"
+    else:
+        config_file = Path(config_path)
     
-    config_path = Path(config_path)
-    
-    if not config_path.exists():
-        logger.warning(f"配置文件不存在: {config_path}，使用默认配置")
+    if not config_file.exists():
+        logger.warning(f"配置文件不存在: {config_file}，使用默认配置")
         return Config()
     
     try:
-        with open(config_path, "rb") as f:
+        with open(config_file, "rb") as f:
             config_data = tomllib.load(f)
         
         logger.info(f"从 {config_path} 加载配置")
@@ -109,7 +108,7 @@ def validate_config(config: Config) -> list[str]:
     return errors
 
 
-def reload_config(config_path: Optional[str] = None) -> Config:
+def reload_config(config_path: str | Path | None = None) -> Config:
     """
     重新加载配置文件
     

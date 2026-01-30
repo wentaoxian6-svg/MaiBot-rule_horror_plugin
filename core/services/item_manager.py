@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Optional, Tuple
+from typing import Any
 
 from ..game.models import Player, GameSession
 
@@ -14,50 +14,50 @@ class ItemManager:
     """物品管理器 - 处理物品的使用、休息和效果"""
 
     # 水类物品关键词
-    WATER_KEYWORDS = [
+    WATER_KEYWORDS: list[str] = [
         "喝水", "喝", "饮用", "水", "矿泉水", "瓶装水", "水杯", "饮水",
         "喝水水", "喝口水", "喝瓶水", "喝饮料", "喝果汁", "喝牛奶",
         "喝可乐", "喝汽水"
     ]
-    
+
     # 食物类物品关键词
-    FOOD_KEYWORDS = [
+    FOOD_KEYWORDS: list[str] = [
         "吃", "食用", "食物", "面包", "饼干", "巧克力", "能量棒", "罐头",
         "水果", "苹果", "香蕉", "糖果", "零食", "饭", "吃点东西", "吃点",
         "吃面包", "吃饼干", "吃巧克力", "吃能量棒", "吃罐头", "吃水果",
         "吃苹果", "吃香蕉", "吃糖果", "吃零食", "吃饭", "吃压缩饼干",
         "吃午餐肉", "吃蛋糕", "吃点心", "吃坚果", "吃香肠", "吃火腿"
     ]
-    
+
     # 休息关键词
-    REST_KEYWORDS = [
+    REST_KEYWORDS: list[str] = [
         "休息", "歇息", "休息一下", "歇一下", "休息会儿", "歇会儿",
         "休息片刻", "歇息片刻", "休息一会", "歇息一会", "坐下休息",
         "坐下歇息", "躺下休息", "躺下歇息", "休息恢复", "歇息恢复",
         "休息恢复体力", "歇息恢复体力"
     ]
-    
+
     # 水类物品名称关键词
-    WATER_ITEM_KEYWORDS = [
+    WATER_ITEM_KEYWORDS: list[str] = [
         "水", "矿泉水", "瓶装水", "水杯", "饮料", "果汁", "牛奶", "可乐", "汽水"
     ]
-    
+
     # 食物类物品名称关键词
-    FOOD_ITEM_KEYWORDS = [
+    FOOD_ITEM_KEYWORDS: list[str] = [
         "食物", "面包", "饼干", "巧克力", "能量棒", "罐头", "水果", "苹果",
         "香蕉", "糖果", "零食", "饭", "压缩饼干", "午餐肉", "蛋糕", "点心",
         "坚果", "香肠", "火腿"
     ]
     
     # 疲劳等级
-    FATIGUE_LEVELS = ["无", "轻微", "中度", "严重", "极度"]
+    FATIGUE_LEVELS: list[str] = ["无", "轻微", "中度", "严重", "极度"]
 
     def check_and_use_item(
         self,
         action: str,
         player: Player,
         session: GameSession,
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> tuple[bool, str | None]:
         """
         检查并使用物品（基于原版plugin_old.py的精确逻辑）
         
@@ -157,7 +157,7 @@ class ItemManager:
         
         return True, f"**使用物品**\n\n{effect_text}\n\n{item_name}已从物品栏中移除。"
     
-    def get_item_by_name(self, player: Player, item_name: str) -> Optional[dict]:
+    def get_item_by_name(self, player: Player, item_name: str) -> dict[str, Any] | None:
         """根据名称获取物品"""
         for item in player.inventory:
             if isinstance(item, dict):
@@ -189,7 +189,7 @@ class ItemManager:
                 return True
         return False
     
-    def get_key_items(self, player: Player) -> list[dict]:
+    def get_key_items(self, player: Player) -> list[dict[str, Any]]:
         """获取玩家的所有关键物品"""
         key_items = []
         for item in player.inventory:
@@ -206,7 +206,7 @@ class ItemManager:
         action: str,
         player: Player,
         session: GameSession,
-    ) -> Tuple[bool, Optional[str], int]:
+    ) -> tuple[bool, str | None, int]:
         """
         检查并执行休息（支持自定义休息时间）
         

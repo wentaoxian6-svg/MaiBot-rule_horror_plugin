@@ -1,13 +1,18 @@
+# pyright: reportImplicitRelativeImport=false
+# pyright: reportIncompatibleMethodOverride=false
+# pyright: reportAssignmentType=false
+# pyright: reportUnannotatedClassAttribute=false
+# pyright: reportMissingTypeArgument=false
+# pyright: reportUnusedImport=false
+# pyright: reportUndefinedVariable=false
+# pyright: reportConstantRedefinition=false
+# pyright: reportIncompatibleVariableOverride=false
+# pyright: reportAttributeAccessIssue=false
+# pyright: reportArgumentType=false
 """
-规则怪谈插件 - 重构版本
+规则怪谈插件
 
-架构改进：
-1. 职责分离：将游戏逻辑、LLM调用、图片生成、存档管理拆分到独立模块
-2. 状态管理：使用 GameStateManager 替代全局变量，支持线程安全
-3. 性能优化：LLMClient 使用连接池，AsyncImageGenerator 使用线程池
-4. 批量保存：SaveManager 支持批量写入，减少磁盘IO
-5. 类型安全：统一使用 Python 3.10+ 类型注解
-6. 错误处理：完善的异常处理和重试机制
+生成规则怪谈并进行互动游戏，支持LLM生成、提示、推理和多种结局判定
 """
 from __future__ import annotations
 
@@ -15,15 +20,16 @@ import asyncio
 import base64
 import logging
 import os
+import re
 from datetime import datetime
-from typing import Any, Optional
+from difflib import SequenceMatcher
+from typing import Any
+
 
 from src.plugin_system import (
     BasePlugin,
     BaseCommand,
     register_plugin,
-    ActionInfo,
-    CommandInfo,
     ConfigField,
     PythonDependency,
 )
@@ -38,8 +44,8 @@ from .core import (
     GameSession,
     GameStatus,
     PlayerStatus,
-    get_config,
     load_config_from_file,
+    get_default_max_tokens,
 )
 
 from .core.services import (
@@ -50,13 +56,17 @@ from .core.services import (
     EndingJudge,
 )
 
-# 导入原有系统（保持不变）
-from .environment_evolution import EnvironmentEvolutionSystem
-from .game_time_manager import GameTimeManager
-from .environment_state import EnvironmentState
-from .rule_mutation_system import RuleMutationSystem
-from .clue_discovery_system import ClueDiscoverySystem
-from .multiplayer_physics_system import MultiplayerPhysicsSystem
+# 导入原有系统（保持兼容性：这些模块在旧版/扩展玩法中用于环境演化、时间推进、规则变异、线索发现、多人协作等）
+# 当前主流程未直接调用它们，但保留导入以便后续功能对接/兼容旧存档结构。
+from .environment_evolution import EnvironmentEvolutionSystem  # noqa: F401
+from .game_time_manager import GameTimeManager  # noqa: F401
+from .environment_state import EnvironmentState  # noqa: F401
+from .rule_mutation_system import RuleMutationSystem  # noqa: F401
+from .clue_discovery_system import ClueDiscoverySystem  # noqa: F401
+from .multiplayer_physics_system import MultiplayerPhysicsSystem  # noqa: F401
+from .npc_system import NPCMemory, NPCAttitude
+
+
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -65,15 +75,14 @@ logger = logging.getLogger(__name__)
 PLUGIN_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 TEMP_IMAGES_DIR = os.path.join(DATA_DIR, "temp_images")
-TEMP_IMAGES_DIR = os.path.join(DATA_DIR, "temp_images")
 
 
 @register_plugin
 class RuleHorrorPlugin(BasePlugin):
-    """规则怪谈插件 - 重构版本"""
+    """规则怪谈插件"""
 
-    plugin_name = "rule_horror"
-    enable_plugin = True
+    plugin_name: str = "rule_horror"
+    enable_plugin: bool = True
     dependencies: list[str] = []
     python_dependencies: list[PythonDependency] = [
         PythonDependency(package_name="aiohttp"),
@@ -82,20 +91,20 @@ class RuleHorrorPlugin(BasePlugin):
         PythonDependency(package_name="pyyaml"),
         PythonDependency(package_name="Pillow"),
     ]
-    config_file_name = "config.toml"
+    config_file_name: str = "config.toml"
 
-    plugin_description = "生成规则怪谈并进行互动游戏（重构版本）。"
-    plugin_version = "2.1.0"
-    plugin_author = "岚影鸿夜"
+    plugin_description: str = "生成规则怪谈并进行互动游戏。"
+    plugin_version: str = "2.1.0"
+    plugin_author: str = "岚影鸿夜"
 
-    config_section_descriptions = {
+    config_section_descriptions: dict[str, str] = {
         "plugin": "插件启用配置",
         "llm": "LLM API 配置",
         "environment": "环境演变系统配置",
         "save": "存档配置",
     }
 
-    config_schema = {
+    config_schema: dict[str, dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(
                 type=bool,
@@ -112,7 +121,13 @@ class RuleHorrorPlugin(BasePlugin):
                 default=30,
                 description="自动保存间隔(秒)"
             ),
+            "enable_natural_language_action": ConfigField(
+                type=bool,
+                default=False,
+                description="是否允许直接发送自然语言触发行动（建议关闭，使用 /rg 行动 更稳定）"
+            ),
         },
+
         "llm": {
             "api_url": ConfigField(
                 type=str,
@@ -126,7 +141,7 @@ class RuleHorrorPlugin(BasePlugin):
             ),
             "model_list": ConfigField(
                 type=list,
-                default=["deepseek-ai/DeepSeek-V3"],
+                default=["gemini-2.5-flash"],
                 description="LLM模型列表"
             ),
             "temperature": ConfigField(
@@ -156,17 +171,18 @@ class RuleHorrorPlugin(BasePlugin):
         },
     }
 
-    def __init__(self, plugin_dir: Optional[str] = None, plugin_config: Optional[dict] = None, **kwargs):
+    def __init__(self, plugin_dir: str | None = None, plugin_config: dict | None = None, **kwargs):
         # 确保plugin_dir被传递给父类
         if plugin_dir is None:
             plugin_dir = PLUGIN_DIR
         super().__init__(plugin_dir=plugin_dir, **kwargs)
         self.plugin_dir = plugin_dir
         self.plugin_config = plugin_config
-        self.state_manager: Optional[GameStateManager] = None
-        self.save_manager: Optional[SaveManager] = None
-        self.llm_client: Optional[LLMClient] = None
-        self.image_generator: Optional[AsyncImageGenerator] = None
+        self.state_manager: GameStateManager | None = None
+        self.save_manager: SaveManager | None = None
+        self.llm_client: LLMClient | None = None
+        self.image_generator: AsyncImageGenerator | None = None
+        self._temp_images_dir: str = os.path.join(plugin_dir, "data", "temp_images")
 
     async def on_load(self) -> None:
         """插件加载时初始化"""
@@ -182,8 +198,11 @@ class RuleHorrorPlugin(BasePlugin):
         # 加载配置文件
         config_path = os.path.join(plugin_dir, "config.toml")
         try:
-            load_config_from_file(config_path)
+            config = load_config_from_file(config_path)
             logger.info("配置文件加载成功")
+            logger.info(f"LLM API URL: {config.llm.api_url}")
+            logger.info(f"LLM 模型列表: {config.llm.model_list}")
+            logger.info(f"LLM API Key: {config.llm.api_key[:20]}..." if config.llm.api_key else "未设置")
         except Exception as e:
             logger.error(f"配置文件加载失败: {e}")
         
@@ -197,7 +216,7 @@ class RuleHorrorPlugin(BasePlugin):
         await self.state_manager.start()
         await self.save_manager.start()
 
-        logger.info("规则怪谈插件已加载（重构版本）")
+        logger.info("规则怪谈插件已加载")
 
     async def on_unload(self) -> None:
         """插件卸载时清理"""
@@ -212,31 +231,43 @@ class RuleHorrorPlugin(BasePlugin):
 
         logger.info("规则怪谈插件已卸载")
 
-    def get_plugin_components(self) -> list:
+    def get_plugin_components(self) -> list[tuple]:
         """注册命令组件"""
         return [
             (RuleHorrorCommand.get_command_info(), RuleHorrorCommand),
         ]
+
 class RuleHorrorCommand(BaseCommand):
     """规则怪谈命令处理器"""
 
-    command_name = "RuleHorrorCommand"
-    command_description = "规则怪谈游戏：生成规则怪谈、加入/离开、提示、推理、行动、结束"
-    command_pattern = r"^/rg\s+(?P<action>\S+)(?:\s+(?P<rest>.+))?"
+    command_name: str = "RuleHorrorCommand"
+    command_description: str = "规则怪谈游戏：生成规则怪谈、加入/离开、提示、推理、行动、结束"
+    command_pattern: str = r"^/rg\s+(?P<action>\S+)(?:\s+(?P<rest>.+))?"
 
-    command_help = (
+    command_help: str = (
         "规则怪谈游戏：\n"
-        "/rg 开始 单人/多人 - 开始新游戏\n"
+        "/rg 开始 单人/多人 - 开始新游戏（单人自动加入）\n"
+        "/rg 强制开始 单人/多人 - 覆盖存档并强制开始\n"
+        "/rg 恢复 - 恢复默认存档\n"
+        "/rg 保存 <存档名称> - 手动保存当前游戏状态\n"
+        "/rg 读取 <存档名称> - 读取指定命名存档\n"
+        "/rg 存档列表 - 查看所有存档\n"
+        "/rg 清理存档 - 清理已结束存档与过期图片缓存\n"
         "/rg 加入 - 加入游戏（多人模式）\n"
         "/rg 离开 - 离开游戏\n"
         "/rg 状态 - 查看游戏状态\n"
+        "/rg 剧情 - 查看剧情导入\n"
         "/rg 规则 - 查看当前规则\n"
+        "/rg 场景 - 查看场景结构\n"
+        "/rg 道具 [道具名称] - 查看道具列表或详情\n"
         "/rg 提示 <规则/线索> - 获取提示\n"
         "/rg 推理 <推理内容> - 记录推理\n"
         "/rg 行动 <行动描述> - 描述行动\n"
+        "/rg 继续 - 通关后继续探索\n"
         "/rg 结束 - 结束游戏\n"
         "/rg 帮助 - 查看帮助"
     )
+
 
     def __init__(self, message, plugin_config=None):
         super().__init__(message, plugin_config)
@@ -244,7 +275,7 @@ class RuleHorrorCommand(BaseCommand):
         self._intent_parser = IntentParser()
         self._feedback_system = ImmersiveFeedback()
         self._action_processor = ActionProcessor()
-        self._game_generator = GameGenerator()
+        self._game_generator: GameGenerator | None = None
         self._ending_judge = EndingJudge()
         
         # 获取临时图片目录
@@ -258,6 +289,12 @@ class RuleHorrorCommand(BaseCommand):
         
         # 确保目录存在
         os.makedirs(self._temp_images_dir, exist_ok=True)
+        
+    def _get_game_generator(self) -> GameGenerator:
+        """获取或创建 GameGenerator（延迟初始化）"""
+        if self._game_generator is None:
+            self._game_generator = GameGenerator()
+        return self._game_generator
 
     def _get_group_id(self) -> str:
         """获取群组/用户ID"""
@@ -279,20 +316,36 @@ class RuleHorrorCommand(BaseCommand):
 
     def _get_user_info(self) -> tuple[str, str]:
         """获取用户信息 (user_id, user_name)"""
+        # 首先尝试从 chat_stream 获取
+        chat_stream = getattr(self, 'chat_stream', None)
+        if chat_stream is None:
+            message_obj = getattr(self, 'message', None)
+            if message_obj:
+                chat_stream = getattr(message_obj, 'chat_stream', None)
+        
+        if chat_stream:
+            user_info = getattr(chat_stream, 'user_info', None)
+            if user_info:
+                user_id = str(getattr(user_info, 'user_id', 'unknown'))
+                user_name = getattr(user_info, 'user_name', f'玩家{user_id}')
+                return user_id, user_name
+        
+        # 回退到从 message 获取
         message_obj = getattr(self, 'message', None)
         if message_obj:
             user_info = getattr(message_obj, 'user_info', None)
             if user_info:
                 user_id = str(getattr(user_info, 'user_id', 'unknown'))
-                user_name = getattr(user_info, 'user_name', '未知玩家')
+                user_name = getattr(user_info, 'user_name', f'玩家{user_id}')
                 return user_id, user_name
+        
         return "unknown", "未知玩家"
 
     async def execute(self) -> tuple[bool, Optional[str], int]:
         """执行命令"""
         matched_groups = self.matched_groups or {}
-        action = matched_groups.get("action", "").strip()
-        rest_input = matched_groups.get("rest", "").strip()
+        action = (matched_groups.get("action") or "").strip()
+        rest_input = (matched_groups.get("rest") or "").strip()
 
         group_id = self._get_group_id()
         user_id, user_name = self._get_user_info()
@@ -305,8 +358,24 @@ class RuleHorrorCommand(BaseCommand):
 
         # 检查是否是命令格式
         if not action:
-            # 不是命令格式，尝试处理自然语言输入
-            return await self._handle_natural_input(group_id, user_id, user_name)
+            # 沉浸式“结束”口令：不必输入 /rg，也不受 enable_natural_language_action 影响
+            raw_text = (getattr(self.message, "text", "") or "").strip()
+            norm = re.sub(r"\s+", "", raw_text)
+            norm = re.sub(r"[，,。.!！？?；;:“”\"'‘’《》【】\[\]（）()\-—…·]", "", norm)
+            if norm in {"结束", "结束游戏"}:
+
+                state_manager = GameStateManager()
+                state = await state_manager.get(group_id)
+                if state and state.session:
+                    return await self._handle_结束(group_id, user_id, user_name, "")
+
+            # 非命令消息：默认不当作行动（避免误触发/剧透）。
+            # 如需开启，可在配置中设置 plugin.enable_natural_language_action=true
+            if self.get_config("plugin.enable_natural_language_action", False):
+                return await self._handle_natural_input(group_id, user_id, user_name)
+            return False, None, 0
+
+
 
         # 路由到对应处理器
         handler = getattr(self, f"_handle_{action}", None)
@@ -341,6 +410,7 @@ class RuleHorrorCommand(BaseCommand):
 
         # 获取用户输入
         user_input = self.message.text
+        logger.info(f"自然语言输入检查: {user_name} - {user_input}")
 
         # 简单的关键词过滤，避免不必要的LLM调用
         action_keywords = [
@@ -348,11 +418,17 @@ class RuleHorrorCommand(BaseCommand):
             "进入", "离开", "触摸", "推", "拉", "按", "转", "看", "听",
             "等待", "躲藏", "逃跑", "攻击", "交谈", "观察", "搜索", "移动",
             "前往", "返回", "调查", "寻找", "翻找", "使用", "吃", "探索",
-            "喝", "睡", "休息", "歇息", "坐", "站"  # 添加物品使用和休息关键词
+            "喝", "睡", "休息", "歇息", "坐", "站", "走", "跑", "爬",
+            "先", "然后", "接着", "再", "去", "来", "到", "在", "找"
         ]
         
         # 如果输入太短或不包含行动关键词，忽略
-        if len(user_input) < 2 or not any(kw in user_input for kw in action_keywords):
+        if len(user_input) < 2:
+            logger.debug(f"自然语言输入太短，忽略: {user_input}")
+            return False, None, 0
+            
+        if not any(kw in user_input for kw in action_keywords):
+            logger.info(f"自然语言输入不包含行动关键词，忽略: {user_input}")
             return False, None, 0
 
         # 判断是否是有效的游戏行动（可选的验证步骤）
@@ -360,6 +436,7 @@ class RuleHorrorCommand(BaseCommand):
         
         try:
             is_valid = await self._intent_parser.is_valid_action(user_input, context)
+            logger.info(f"自然语言输入验证结果: {user_input[:30]}... -> {'有效' if is_valid else '无效'}")
         except Exception as e:
             logger.error(f"判断行动有效性失败: {e}")
             # 即使验证失败，也尝试处理（因为可能是物品使用或休息）
@@ -367,6 +444,7 @@ class RuleHorrorCommand(BaseCommand):
 
         if not is_valid:
             # 不是有效的游戏行动，忽略
+            logger.info(f"自然语言输入被验证为无效，忽略: {user_input[:30]}...")
             return False, None, 0
 
         try:
@@ -460,11 +538,17 @@ class RuleHorrorCommand(BaseCommand):
             
             # 如果玩家死亡
             if result.is_fatal or player.status != PlayerStatus.ALIVE:
-                await self.send_text(
-                    "**💀 你已死亡！**\n\n"
-                    f"违反的规则：{result.violated_rule or '未知'}\n\n"
-                    "游戏结束。使用 `/rg 结束` 查看结局。"
-                )
+                if player.sanity == 0:
+                    # 理智崩坏：保持沉浸，不做 OOC 指令提示
+                    await self.send_text("**……**\n\n你感到某种‘秩序’正在接纳你。")
+
+                else:
+
+                    await self.send_text(
+                        "**💀 你已死亡！**\n\n"
+                        f"违反的规则：{result.violated_rule or '未知'}\n\n"
+                        "游戏结束。使用 `/rg 结束` 查看结局。"
+                    )
             
             # 保存状态
             save_manager = SaveManager()
@@ -476,25 +560,59 @@ class RuleHorrorCommand(BaseCommand):
             logger.error(f"处理自然语言输入失败: {e}", exc_info=True)
             await self.send_text(f"处理行动时出错：{e}")
             return False, "处理失败", 2
+
         finally:
             if state:
                 state.release()
 
     def _build_game_context(self, state, player) -> dict[str, Any]:
-        """构建游戏上下文"""
+        """构建游戏上下文
+
+        注意：这里的 rules 应当是“玩家已知规则”，避免自然语言模块/提示系统拿到全规则导致剧透。
+        """
+        session = state.session
+        env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
+
+        # 归一化规则表
+        all_rules: list[dict[str, Any]] = []
+        for i, r in enumerate(session.rules or []):
+            if isinstance(r, dict):
+                rr = dict(r)
+                rr.setdefault("original_index", i)
+                all_rules.append(rr)
+            else:
+                all_rules.append({"text": str(r), "original_index": i})
+
+        known_indices: list[int] = []
+        if isinstance(env_state.get("known_rule_indices"), list):
+            known_indices = [int(x) for x in env_state.get("known_rule_indices", []) if isinstance(x, int)]
+
+        known_rules: list[dict[str, Any]] = []
+        if known_indices:
+            for idx in sorted(set(known_indices)):
+                if 0 <= idx < len(all_rules):
+                    known_rules.append(all_rules[idx])
+
+        # 合并口述补全规则（不占用 original_index）
+        extra = env_state.get("known_rule_texts_extra", []) if isinstance(env_state, dict) else []
+        if isinstance(extra, list):
+            for t in extra:
+                tt = str(t).strip()
+                if tt:
+                    known_rules.append({"text": tt, "original_index": None, "source": "npc_dialogue"})
+
         return {
-            "scene_name": state.session.scene_name,
-            "background": state.session.background,
-            "rules": state.session.rules,
+            "scene_name": session.scene_name,
+            "background": session.background,
+            "rules": known_rules,
             "player_status": {
                 "sanity": player.sanity,
                 "health": player.health,
                 "location": player.location,
             },
-            "recent_actions": [
-                a.get("action", "") for a in player.action_history[-5:]
-            ],
+            "recent_actions": [a.get("action", "") for a in player.action_history[-5:]],
         }
+
 
     def _build_game_state_dict(self, state, player) -> dict[str, Any]:
         """构建游戏状态字典"""
@@ -552,7 +670,229 @@ class RuleHorrorCommand(BaseCommand):
         # 发送反馈
         await self.send_text(feedback.content)
 
+    async def _extract_rules_from_dialogue(
+        self,
+        npc_dialogue: str,
+        all_rules: list[dict[str, Any]],
+        npc_name: str,
+    ) -> list[dict[str, Any]]:
+        """从NPC对话中提取提到的规则。
+
+        策略：
+        - 先用 LLM 做“索引对齐 + 口吻改写”（便于和后台规则表对齐）。
+        - 再用轻量启发式从口述里补全：
+          - 把“非常像规则的句子”抓出来。
+          - 能匹配到后台规则表的就补齐缺失索引。
+          - 匹配不到但明显是规矩/警告的，也允许作为“口述规则”展示（不占用 original_index）。
+        """
+        if not npc_dialogue:
+            return all_rules
+
+        def _norm(s: str) -> str:
+            s = str(s or "")
+            s = re.sub(r"\s+", "", s)
+            s = re.sub(r"[，,。.!！？?；;:“”\"'‘’《》【】\[\]（）()\-—…·]", "", s)
+            return s
+
+        def _sim(a: str, b: str) -> float:
+            na, nb = _norm(a), _norm(b)
+            if not na or not nb:
+                return 0.0
+            if na in nb or nb in na:
+                return 1.0
+            return float(SequenceMatcher(None, na, nb).ratio())
+
+        def _looks_like_rule(line: str) -> bool:
+            t = str(line or "").strip()
+            if len(t) < 8:
+                return False
+            cues = ["不要", "别", "必须", "务必", "千万", "记住", "如果", "一旦", "立刻", "禁止", "不得", "否则"]
+            return any(c in t for c in cues)
+
+        # 先从口述里提取“候选规则句”
+        raw = str(npc_dialogue)
+        parts = [p.strip() for p in re.split(r"[\n。！？；]+", raw) if p.strip()]
+        candidates = [p for p in parts if _looks_like_rule(p)]
+
+        # 1) LLM对齐提取
+        extracted_rules: list[dict[str, Any]] = []
+        try:
+            if all_rules:
+                llm_client = LLMClient()
+
+                rules_text = "\n".join(
+                    [
+                        f"{i+1}. {rule.get('text', rule.get('content', str(rule)))}"
+                        for i, rule in enumerate(all_rules)
+                    ]
+                )
+
+                system_prompt = f"""你是规则怪谈游戏的规则提取器。你需要分析{npc_name}的对话，找出其中提到的所有规则。
+
+任务：
+1. 仔细阅读NPC的对话内容，找出其中提到的所有注意事项、警告、规则
+2. 对比所有规则列表，找出NPC明确提到、暗示或警告的规则
+3. 对于每条被提到的规则，用NPC对话中的措辞重新表述（保持原意但使用NPC的语言风格）
+4. 返回所有被提到的规则，不要遗漏
+
+注意：
+- 只返回JSON格式
+- 即使NPC的措辞与规则原文不同，只要意思相同就应该提取
+- 要提取所有被提到的规则，不要只提取一条
+- 用NPC对话中的原话或类似风格重新表述规则"""
+
+                user_prompt = f"""NPC对话：
+{npc_dialogue}
+
+所有规则：
+{rules_text}
+
+请分析NPC对话中提到的所有规则，返回JSON格式：
+{{"mentioned_rules": [
+    {{"original_index": 0, "text": "用NPC对话中的措辞重新表述的规则内容"}},
+    {{"original_index": 2, "text": "另一条被提到的规则"}}
+]}}"""
+
+                response = await llm_client.call(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.3,
+                )
+
+                data = response.parse_json()
+                mentioned_rules = data.get("mentioned_rules", [])
+
+                if mentioned_rules and isinstance(mentioned_rules, list):
+                    for rule_data in mentioned_rules:
+                        if isinstance(rule_data, dict):
+                            original_index = rule_data.get("original_index")
+                            text = str(rule_data.get("text", "") or "").strip()
+
+                            if isinstance(original_index, int) and 0 <= original_index < len(all_rules):
+                                if text:
+                                    extracted_rules.append({"text": text, "original_index": original_index})
+                                else:
+                                    base = dict(all_rules[original_index]) if isinstance(all_rules[original_index], dict) else {"text": str(all_rules[original_index])}
+                                    base.setdefault("original_index", original_index)
+                                    extracted_rules.append(base)
+                        elif isinstance(rule_data, int) and 0 <= rule_data < len(all_rules):
+                            base = dict(all_rules[rule_data]) if isinstance(all_rules[rule_data], dict) else {"text": str(all_rules[rule_data])}
+                            base.setdefault("original_index", rule_data)
+                            extracted_rules.append(base)
+        except Exception as e:
+            logger.warning(f"LLM提取规则失败，将使用启发式兜底: {e}")
+
+        # 2) 启发式补全：补齐漏掉的“后台规则表”索引
+        extracted_idx: set[int] = set(
+            [int(r.get("original_index")) for r in extracted_rules if isinstance(r, dict) and isinstance(r.get("original_index"), int)]
+        )
+
+        if all_rules and candidates:
+            for i, rule in enumerate(all_rules):
+                if i in extracted_idx:
+                    continue
+                rule_text = str(rule.get("text", rule.get("content", str(rule))) if isinstance(rule, dict) else str(rule))
+                best = 0.0
+                best_cand = ""
+                for c in candidates:
+                    s = _sim(c, rule_text)
+                    if s > best:
+                        best, best_cand = s, c
+                if best >= 0.55:
+                    extracted_rules.append({"text": best_cand.strip(), "original_index": i})
+                    extracted_idx.add(i)
+
+        # 3) 启发式补全：加入“口述规则”（匹配不到索引但像规矩/警告）
+        #    这能覆盖你图里那种：NPC说了“别过夜/别理会”，但后台规则表暂时没有写进去的情况。
+        if candidates:
+            existing_texts = {_norm(r.get("text", "")) for r in extracted_rules if isinstance(r, dict)}
+            for c in candidates:
+                nc = _norm(c)
+                if not nc or nc in existing_texts:
+                    continue
+
+                # 如果它与某条后台规则相似度很高，但那条规则已经提取了，就跳过（避免重复表述）
+                if all_rules:
+                    best = 0.0
+                    for i, rule in enumerate(all_rules):
+                        rule_text = str(rule.get("text", rule.get("content", str(rule))) if isinstance(rule, dict) else str(rule))
+                        best = max(best, _sim(c, rule_text))
+                    if best >= 0.80:
+                        continue
+
+                extracted_rules.append({"text": c.strip(), "original_index": None, "source": "npc_dialogue"})
+                existing_texts.add(nc)
+
+        if extracted_rules:
+            # 稳定排序：先按索引，其次保持口述规则在后面
+            def _sort_key(x: dict[str, Any]) -> tuple[int, int]:
+                idx = x.get("original_index")
+                return (0, int(idx)) if isinstance(idx, int) else (1, 10**9)
+
+            extracted_rules.sort(key=_sort_key)
+            logger.info(f"从NPC对话中提取到 {len(extracted_rules)} 条规则（含口述补全）")
+            return extracted_rules
+
+        # 如果还是没有提取到：返回所有规则（并补齐 original_index）
+        normalized: list[dict[str, Any]] = []
+        for i, r in enumerate(all_rules):
+            if isinstance(r, dict):
+                rr = dict(r)
+                rr.setdefault("original_index", i)
+                normalized.append(rr)
+            else:
+                normalized.append({"text": str(r), "original_index": i})
+        return normalized
+
+
     # ============== 命令处理器==============
+    
+    async def _generate_entrance_description(
+        self,
+        session: GameSession
+    ) -> str:
+        """生成入场描述
+        
+        Args:
+            session: 游戏会话
+        
+        Returns:
+            入场描述文本
+        """
+        llm_client = LLMClient()
+        system_prompt = """你是规则怪谈游戏的入场描述生成器。你需要生成玩家进入场景时的描述。
+
+入场描述要求：
+1. 描述玩家如何到达这个场景
+2. 描述玩家进入场景时的第一印象
+3. 描述玩家进入时的感受
+4. 描述环境的初始状态
+5. 使用感官细节（视觉、听觉、嗅觉、触觉）
+6. 营造紧张和不安的氛围
+7. 长度：150-200字
+
+返回纯文本，不要JSON格式。"""
+
+        user_prompt = f"""场景名称：{session.scene_name}
+
+背景：{session.background}
+
+玩家身份：{session.player_identity}
+
+请生成入场描述。"""
+
+        try:
+            response = await llm_client.call(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=0.8,
+            )
+
+            return response.clean_content
+        except Exception as e:
+            logger.error(f"生成入场描述失败: {e}")
+            # 返回默认描述
+            return f"你来到了{session.scene_name}。这里的气氛让你感到不安。"
 
     async def _handle_开始(
         self,
@@ -581,7 +921,7 @@ class RuleHorrorCommand(BaseCommand):
 
         try:
             # 生成游戏
-            session = await self._game_generator.generate_game(group_id, game_mode)
+            session = await self._get_game_generator().generate_game(group_id, game_mode)
             session.status = GameStatus.ACTIVE
             
             # 单人模式自动添加玩家
@@ -600,13 +940,13 @@ class RuleHorrorCommand(BaseCommand):
             finally:
                 state.release()
             
-            # 生成剧情导入图片（使用增强版）
+            # 生成图片
             image_generator = AsyncImageGenerator(self._temp_images_dir)
             
             # 获取核心象征符号（如果有）
             core_symbols = getattr(session, 'core_symbols', None)
             
-            # 生成剧情导入图片
+            # ① 生成并发送剧情导入图片
             scene_image = await image_generator.generate_scene_image(
                 scene_name=session.scene_name,
                 background=session.background,
@@ -614,53 +954,230 @@ class RuleHorrorCommand(BaseCommand):
                 core_symbols=core_symbols,
             )
             
-            # 发送剧情导入图片
             with open(scene_image, 'rb') as f:
                 image_bytes = f.read()
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
             await self.send_image(image_base64)
+            await asyncio.sleep(1.0)  # 间隔1秒
             
-            await asyncio.sleep(0.5)
+            # ② 生成入场描述
+            entrance_description = await self._generate_entrance_description(session)
+            # 记录入场描述，供 `/rg 剧情` 重发（尽量避免重复LLM调用）
+            if isinstance(getattr(session, 'environment_state', None), dict):
+                session.environment_state["entrance_description"] = entrance_description
             
-            # 生成场景结构文字长图
-            scene_structure = session.scene_structure or {}
-            building_type = scene_structure.get('building_type', '未知建筑')
-            overall_layout = scene_structure.get('overall_layout', '未知布局')
-            floors = scene_structure.get('floors', [])
-            connections = scene_structure.get('connections', [])
-            special_areas = scene_structure.get('special_areas', [])
+            # ② 生成并发送入场长图（入场+NPC引导）
+            npc_guidance = getattr(session, 'npc_guidance', {}) or {}
+
+            # 初始化 NPC 与“已知规则”状态：让后续行动可以基于态度/记忆动态演化，而不是硬编码结论
+            if isinstance(getattr(session, 'environment_state', None), dict) and npc_guidance:
+                env_state = session.environment_state
+                env_state.setdefault("npcs", [])
+                env_state.setdefault("known_rule_indices", [])
+
+                npc_name = npc_guidance.get("npc_name", "NPC")
+
+                # 推断更像人类的初始NPC位置：优先前台/柜台/收银台等
+                scene_structure = getattr(session, "scene_structure", {}) or {}
+                areas: list[str] = []
+                for fl in scene_structure.get("floors", []) or []:
+                    if isinstance(fl, dict):
+                        areas.extend([str(x) for x in (fl.get("areas") or fl.get("rooms") or [])])
+                areas.extend([str(x) for x in (scene_structure.get("special_areas") or [])])
+
+                prefer = ["柜台", "收银", "前台", "服务台", "接待", "值班室", "大厅", "入口", "门口"]
+                npc_location = None
+                for kw in prefer:
+                    hit = next((a for a in areas if kw in a), None)
+                    if hit:
+                        npc_location = hit
+                        break
+                npc_location = npc_location or (areas[0] if areas else session.scene_name or "起始位置")
+
+                # 只在第一次初始化 NPC 列表（避免覆盖存档/后续演化）
+                if not env_state.get("npcs"):
+                    memory = NPCMemory()
+
+                    # 尝试给“单人模式”的开局玩家一个初始态度向量（多人模式在首次互动时再初始化）
+                    if game_mode == "单人" and user_id:
+                        memory.initialize_attitude_vector(user_id)
+
+                        att = str(npc_guidance.get("npc_attitude", "") or "")
+                        # 轻量映射：让初始“语气/态度”影响信任/怀疑
+                        if any(k in att for k in ["友好", "温和", "热情"]):
+                            memory.update_attitude_vector(user_id, affection_delta=10, trust_delta=10)
+                        elif any(k in att for k in ["警告", "严厉", "冷淡", "不耐烦"]):
+                            memory.update_attitude_vector(user_id, suspicion_delta=15, trust_delta=-5)
+                        elif any(k in att for k in ["敌对", "威胁"]):
+                            memory.update_attitude_vector(user_id, hostility_delta=25, trust_delta=-15)
+
+                    env_state["npcs"] = [
+                        {
+                            "npc_id": "guide_0",
+                            "name": npc_name,
+                            "role": npc_guidance.get("npc_role", ""),
+                            "personality": "",
+                            "danger_level": "低",
+                            "home_location": npc_location,
+                            "current_location": npc_location,
+                            "can_speak": True,
+                            "memory": memory.to_dict(),
+                        }
+                    ]
+
+                # 兼容旧字段：给上下文/旧逻辑一个“在场NPC摘要”
+                env_state["npcs_present"] = [
+                    {
+                        "name": npc_name,
+                        "role": npc_guidance.get("npc_role", ""),
+                        "attitude": npc_guidance.get("npc_attitude", ""),
+                        "location": npc_location,
+                    }
+                ]
+
+
+            if npc_guidance:
+                entrance_long_image = await image_generator.generate_entrance_long_image(
+                    scene_name=session.scene_name,
+                    entrance_description=entrance_description,
+                    npc_guidance=npc_guidance,
+                )
+
+                
+                with open(entrance_long_image, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+                await asyncio.sleep(1.0)  # 间隔1秒
             
-            scene_structure_image = await image_generator.generate_scene_structure_text_image(
-                building_type=building_type,
-                overall_layout=overall_layout,
-                floors=floors,
-                connections=connections,
-                special_areas=special_areas,
-            )
+            # ③ 生成并发送规则图片
+            guidance_method = npc_guidance.get("guidance_method", "rule_carrier") if npc_guidance else "rule_carrier"
+
+            # “规则图”展示的是玩家当前已获得的信息（已知规则），而不是后台完整规则。
+            # 这样 NPC 的态度/是否愿意多说，才能在玩法上形成可感知的动态变化。
+            env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
+
+            def _normalize_all_rules() -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+                for i, r in enumerate(session.rules):
+                    if isinstance(r, dict):
+                        rr = dict(r)
+                        rr.setdefault("original_index", i)
+                        out.append(rr)
+                    else:
+                        out.append({"text": str(r), "original_index": i})
+                return out
+
+            if guidance_method == "natural_language" and npc_guidance:
+                npc_name = npc_guidance.get("npc_name", "NPC")
+                npc_attitude = str(npc_guidance.get("npc_attitude", "警告") or "").strip()
+
+                # 标题可读化：避免出现“警告且疲惫/严厉并慌张”这种像状态描述的拼接
+                def _title_att(att: str) -> str:
+                    att = str(att or "").strip()
+                    for sep in ["且", "并", "但是", "而且", "同时", "，", ",", "。", "；", ";", "、", "/"]:
+                        if sep in att:
+                            att = att.split(sep, 1)[0].strip()
+                    allow = {"警告", "提醒", "告诫", "忠告", "提示", "指示", "劝告"}
+                    return att if att in allow else (att if len(att) <= 4 and att else "提醒")
+
+                rules_title = f"{npc_name}的{_title_att(npc_attitude)}"
+
+                npc_dialogue = str(npc_guidance.get("npc_dialogue", "") or "")
+                display_rules = await self._extract_rules_from_dialogue(npc_dialogue, _normalize_all_rules(), npc_name)
+
+                known = [int(r.get("original_index")) for r in display_rules if isinstance(r, dict) and isinstance(r.get("original_index"), int)]
+                env_state["known_rule_indices"] = sorted(set(known))
+
+                extra_texts = [str(r.get("text", "")).strip() for r in display_rules if isinstance(r, dict) and not isinstance(r.get("original_index"), int)]
+                if extra_texts:
+                    env_state["known_rule_texts_extra"] = sorted(set([x for x in extra_texts if x]))
+                else:
+                    env_state.pop("known_rule_texts_extra", None)
+            else:
+                rules_title = npc_guidance.get("rule_carrier_title", f"{session.scene_name} - 规则") if npc_guidance else f"{session.scene_name} - 规则"
+                display_rules = _normalize_all_rules()
+                env_state["known_rule_indices"] = [int(r.get("original_index", 0)) for r in display_rules]
+                env_state.pop("known_rule_texts_extra", None)
+
             
-            # 发送场景结构文字长图
-            with open(scene_structure_image, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            await self.send_image(image_base64)
-            
-            await asyncio.sleep(0.5)
-            
-            # 生成规则图片
+            # 把“口述补全规则”也合并到规则图展示里（这些可能不在后台规则表，但玩家确实已经听到）
+            if isinstance(env_state, dict) and isinstance(env_state.get("known_rule_texts_extra"), list):
+                extra = [str(x).strip() for x in env_state.get("known_rule_texts_extra", []) if str(x).strip()]
+                if extra:
+                    has_extra_in_display = any(
+                        isinstance(r, dict) and not isinstance(r.get("original_index"), int)
+                        for r in (display_rules or [])
+                    )
+                    if not has_extra_in_display:
+                        display_rules = list(display_rules) + [{"text": t, "original_index": None, "source": "npc_dialogue"} for t in extra]
+
+            # 规则展示去重：同一句话只保留一条（优先保留带 original_index 的版本）
+            def _norm_rule_text(t: str) -> str:
+                t = re.sub(r"\s+", "", str(t or ""))
+                t = re.sub(r"[，,。.!！？?；;:“”\"'‘’《》【】\[\]（）()\-—…·]", "", t)
+                return t
+
+            dedup: list[dict[str, Any]] = []
+            seen: dict[str, int] = {}
+            for r in (display_rules or []):
+                if not isinstance(r, dict):
+                    r = {"text": str(r)}
+                txt = str(r.get("text", r.get("content", str(r))) or "").strip()
+                if not txt:
+                    continue
+                key = _norm_rule_text(txt)
+                if not key:
+                    continue
+                if key in seen:
+                    pi = seen[key]
+                    prev = dedup[pi]
+                    if not isinstance(prev.get("original_index"), int) and isinstance(r.get("original_index"), int):
+                        dedup[pi] = r
+                    continue
+                seen[key] = len(dedup)
+                dedup.append(r)
+            display_rules = dedup
+
             rules_image = await image_generator.generate_rules_image(
-                rules_title=f"{session.scene_name} - 规则",
-                rules=session.rules,
+
+                rules_title=rules_title,
+                rules=display_rules,
                 win_condition=session.win_condition,
                 game_mode=game_mode,
             )
+
+
+
             
-            # 发送规则图片
             with open(rules_image, 'rb') as f:
                 image_bytes = f.read()
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
             await self.send_image(image_base64)
+            await asyncio.sleep(1.0)  # 间隔1秒
             
-            await asyncio.sleep(0.5)
+            # ④ 生成并发送场景结构文字长图
+            scene_structure = getattr(session, 'scene_structure', {}) or {}
+            if scene_structure:
+                building_type = scene_structure.get('building_type', '未知建筑')
+                overall_layout = scene_structure.get('overall_layout', '未知布局')
+                floors = scene_structure.get('floors', [])
+                connections = scene_structure.get('connections', [])
+                special_areas = scene_structure.get('special_areas', [])
+                
+                scene_structure_image = await image_generator.generate_scene_structure_text_image(
+                    building_type=building_type,
+                    overall_layout=overall_layout,
+                    floors=floors,
+                    connections=connections,
+                    special_areas=special_areas,
+                )
+                
+                with open(scene_structure_image, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+                await asyncio.sleep(0.5)  # 最后一张可以稍短
             
             # 发送文字说明
             if game_mode == "多人":
@@ -814,15 +1331,71 @@ class RuleHorrorCommand(BaseCommand):
                 await self.send_text("规则尚未生成。")
                 return False, "无规则", 2
 
-            rules_text = [f"**{session.scene_name} - 规则**", ""]
-            for i, rule in enumerate(session.rules, 1):
-                rule_text = rule.get("text", rule.get("content", str(rule)))
-                rules_text.append(f"{i}. {rule_text}")
+            env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
+
+            # 归一化全规则表（用于索引取值）
+            all_rules: list[dict[str, Any]] = []
+            for i, r in enumerate(session.rules):
+                if isinstance(r, dict):
+                    rr = dict(r)
+                    rr.setdefault("original_index", i)
+                    all_rules.append(rr)
+                else:
+                    all_rules.append({"text": str(r), "original_index": i})
+
+            known_indices: list[int] = []
+            if isinstance(env_state.get("known_rule_indices"), list):
+                known_indices = [int(x) for x in env_state.get("known_rule_indices", []) if isinstance(x, int)]
+
+            known_rules: list[dict[str, Any]] = []
+            for idx in sorted(set(known_indices)):
+                if 0 <= idx < len(all_rules):
+                    known_rules.append(all_rules[idx])
+
+            extra_texts: list[str] = []
+            if isinstance(env_state.get("known_rule_texts_extra"), list):
+                extra_texts = [str(x).strip() for x in env_state.get("known_rule_texts_extra", []) if str(x).strip()]
+
+            if not known_rules and not extra_texts:
+                await self.send_text(
+                    f"**{session.scene_name} - 已知规则**\n\n"
+                    "你目前还没有获得任何明确规则。\n"
+                    "建议：先查看 `/rg 剧情` 的入场信息，或使用 `/rg 行动` 进行探索/礼貌询问。\n\n"
+                    f"**通关条件**：{session.win_condition}"
+                )
+                return True, "规则已显示", 2
+
+            rules_text = [f"**{session.scene_name} - 已知规则**", ""]
+
+            def _norm_rule_text(t: str) -> str:
+                t = re.sub(r"\s+", "", str(t or ""))
+                t = re.sub(r"[，,。.!！？?；;:“”\"'‘’《》【】\[\]（）()\-—…·]", "", t)
+                return t
+
+            seen_text: set[str] = set()
+
+            idx_num = 1
+            for rule in known_rules:
+                text = str(rule.get("text", rule.get("content", str(rule))) if isinstance(rule, dict) else str(rule)).strip()
+                key = _norm_rule_text(text)
+                if text and key and key not in seen_text:
+                    rules_text.append(f"{idx_num}. {text}")
+                    idx_num += 1
+                    seen_text.add(key)
+
+            for t in extra_texts:
+                key = _norm_rule_text(t)
+                if t and key and key not in seen_text:
+                    rules_text.append(f"{idx_num}. {t}")
+                    idx_num += 1
+                    seen_text.add(key)
+
 
             rules_text.extend(["", f"**通关条件**：{session.win_condition}"])
 
             await self.send_text("\n".join(rules_text))
             return True, "规则已显示", 2
+
         finally:
             if state:
                 state.release()
@@ -854,42 +1427,41 @@ class RuleHorrorCommand(BaseCommand):
             # 减少提示次数
             session.hint_count -= 1
 
-            # 调用 LLM 生成提示
-            llm_client = LLMClient()
-            
-            system_prompt = """你是规则怪谈游戏的提示系统。你需要给玩家提供有用但不直接揭示答案的提示。
+            # 生成“非剧透”提示：只基于已知信息给方向，不注入隐藏真相/全规则表。
+            env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
 
-提示原则：
-1. 不要直接说出答案
-2. 给出方向性的引导
-3. 提示规则之间的矛盾
-4. 暗示需要注意的细节
+            known_indices: list[int] = []
+            if isinstance(env_state.get("known_rule_indices"), list):
+                known_indices = [int(x) for x in env_state.get("known_rule_indices", []) if isinstance(x, int)]
 
-返回JSON格式：
-{
-    "hint": "提示内容（100-200字）"
-}"""
+            total_rules = len(session.rules or [])
+            have_unknown = bool(total_rules and len(set(known_indices)) < total_rules)
 
-            user_prompt = f"""场景：{session.scene_name}
+            want_clue = "线索" in str(hint_type)
+            if want_clue:
+                hint = (
+                    "先别做高风险动作。用低风险的方式‘确认事实’：\n"
+                    "- 观察/检查可写字的东西（告示、标签、票据、墙面痕迹）\n"
+                    "- 询问在场NPC‘这里有什么禁忌’，注意对方态度变化\n"
+                    "- 用 `/rg 道具` 复盘你拿到的物品是否暗示线索"
+                )
+            else:
+                npc_name = "NPC"
+                if isinstance(getattr(session, "npc_guidance", None), dict):
+                    npc_name = str(session.npc_guidance.get("npc_name", "NPC") or "NPC")
 
-规则：
-{chr(10).join(f"{i+1}. {r.get('text', str(r))}" for i, r in enumerate(session.rules))}
+                if have_unknown:
+                    hint = (
+                        "你直觉觉得‘规矩’还没说完。\n"
+                        f"尝试在同一地点礼貌地询问{npc_name}，或寻找规则载体（告示/收据/标签）。\n"
+                        "注意：你越礼貌、越像在确认而非逼问，越可能得到更多信息。"
+                    )
+                else:
+                    hint = (
+                        "把你已知的规则逐条对照现场：哪些能被立刻验证？\n"
+                        "用最小代价做试探（例如观察、短暂停留、轻触），再决定是否行动。"
+                    )
 
-隐藏真相：{session.hidden_truth}
-
-玩家请求：{hint_type}提示
-
-请生成提示。"""
-
-            response = await llm_client.call(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                temperature=0.7,
-                max_tokens=400,
-            )
-            
-            result = response.parse_json()
-            hint = result.get("hint", "仔细观察规则之间的矛盾..")
             
             # 保存状态
             save_manager = SaveManager()
@@ -1063,11 +1635,16 @@ class RuleHorrorCommand(BaseCommand):
             
             # 如果玩家死亡
             if result.is_fatal or player.status != PlayerStatus.ALIVE:
-                await self.send_text(
-                    "**💀 你已死亡！**\n\n"
-                    f"违反的规则：{result.violated_rule or '未知'}\n\n"
-                    "游戏结束。使用 `/rg 结束` 查看结局。"
-                )
+                if player.sanity == 0:
+                    await self.send_text("**……**\n\n你感到某种‘秩序’正在接纳你。")
+
+                else:
+
+                    await self.send_text(
+                        "**💀 你已死亡！**\n\n"
+                        f"违反的规则：{result.violated_rule or '未知'}\n\n"
+                        "游戏结束。使用 `/rg 结束` 查看结局。"
+                    )
             
             # 保存状态
             save_manager = SaveManager()
@@ -1079,6 +1656,7 @@ class RuleHorrorCommand(BaseCommand):
             logger.error(f"处理行动失败: {e}", exc_info=True)
             await self.send_text(f"处理行动时出错：{e}")
             return False, "处理失败", 2
+
         finally:
             if state:
                 state.release()
@@ -1114,10 +1692,12 @@ class RuleHorrorCommand(BaseCommand):
                 player=player,
             )
             
-            # 更新会话状?            session.status = GameStatus.ENDED
+            # 更新会话状态
+            session.status = GameStatus.ENDED
             session.ended_at = datetime.now()
             
-            # 生成结局图片（使用增强版?            image_generator = AsyncImageGenerator(self._temp_images_dir)
+            # 生成结局图片
+            image_generator = AsyncImageGenerator(self._temp_images_dir)
             ending_image = await image_generator.generate_ending_image(
                 ending_title=ending.title,
                 ending_description=ending.description,
@@ -1133,7 +1713,8 @@ class RuleHorrorCommand(BaseCommand):
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
             await self.send_image(image_base64)
             
-            # 清理状?            await state_manager.remove(group_id)
+            # 清理状态
+            await state_manager.remove(group_id)
             
             # 删除存档
             save_manager = SaveManager()
@@ -1158,30 +1739,167 @@ class RuleHorrorCommand(BaseCommand):
         rest_input: str,
     ) -> tuple[bool, Optional[str], int]:
         """处理帮助命令"""
+        _ = rest_input
         help_text = (
-            "**规则怪谈游戏帮助（重构版本）**\n\n"
+            "**规则怪谈游戏帮助**\n\n"
             "**命令列表**\n"
-            "- `/rg 开始 单人/多人` - 开始新游戏\n"
+            "- `/rg 开始 单人/多人` - 开始新游戏（单人自动加入，多人需手动加入）\n"
+            "- `/rg 强制开始 单人/多人` - 覆盖存档并强制开始\n"
+            "- `/rg 恢复` - 恢复默认存档\n"
+            "- `/rg 保存 <存档名称>` - 手动保存当前游戏状态\n"
+            "- `/rg 读取 <存档名称>` - 读取指定命名存档\n"
+            "- `/rg 存档列表` - 查看当前群组/用户的存档\n"
+            "- `/rg 清理存档` - 清理已结束的存档与过期图片缓存\n"
             "- `/rg 加入` - 加入当前游戏（多人模式）\n"
             "- `/rg 离开` - 离开当前游戏\n"
             "- `/rg 状态` - 查看游戏状态和玩家信息\n"
+            "- `/rg 剧情` - 查看剧情导入（重新发送入场/导入图）\n"
             "- `/rg 规则` - 查看当前规则\n"
-            "- `/rg 提示 <规则/线索>` - 获取提示（剩余3次）\n"
+            "- `/rg 场景` - 查看场景结构\n"
+            "- `/rg 道具 [道具名称]` - 查看道具列表或道具详情\n"
+            "- `/rg 提示 <规则/线索>` - 获取提示（默认3次）\n"
             "- `/rg 推理 <推理内容>` - 记录你的推理\n"
             "- `/rg 行动 <行动描述>` - 描述你的行动\n"
-            "- `/rg 结束` - 结束游戏\n"
+            "- `/rg 继续` - 达成通关后继续探索（追求完美结局）\n"
+            "- `/rg 结束` - 结束游戏并判定结局\n"
             "- `/rg 帮助` - 查看帮助\n\n"
-            "**重构改进**\n"
-            "- 使用连接池优化LLM 调用性能\n"
-            "- 使用线程池优化图片生成\n"
-            "- 批量保存减少磁盘IO\n"
-            "- 线程安全的状态管理\n"
-            "- 完善的错误处理和重试机制"
+            "**提示**\n"
+            "- 为避免误触发与剧透，建议用 `/rg 行动 <行动描述>` 推进游戏。"
+
         )
         await self.send_text(help_text)
         return True, "帮助已发送", 2
 
+    async def _handle_剧情(
+        self,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        rest_input: str,
+    ) -> tuple[bool, Optional[str], int]:
+        """处理查看剧情导入命令（重发导入/入场信息）"""
+        _ = rest_input
+        _ = user_name
+
+        state_manager = GameStateManager()
+        state = await state_manager.get(group_id)
+
+        if not state or not state.session:
+            await self.send_text("当前没有正在进行的游戏。")
+            return False, "无游戏", 2
+
+        try:
+            session = state.session
+            image_generator = AsyncImageGenerator(self._temp_images_dir)
+
+            # ① 剧情导入图（缓存）
+            core_symbols = getattr(session, 'core_symbols', None)
+            scene_image = await image_generator.generate_scene_image(
+                scene_name=session.scene_name,
+                background=session.background,
+                arrival_reason=session.player_identity,
+                core_symbols=core_symbols,
+                use_cache=True,
+            )
+            with open(scene_image, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('ascii')
+            await self.send_image(image_base64)
+
+            # ② 入场长图（如果可用）
+            entrance_description = None
+            if session.environment_state and isinstance(session.environment_state, dict):
+                entrance_description = session.environment_state.get("entrance_description")
+
+            npc_guidance = getattr(session, 'npc_guidance', {}) or {}
+            if entrance_description and npc_guidance:
+                entrance_long_image = await image_generator.generate_entrance_long_image(
+                    scene_name=session.scene_name,
+                    entrance_description=str(entrance_description),
+                    npc_guidance=npc_guidance,
+                    use_cache=True,
+                )
+                with open(entrance_long_image, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+
+            return True, "剧情已显示", 2
+
+        except Exception as e:
+            logger.error(f"显示剧情失败: {e}", exc_info=True)
+            await self.send_text(f"显示剧情时出错：{e}")
+            return False, "显示失败", 2
+
+        finally:
+            if state:
+                state.release()
+
+    async def _handle_道具(
+        self,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        rest_input: str,
+    ) -> tuple[bool, Optional[str], int]:
+        """处理查看道具命令（物品栏别名，支持详情）"""
+        return await self._handle_物品栏(group_id, user_id, user_name, rest_input)
+
+    async def _handle_清理存档(
+        self,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        rest_input: str,
+    ) -> tuple[bool, Optional[str], int]:
+        """处理清理存档命令：清理已结束存档 + 过期图片缓存"""
+        _ = user_id
+        _ = user_name
+        _ = rest_input
+
+        save_manager = SaveManager()
+        try:
+            cleaned_saves = await save_manager.cleanup_ended_saves(group_id)
+        except Exception as e:
+            logger.error(f"清理已结束存档失败: {e}", exc_info=True)
+            cleaned_saves = 0
+
+        # 清理图片缓存：只删除过期文件，避免误删仍在使用的缓存
+        cleaned_images = 0
+        try:
+            import time
+            from pathlib import Path
+
+            now = time.time()
+            max_age_days = 30
+            cutoff = now - max_age_days * 86400
+
+            temp_dir = Path(self._temp_images_dir)
+            if temp_dir.exists():
+                for p in temp_dir.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    # 保留缓存索引
+                    if p.name == "cache_index.json":
+                        continue
+                    try:
+                        if p.stat().st_mtime < cutoff:
+                            p.unlink()
+                            cleaned_images += 1
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"清理图片缓存失败: {e}", exc_info=True)
+
+        await self.send_text(
+            "**清理完成**\n\n"
+            f"- 已清理已结束存档：{cleaned_saves} 个\n"
+            f"- 已清理过期图片缓存：{cleaned_images} 个（>30天）"
+        )
+        return True, "清理完成", 2
+
     async def _handle_场景(
+
         self,
         group_id: str,
         user_id: str,
@@ -1198,7 +1916,7 @@ class RuleHorrorCommand(BaseCommand):
 
         try:
             session = state.session
-            scene_structure = session.scene_structure or {}
+            scene_structure = getattr(session, 'scene_structure', {}) or {}
             
             if not scene_structure:
                 await self.send_text("场景结构尚未生成。")
@@ -1217,11 +1935,13 @@ class RuleHorrorCommand(BaseCommand):
             if floors:
                 scene_text.append("**楼层布局**:")
                 for floor in floors:
-                    floor_name = floor.get('name', '未知楼层')
-                    rooms = floor.get('rooms', [])
+                    # 兼容旧结构：{'floor': '一层', 'areas': [...]}
+                    floor_name = floor.get('floor') or floor.get('name') or '未知楼层'
+                    rooms = floor.get('areas') or floor.get('rooms') or []
                     scene_text.append(f"\n{floor_name}:")
                     for room in rooms:
                         scene_text.append(f"  - {room}")
+
             
             connections = scene_structure.get('connections', [])
             if connections:
@@ -1264,28 +1984,82 @@ class RuleHorrorCommand(BaseCommand):
                 return False, "不在游戏中", 2
 
             inventory = getattr(player, 'inventory', [])
-            
+
             if not inventory:
                 await self.send_text("**物品栏**\n\n你的背包是空的。")
                 return True, "物品栏已显示", 2
-            
-            # 构建物品栏文?            items_text = [f"**{user_name} 的物品栏**\n"]
-            
+
+            query = (rest_input or "").strip()
+            if query:
+                # 详情模式：根据名称模糊匹配
+                matches: list[dict[str, Any]] = []
+                for it in inventory:
+                    if not isinstance(it, dict):
+                        continue
+                    name = str(it.get('name', ''))
+                    if query in name:
+                        matches.append(it)
+
+                if not matches:
+                    await self.send_text(f"未找到道具：{query}\n\n你可以使用 `/rg 道具` 查看道具列表。")
+                    return False, "未找到道具", 2
+
+                if len(matches) > 3:
+                    await self.send_text(f"匹配到多个道具（{len(matches)}个），请提供更精确的名称。")
+                    return False, "匹配过多", 2
+
+                lines = [f"**道具详情**\n"]
+                for it in matches:
+                    name = it.get('name', '未知')
+                    item_type = it.get('type', '物品')
+                    desc = it.get('description', '')
+                    hint = it.get('observation_hint', '')
+                    is_key = it.get('is_key_item', False)
+
+                    lines.append(f"- 名称：{name}{'（关键物品）' if is_key else ''}")
+                    lines.append(f"  类型：{item_type}")
+                    if desc:
+                        lines.append(f"  描述：{desc}")
+                    if hint:
+                        lines.append(f"  观察提示：{hint}")
+                    lines.append("")
+
+                await self.send_text("\n".join(lines).strip())
+                return True, "道具详情已显示", 2
+
+            # 列表模式：优先发送道具清单图片（失败则降级文本）
+            try:
+                image_generator = AsyncImageGenerator(self._temp_images_dir)
+                inventory_image = await image_generator.generate_inventory_image(
+                    inventory_data=inventory,
+                    player_name=user_name,
+                    use_cache=True,
+                )
+                with open(inventory_image, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+            except Exception as e:
+                logger.debug(f"生成或发送道具图片失败，回退到文本: {e}")
+
+            items_text = [f"**{user_name} 的物品栏**\n"]
             for i, item in enumerate(inventory, 1):
                 if isinstance(item, dict):
                     item_name = item.get('name', '未知物品')
                     item_desc = item.get('description', '')
                     is_key = item.get('is_key_item', False)
-                    
+
                     key_marker = " 🔑" if is_key else ""
                     items_text.append(f"{i}. {item_name}{key_marker}")
                     if item_desc:
                         items_text.append(f"   {item_desc}")
                 else:
                     items_text.append(f"{i}. {item}")
-            
+
+            items_text.append("\n使用 `/rg 道具 <名称>` 查看详情。")
             await self.send_text("\n".join(items_text))
             return True, "物品栏已显示", 2
+
             
         finally:
             if state:
@@ -1345,7 +2119,8 @@ class RuleHorrorCommand(BaseCommand):
             await self.send_text("请指定游戏模式：`/rg 强制开始 单人` 或 `/rg 强制开始 多人`")
             return False, "缺少游戏模式", 2
 
-        # 清理现有状?        state_manager = GameStateManager()
+        # 清理现有状态
+        state_manager = GameStateManager()
         await state_manager.remove(group_id)
         
         # 删除现有存档
@@ -1356,9 +2131,9 @@ class RuleHorrorCommand(BaseCommand):
 
         try:
             # 生成游戏
-            session = await self._game_generator.generate_game(group_id, game_mode)
+            session = await self._get_game_generator().generate_game(group_id, game_mode)
             session.status = GameStatus.ACTIVE
-            
+
             # 单人模式自动添加玩家
             if game_mode == "单人":
                 player = Player(player_id=user_id, name=user_name)
@@ -1374,67 +2149,239 @@ class RuleHorrorCommand(BaseCommand):
             finally:
                 state.release()
             
-            # 生成剧情导入图片（使用增强版）
+            # 生成图片（强制开始不使用缓存）
             image_generator = AsyncImageGenerator(self._temp_images_dir)
             
             # 获取核心象征符号（如果有）
             core_symbols = getattr(session, 'core_symbols', None)
             
-            # 生成剧情导入图片
+            # ① 生成并发送剧情导入图片
             scene_image = await image_generator.generate_scene_image(
                 scene_name=session.scene_name,
                 background=session.background,
                 arrival_reason=session.player_identity,
                 core_symbols=core_symbols,
+                use_cache=False,  # 强制开始不使用缓存
             )
             
-            # 发送剧情导入图片
             with open(scene_image, 'rb') as f:
                 image_bytes = f.read()
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
             await self.send_image(image_base64)
+            await asyncio.sleep(1.0)  # 间隔1秒
             
-            await asyncio.sleep(0.5)
+            # ② 生成入场描述
+            entrance_description = await self._generate_entrance_description(session)
+            # 记录入场描述，供 `/rg 剧情` 重发（尽量避免重复LLM调用）
+            if isinstance(getattr(session, 'environment_state', None), dict):
+                session.environment_state["entrance_description"] = entrance_description
             
-            # 生成场景结构文字长图
-            scene_structure = session.scene_structure or {}
-            building_type = scene_structure.get('building_type', '未知建筑')
-            overall_layout = scene_structure.get('overall_layout', '未知布局')
-            floors = scene_structure.get('floors', [])
-            connections = scene_structure.get('connections', [])
-            special_areas = scene_structure.get('special_areas', [])
+            # ② 生成并发送入场长图（入场+NPC引导）
+            npc_guidance = getattr(session, 'npc_guidance', {}) or {}
+
+            # 初始化 NPC 与“已知规则”状态：让后续行动可以基于态度/记忆动态演化，而不是硬编码结论
+            if isinstance(getattr(session, 'environment_state', None), dict) and npc_guidance:
+                env_state = session.environment_state
+                env_state.setdefault("npcs", [])
+                env_state.setdefault("known_rule_indices", [])
+
+                npc_name = npc_guidance.get("npc_name", "NPC")
+
+                scene_structure = getattr(session, "scene_structure", {}) or {}
+                areas: list[str] = []
+                for fl in scene_structure.get("floors", []) or []:
+                    if isinstance(fl, dict):
+                        areas.extend([str(x) for x in (fl.get("areas") or fl.get("rooms") or [])])
+                areas.extend([str(x) for x in (scene_structure.get("special_areas") or [])])
+
+                prefer = ["柜台", "收银", "前台", "服务台", "接待", "值班室", "大厅", "入口", "门口"]
+                npc_location = None
+                for kw in prefer:
+                    hit = next((a for a in areas if kw in a), None)
+                    if hit:
+                        npc_location = hit
+                        break
+                npc_location = npc_location or (areas[0] if areas else session.scene_name or "起始位置")
+
+                if not env_state.get("npcs"):
+                    memory = NPCMemory()
+                    if game_mode == "单人" and user_id:
+                        memory.initialize_attitude_vector(user_id)
+
+                        att = str(npc_guidance.get("npc_attitude", "") or "")
+                        if any(k in att for k in ["友好", "温和", "热情"]):
+                            memory.update_attitude_vector(user_id, affection_delta=10, trust_delta=10)
+                        elif any(k in att for k in ["警告", "严厉", "冷淡", "不耐烦"]):
+                            memory.update_attitude_vector(user_id, suspicion_delta=15, trust_delta=-5)
+                        elif any(k in att for k in ["敌对", "威胁"]):
+                            memory.update_attitude_vector(user_id, hostility_delta=25, trust_delta=-15)
+
+                    env_state["npcs"] = [
+                        {
+                            "npc_id": "guide_0",
+                            "name": npc_name,
+                            "role": npc_guidance.get("npc_role", ""),
+                            "personality": "",
+                            "danger_level": "低",
+                            "home_location": npc_location,
+                            "current_location": npc_location,
+                            "can_speak": True,
+                            "memory": memory.to_dict(),
+                        }
+                    ]
+
+                env_state["npcs_present"] = [
+                    {
+                        "name": npc_name,
+                        "role": npc_guidance.get("npc_role", ""),
+                        "attitude": npc_guidance.get("npc_attitude", ""),
+                        "location": npc_location,
+                    }
+                ]
+
+
+            if npc_guidance:
+                entrance_long_image = await image_generator.generate_entrance_long_image(
+                    scene_name=session.scene_name,
+                    entrance_description=entrance_description,
+                    npc_guidance=npc_guidance,
+                    use_cache=False,  # 强制开始不使用缓存
+                )
+
+
+                
+                with open(entrance_long_image, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+                await asyncio.sleep(1.0)  # 间隔1秒
             
-            scene_structure_image = await image_generator.generate_scene_structure_text_image(
-                building_type=building_type,
-                overall_layout=overall_layout,
-                floors=floors,
-                connections=connections,
-                special_areas=special_areas,
-            )
+            # ③ 生成并发送规则图片
+            guidance_method = npc_guidance.get("guidance_method", "rule_carrier") if npc_guidance else "rule_carrier"
+
+            # “规则图”展示的是玩家当前已获得的信息（已知规则），而不是后台完整规则。
+            env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
+
+            def _normalize_all_rules() -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+                for i, r in enumerate(session.rules):
+                    if isinstance(r, dict):
+                        rr = dict(r)
+                        rr.setdefault("original_index", i)
+                        out.append(rr)
+                    else:
+                        out.append({"text": str(r), "original_index": i})
+                return out
+
+            if guidance_method == "natural_language" and npc_guidance:
+                npc_name = npc_guidance.get("npc_name", "NPC")
+                npc_attitude = str(npc_guidance.get("npc_attitude", "警告") or "").strip()
+
+                def _title_att(att: str) -> str:
+                    att = str(att or "").strip()
+                    for sep in ["且", "并", "但是", "而且", "同时", "，", ",", "。", "；", ";", "、", "/"]:
+                        if sep in att:
+                            att = att.split(sep, 1)[0].strip()
+                    allow = {"警告", "提醒", "告诫", "忠告", "提示", "指示", "劝告"}
+                    return att if att in allow else (att if len(att) <= 4 and att else "提醒")
+
+                rules_title = f"{npc_name}的{_title_att(npc_attitude)}"
+
+                npc_dialogue = str(npc_guidance.get("npc_dialogue", "") or "")
+                display_rules = await self._extract_rules_from_dialogue(npc_dialogue, _normalize_all_rules(), npc_name)
+
+                known = [int(r.get("original_index")) for r in display_rules if isinstance(r, dict) and isinstance(r.get("original_index"), int)]
+                env_state["known_rule_indices"] = sorted(set(known))
+
+                extra_texts = [str(r.get("text", "")).strip() for r in display_rules if isinstance(r, dict) and not isinstance(r.get("original_index"), int)]
+                if extra_texts:
+                    env_state["known_rule_texts_extra"] = sorted(set([x for x in extra_texts if x]))
+                else:
+                    env_state.pop("known_rule_texts_extra", None)
+            else:
+                rules_title = npc_guidance.get("rule_carrier_title", f"{session.scene_name} - 规则") if npc_guidance else f"{session.scene_name} - 规则"
+                display_rules = _normalize_all_rules()
+                env_state["known_rule_indices"] = [int(r.get("original_index", 0)) for r in display_rules]
+                env_state.pop("known_rule_texts_extra", None)
+
             
-            # 发送场景结构文字长图
-            with open(scene_structure_image, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            await self.send_image(image_base64)
-            
-            await asyncio.sleep(0.5)
-            
-            # 生成规则图片
+            if isinstance(env_state, dict) and isinstance(env_state.get("known_rule_texts_extra"), list):
+                extra = [str(x).strip() for x in env_state.get("known_rule_texts_extra", []) if str(x).strip()]
+                if extra:
+                    has_extra_in_display = any(
+                        isinstance(r, dict) and not isinstance(r.get("original_index"), int)
+                        for r in (display_rules or [])
+                    )
+                    if not has_extra_in_display:
+                        display_rules = list(display_rules) + [{"text": t, "original_index": None, "source": "npc_dialogue"} for t in extra]
+
+            def _norm_rule_text(t: str) -> str:
+                t = re.sub(r"\s+", "", str(t or ""))
+                t = re.sub(r"[，,。.!！？?；;:“”\"'‘’《》【】\[\]（）()\-—…·]", "", t)
+                return t
+
+            dedup: list[dict[str, Any]] = []
+            seen: dict[str, int] = {}
+            for r in (display_rules or []):
+                if not isinstance(r, dict):
+                    r = {"text": str(r)}
+                txt = str(r.get("text", r.get("content", str(r))) or "").strip()
+                if not txt:
+                    continue
+                key = _norm_rule_text(txt)
+                if not key:
+                    continue
+                if key in seen:
+                    pi = seen[key]
+                    prev = dedup[pi]
+                    if not isinstance(prev.get("original_index"), int) and isinstance(r.get("original_index"), int):
+                        dedup[pi] = r
+                    continue
+                seen[key] = len(dedup)
+                dedup.append(r)
+            display_rules = dedup
+
             rules_image = await image_generator.generate_rules_image(
-                rules_title=f"{session.scene_name} - 规则",
-                rules=session.rules,
+
+                rules_title=rules_title,
+                rules=display_rules,
                 win_condition=session.win_condition,
                 game_mode=game_mode,
+                use_cache=False,  # 强制开始不使用缓存
             )
+
+
+
             
-            # 发送规则图片
             with open(rules_image, 'rb') as f:
                 image_bytes = f.read()
             image_base64 = base64.b64encode(image_bytes).decode('ascii')
             await self.send_image(image_base64)
+            await asyncio.sleep(1.0)  # 间隔1秒
             
-            await asyncio.sleep(0.5)
+            # ④ 生成并发送场景结构文字长图
+            scene_structure = getattr(session, 'scene_structure', {}) or {}
+            if scene_structure:
+                building_type = scene_structure.get('building_type', '未知建筑')
+                overall_layout = scene_structure.get('overall_layout', '未知布局')
+                floors = scene_structure.get('floors', [])
+                connections = scene_structure.get('connections', [])
+                special_areas = scene_structure.get('special_areas', [])
+                
+                scene_structure_image = await image_generator.generate_scene_structure_text_image(
+                    building_type=building_type,
+                    overall_layout=overall_layout,
+                    floors=floors,
+                    connections=connections,
+                    special_areas=special_areas,
+                    use_cache=False,  # 强制开始不使用缓存
+                )
+                
+                with open(scene_structure_image, 'rb') as f:
+                    image_bytes = f.read()
+                image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                await self.send_image(image_base64)
+                await asyncio.sleep(0.5)  # 最后一张可以稍短
             
             # 发送文字说明
             if game_mode == "多人":
@@ -1458,7 +2405,7 @@ class RuleHorrorCommand(BaseCommand):
             return True, "游戏已开始", 2
             
         except Exception as e:
-            logger.error(f"强制开始游戏失? {e}", exc_info=True)
+            logger.error(f"强制开始游戏失败: {e}", exc_info=True)
             await self.send_text(f"生成游戏失败：{e}\n请稍后重试。")
             return False, "生成失败", 2
 
@@ -1527,13 +2474,15 @@ class RuleHorrorCommand(BaseCommand):
         try:
             save_name = rest_input.strip()
             save_manager = SaveManager()
-            
-            # 使用自定义名称保?            custom_group_id = f"{group_id}_{save_name}"
-            await save_manager.save_immediately(custom_group_id, state.session)
-            
+
+            ok = await save_manager.save_with_name(group_id, state.session, save_name)
+            if not ok:
+                await self.send_text("存档保存失败，请稍后重试。")
+                return False, "保存失败", 2
+
             await self.send_text(f"**存档已保存**\n\n存档名称：{save_name}")
             return True, "存档已保存", 2
-            
+
         except Exception as e:
             logger.error(f"保存存档失败: {e}", exc_info=True)
             await self.send_text(f"保存存档时出错：{e}")
@@ -1541,6 +2490,7 @@ class RuleHorrorCommand(BaseCommand):
         finally:
             if state:
                 state.release()
+
 
     async def _handle_读取(
         self,
@@ -1555,20 +2505,19 @@ class RuleHorrorCommand(BaseCommand):
             return False, "缺少存档名称", 2
 
         save_name = rest_input.strip()
-        custom_group_id = f"{group_id}_{save_name}"
         save_manager = SaveManager()
-        
+
         try:
-            session = await save_manager.load(custom_group_id)
-            
+            session = await save_manager.load_with_name(group_id, save_name)
+
             if not session:
                 await self.send_text(f"未找到存档：{save_name}")
                 return False, "无存档", 2
-            
+
             if session.status == GameStatus.ENDED:
                 await self.send_text(f"存档 {save_name} 已结束。")
                 return False, "存档已结束", 2
-            
+
             # 恢复到状态管理器
             state_manager = GameStateManager()
             state = await state_manager.get_or_create(group_id)
@@ -1576,7 +2525,7 @@ class RuleHorrorCommand(BaseCommand):
                 state.session = session
             finally:
                 state.release()
-            
+
             await self.send_text(
                 f"**存档已读取**\n\n"
                 f"存档名称：{save_name}\n"
@@ -1586,11 +2535,12 @@ class RuleHorrorCommand(BaseCommand):
                 f"使用 `/rg 状态` 查看详细信息。"
             )
             return True, "存档已读取", 2
-            
+
         except Exception as e:
             logger.error(f"读取存档失败: {e}", exc_info=True)
             await self.send_text(f"读取存档时出错：{e}")
             return False, "读取失败", 2
+
 
     async def _handle_存档列表(
         self,
@@ -1601,63 +2551,35 @@ class RuleHorrorCommand(BaseCommand):
     ) -> tuple[bool, Optional[str], int]:
         """处理查看存档列表命令"""
         save_manager = SaveManager()
-        
+
         try:
-            # 获取所有存档文?            import os
-            save_dir = save_manager.save_dir
-            
-            if not os.path.exists(save_dir):
-                await self.send_text("**存档列表**\n\n暂无存档。")
-                return True, "存档列表已显示", 2
-            
-            # 查找所有相关存档
-            saves = []
-            for filename in os.listdir(save_dir):
-                if filename.startswith(f"{group_id}") and filename.endswith(".json"):
-                    save_path = os.path.join(save_dir, filename)
-                    try:
-                        session = await save_manager.load(filename[:-5])  # 去掉 .json
-                        if session:
-                            save_name = filename[:-5].replace(f"{group_id}_", "")
-                            if save_name == group_id:
-                                save_name = "默认存档"
-                            
-                            saves.append({
-                                "name": save_name,
-                                "scene": session.scene_name,
-                                "mode": session.game_mode,
-                                "status": session.status.value,
-                                "created_at": getattr(session, 'created_at', None),
-                            })
-                    except Exception as e:
-                        logger.warning(f"读取存档失败: {filename}, {e}")
-                        continue
-            
+            all_saves = await save_manager.list_saves()
+            saves = [s for s in all_saves if s.get("group_id") == group_id]
+
             if not saves:
                 await self.send_text("**存档列表**\n\n暂无存档。")
                 return True, "存档列表已显示", 2
-            
-            # 构建存档列表文本
+
             saves_text = ["**存档列表**\n"]
-            for i, save in enumerate(saves, 1):
-                created_at = save.get('created_at')
-                time_str = created_at.strftime("%Y-%m-%d %H:%M") if created_at else "未知时间"
-                
+            for i, s in enumerate(saves, 1):
+                name = s.get("name") or ("默认存档" if not s.get("is_named") else "未命名")
+                saved_at = str(s.get("saved_at", "未知时间"))
                 saves_text.append(
-                    f"{i}. {save['name']}\n"
-                    f"   场景：{save['scene']}\n"
-                    f"   模式：{save['mode']}\n"
-                    f"   状态：{save['status']}\n"
-                    f"   时间：{time_str}\n"
+                    f"{i}. {name}\n"
+                    f"   场景：{s.get('scene_name', '未知')}\n"
+                    f"   模式：{s.get('game_mode', '未知')}\n"
+                    f"   状态：{s.get('status', 'unknown')}\n"
+                    f"   时间：{saved_at}\n"
                 )
-            
+
             await self.send_text("\n".join(saves_text))
             return True, "存档列表已显示", 2
-            
+
         except Exception as e:
             logger.error(f"查看存档列表失败: {e}", exc_info=True)
             await self.send_text(f"查看存档列表时出错：{e}")
             return False, "查看失败", 2
+
 
     # 别名处理
     _handle_start = _handle_开始
@@ -1671,6 +2593,10 @@ class RuleHorrorCommand(BaseCommand):
     _handle_end = _handle_结束
     _handle_help = _handle_帮助
     _handle_scene = _handle_场景
+    _handle_plot = _handle_剧情
+    _handle_story = _handle_剧情
+    _handle_item = _handle_道具
+    _handle_items = _handle_道具
     _handle_inventory = _handle_物品栏
     _handle_bag = _handle_背包
     _handle_continue = _handle_继续
@@ -1679,3 +2605,5 @@ class RuleHorrorCommand(BaseCommand):
     _handle_save = _handle_保存
     _handle_load = _handle_读取
     _handle_save_list = _handle_存档列表
+    _handle_cleanup_saves = _handle_清理存档
+

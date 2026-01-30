@@ -1,19 +1,32 @@
-"""场景生成器 - 使用 LLM 生成沉浸式的规则怪谈场景"""
+"""场景生成服务
+
+使用 LLM 生成“规则怪谈”场景数据（SceneData）：背景、规则、线索、核心象征符号等。
+
+该文件曾被批量替换破坏（引号缺失、字符串不闭合、全角标点落入语法层），此处按原意重写并保持对外接口：
+- SceneType
+- SceneData
+- SceneGenerator.generate_scene()
+- SceneGenerator.generate_progressive_reveal()
+
+注意：项目中另有更复杂的 `GameGenerator`；本模块作为可复用的“场景生成器”仍保持可用。
+"""
+
 from __future__ import annotations
 
-import json
 import logging
+import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
-from ..llm.client import LLMClient, LLMResponse
+from ..llm.client import LLMClient, get_default_max_tokens
 
 logger = logging.getLogger(__name__)
 
 
 class SceneType(Enum):
     """场景类型枚举"""
+
     SUBWAY = "subway"
     HOSPITAL = "hospital"
     SCHOOL = "school"
@@ -28,7 +41,8 @@ class SceneType(Enum):
 
 @dataclass
 class SceneData:
-    """场景数据类"""
+    """场景数据"""
+
     scene_name: str
     scene_type: SceneType
     background: str
@@ -43,278 +57,227 @@ class SceneData:
 
 
 class SceneGenerator:
-    """场景生成器 - 使用 LLM 生成沉浸式的规则怪谈场景"""
+    """场景生成器"""
 
-    def __init__(self, llm_client: Optional[LLMClient] = None):
-        self.llm_client = llm_client or LLMClient()
+    def __init__(self, llm_client: LLMClient | None = None):
+        self.llm_client: LLMClient = llm_client or LLMClient()
 
     async def generate_scene(
         self,
-        scene_type: Optional[SceneType] = None,
-        custom_prompt: Optional[str] = None,
+        scene_type: SceneType | None = None,
+        custom_prompt: str | None = None,
         game_mode: str = "单人",
     ) -> SceneData:
-        """
-        生成规则怪谈场景
+        """生成规则怪谈场景"""
 
-        Args:
-            scene_type: 场景类型，如果为 None 则随机选择
-            custom_prompt: 自定义提示词，如果提供则覆盖 scene_type
-            game_mode: 游戏模式（单人/多人）
-
-        Returns:
-            SceneData 对象
-        """
         if custom_prompt:
             return await self._generate_from_custom_prompt(custom_prompt, game_mode)
-        else:
-            if scene_type is None:
-                scene_type = self._random_scene_type()
-            return await self._generate_from_type(scene_type, game_mode)
 
-    async def _generate_from_type(
-        self,
-        scene_type: SceneType,
-        game_mode: str,
-    ) -> SceneData:
-        """根据场景类型生成"""
+        if scene_type is None:
+            scene_type = self._random_scene_type()
+
+        return await self._generate_from_type(scene_type, game_mode)
+
+    async def _generate_from_type(self, scene_type: SceneType, game_mode: str) -> SceneData:
         system_prompt = self._build_system_prompt(game_mode)
         user_prompt = self._build_type_prompt(scene_type)
 
         try:
-            response = await self.llm_client.call(
+            resp = await self.llm_client.call(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.9,
-                max_tokens=2000,
+                max_tokens=get_default_max_tokens(),
             )
-
-            result = response.parse_json()
-            return self._parse_scene_data(result, scene_type)
-
+            data = resp.parse_json()
+            return self._parse_scene_data(data, scene_type)
         except Exception as e:
-            logger.error(f"生成场景失败: {e}")
+            logger.error(f"生成场景失败: {e}", exc_info=True)
             return self._get_fallback_scene(scene_type)
 
-    async def _generate_from_custom_prompt(
-        self,
-        custom_prompt: str,
-        game_mode: str,
-    ) -> SceneData:
-        """根据自定义提示词生成"""
+    async def _generate_from_custom_prompt(self, custom_prompt: str, game_mode: str) -> SceneData:
         system_prompt = self._build_system_prompt(game_mode)
-        user_prompt = f"""请根据以下描述生成规则怪谈场景：
-
-{custom_prompt}
-
-请按照要求的 JSON 格式返回。"""
+        user_prompt = (
+            "请根据以下描述生成规则怪谈场景，并按要求返回 JSON：\n\n"
+            f"{custom_prompt}\n"
+        )
 
         try:
-            response = await self.llm_client.call(
+            resp = await self.llm_client.call(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.9,
-                max_tokens=2000,
+                max_tokens=get_default_max_tokens(),
             )
-
-            result = response.parse_json()
-            return self._parse_scene_data(result, SceneType.CUSTOM)
-
+            data = resp.parse_json()
+            return self._parse_scene_data(data, SceneType.CUSTOM)
         except Exception as e:
-            logger.error(f"生成自定义场景失败: {e}")
+            logger.error(f"生成自定义场景失败: {e}", exc_info=True)
             return self._get_fallback_scene(SceneType.CUSTOM)
 
     def _build_system_prompt(self, game_mode: str) -> str:
         """构建系统提示词"""
-        return f"""你是一个规则怪谈游戏的场景生成器。你的任务是生成沉浸式的恐怖场景。
 
-场景生成要求：
-1. 生成一个日常场所作为场景（地铁站、医院、学校、图书馆、便利店、公寓、电梯、停车场、办公室等）
-2. 创建一个看似正常的欢迎信息
-3. 生成 3-5 条规则，其中至少有一条是错误的或陷阱
-4. 包含微妙的异常暗示
-5. 设计一个隐藏的真相
-6. 提供通关条件
-7. 生成线索和核心符号
-8. 添加恐怖元素
-9. 描述氛围
-
-风格要求：
-- 克系恐怖（Cosmic Horror）
-- 新怪谈（New Weird）
-- Liminal Space（阈限空间）
-- 认知失调
-- 渐进式异化
-
-游戏模式：{game_mode}
-
-请以 JSON 格式返回：
-{{
-    "scene_name": "场景名称",
-    "background": "背景故事（200-300字）",
-    "player_identity": "玩家身份描述",
-    "hidden_truth": "隐藏的真相（100-150字）",
-    "rules": [
-        {{"id": 1, "text": "规则内容", "is_trap": false}},
-        {{"id": 2, "text": "规则内容", "is_trap": true}}
-    ],
-    "win_condition": "通关条件",
-    "clues": [
-        {{"id": 1, "content": "线索内容", "location": "线索位置"}}
-    ],
-    "core_symbols": [
-        {{"id": 1, "symbol": "符号名称", "meaning": "符号含义"}}
-    ],
-    "horror_elements": ["恐怖元素1", "恐怖元素2"],
-    "atmosphere_description": "氛围描述（100-150字）"
-}}
-
-注意：
-- 规则应该看起来合理但隐藏着危险
-- 陷阱规则应该看起来像正常规则
-- 线索应该帮助玩家发现真相
-- 恐怖元素应该营造紧张和不安的氛围
-- 氛围描述应该使用感官语言"""
+        return (
+            "你是规则怪谈游戏的场景生成器。你需要生成一个日常场所中的诡异场景。\n\n"
+            "要求：\n"
+            "1) 场景要具体、日常，不要用‘废弃的/神秘的/阴森的’这种空泛形容\n"
+            "2) 背景 200-300 字，平淡语气暗含不对劲\n"
+            "3) 规则 3-6 条，至少 1 条是陷阱（is_trap=true）\n"
+            "4) 隐藏真相 120-200 字，解释规则为何存在\n"
+            "5) 提供通关条件 win_condition\n"
+            "6) 线索 clues（1-3 条，包含 location）\n"
+            "7) 核心象征符号 core_symbols（1-2 个）\n"
+            "8) 给出恐怖元素列表 horror_elements（2-4 个短语）\n"
+            "9) 给出氛围描述 atmosphere_description（80-150 字）\n\n"
+            f"游戏模式: {game_mode}\n\n"
+            "只返回 JSON（不要 markdown，不要其他文字）：\n"
+            "{\n"
+            '  "scene_name": "场景名称",\n'
+            '  "background": "背景故事",\n'
+            '  "player_identity": "玩家身份",\n'
+            '  "hidden_truth": "隐藏真相",\n'
+            '  "rules": [ {"id": 1, "text": "规则", "is_trap": false} ],\n'
+            '  "win_condition": "通关条件",\n'
+            '  "clues": [ {"id": 1, "content": "线索内容", "location": "位置"} ],\n'
+            '  "core_symbols": [ {"id": 1, "symbol": "符号", "meaning": "含义"} ],\n'
+            '  "horror_elements": ["元素1", "元素2"],\n'
+            '  "atmosphere_description": "氛围描述"\n'
+            "}"
+        )
 
     def _build_type_prompt(self, scene_type: SceneType) -> str:
         """构建场景类型提示词"""
-        type_descriptions = {
-            SceneType.SUBWAY: "地铁站 - 地下的交通枢纽，充满机械声和人流",
-            SceneType.HOSPITAL: "医院 - 治疗疾病的场所，充满消毒水味和不安",
-            SceneType.SCHOOL: "学校 - 学习的场所，充满回忆和诡异",
-            SceneType.LIBRARY: "图书馆 - 知识的殿堂，安静而神秘",
-            SceneType.CONVENIENCE_STORE: "便利店 - 24小时营业，深夜的孤岛",
-            SceneType.APARTMENT: "公寓 - 居住的空间，私密而诡异",
-            SceneType.ELEVATOR: "电梯 - 封闭的空间，移动的盒子",
-            SceneType.PARKING_LOT: "停车场 - 停放车辆的地方，阴暗而空旷",
-            SceneType.OFFICE: "办公室 - 工作的场所，重复而压抑",
+
+        descriptions = {
+            SceneType.SUBWAY: "地铁站（地下交通枢纽，金属与回声）",
+            SceneType.HOSPITAL: "医院（消毒水、值班、走廊与病房）",
+            SceneType.SCHOOL: "学校（夜间教学楼、公告栏、铃声）",
+            SceneType.LIBRARY: "图书馆（借阅规则、静默、书页声）",
+            SceneType.CONVENIENCE_STORE: "24小时便利店（深夜灯光、货架、店员守则）",
+            SceneType.APARTMENT: "老旧公寓（楼道、门牌号、物业通知）",
+            SceneType.ELEVATOR: "电梯（封闭空间、楼层按钮、广播）",
+            SceneType.PARKING_LOT: "地下停车场（指示牌、车位号、回声）",
+            SceneType.OFFICE: "办公室（加班、门禁、打印机、会议室）",
         }
 
-        description = type_descriptions.get(scene_type, "未知场景")
-        return f"""请生成一个{description}的规则怪谈场景。
+        desc = descriptions.get(scene_type, "自定义场景")
+        return (
+            f"请生成一个以‘{desc}’为核心的规则怪谈场景。\n"
+            f"场景类型: {scene_type.value}\n"
+            "按系统提示的 JSON 格式返回。"
+        )
 
-场景类型：{scene_type.value}
+    def _parse_scene_data(self, data: dict[str, Any], scene_type: SceneType) -> SceneData:
+        """解析 LLM JSON -> SceneData"""
 
-请按照要求的 JSON 格式返回。"""
+        rules = data.get("rules", [])
+        if not isinstance(rules, list):
+            rules = []
 
-    def _parse_scene_data(self, result: dict[str, Any], scene_type: SceneType) -> SceneData:
-        """将解析结果转换为 SceneData 对象"""
+        clues = data.get("clues", [])
+        if not isinstance(clues, list):
+            clues = []
+
+        core_symbols = data.get("core_symbols", [])
+        if not isinstance(core_symbols, list):
+            core_symbols = []
+
+        horror_elements = data.get("horror_elements", [])
+        if not isinstance(horror_elements, list):
+            horror_elements = []
+
         return SceneData(
-            scene_name=result.get("scene_name", "未知场景"),
+            scene_name=str(data.get("scene_name", "未知场景") or "未知场景"),
             scene_type=scene_type,
-            background=result.get("background", ""),
-            player_identity=result.get("player_identity", ""),
-            hidden_truth=result.get("hidden_truth", ""),
-            rules=result.get("rules", []),
-            win_condition=result.get("win_condition", ""),
-            clues=result.get("clues", []),
-            core_symbols=result.get("core_symbols", []),
-            horror_elements=result.get("horror_elements", []),
-            atmosphere_description=result.get("atmosphere_description", ""),
+            background=str(data.get("background", "") or ""),
+            player_identity=str(data.get("player_identity", "") or ""),
+            hidden_truth=str(data.get("hidden_truth", "") or ""),
+            rules=rules,
+            win_condition=str(data.get("win_condition", "") or ""),
+            clues=clues,
+            core_symbols=core_symbols[:2],
+            horror_elements=[str(x) for x in horror_elements][:4],
+            atmosphere_description=str(data.get("atmosphere_description", "") or ""),
         )
 
     def _get_fallback_scene(self, scene_type: SceneType) -> SceneData:
-        """获取备用场景（当 LLM 调用失败时）"""
+        """LLM 失败时的备用场景"""
+
         return SceneData(
             scene_name=f"{scene_type.value}（备用场景）",
             scene_type=scene_type,
-            background="一个神秘的场所，隐藏着未知的危险。",
+            background="一个看似正常的地方，却有几条没人愿意解释清楚的规矩。",
             player_identity="你是一个误入此地的普通人。",
-            hidden_truth="这里的一切都是虚假的，你被困在了一个循环中。",
+            hidden_truth="这里的秩序并非为了保护你，而是在保护某种不能被看见的东西。",
             rules=[
-                {"id": 1, "text": "不要相信任何红色的东西。", "is_trap": False},
-                {"id": 2, "text": "当听到钟声时，立即停止移动。", "is_trap": False},
-                {"id": 3, "text": "如果你看到镜子，不要看里面的倒影。", "is_trap": True},
+                {"id": 1, "text": "听到广播时，先停下三秒再行动。", "is_trap": False},
+                {"id": 2, "text": "如果灯光闪烁，别去数它闪了几次。", "is_trap": True},
+                {"id": 3, "text": "不要在镜面前停留超过十秒。", "is_trap": False},
             ],
             win_condition="找到出口并离开。",
             clues=[
-                {"id": 1, "content": "墙上有一行字：红色是警告。", "location": "走廊"},
+                {"id": 1, "content": "墙上的通知单被反复撕贴，某一行字被涂得很黑。", "location": "走廊"}
             ],
             core_symbols=[
-                {"id": 1, "symbol": "红色", "meaning": "危险和警告"},
+                {"id": 1, "symbol": "闪烁的灯", "meaning": "被篡改的规则与不稳定的现实"}
             ],
-            horror_elements=["异常的寂静", "扭曲的空间"],
-            atmosphere_description="空气中弥漫着不安的气息，仿佛有什么东西在注视着你。",
+            horror_elements=["异常的安静", "不合逻辑的影子"],
+            atmosphere_description="空气里像积着陈旧的灰，声音被压得很低。你每走一步，都像踩在某种不愿承认你存在的地面上。",
         )
 
     def _random_scene_type(self) -> SceneType:
-        """随机选择场景类型"""
-        import random
-        return random.choice(list(SceneType))
+        """随机选择一个非 CUSTOM 类型"""
 
-    async def generate_progressive_reveal(
-        self,
-        scene_data: SceneData,
-        stage: int = 1,
-    ) -> str:
-        """
-        生成渐进式信息揭示
+        choices = [t for t in SceneType if t != SceneType.CUSTOM]
+        return random.choice(choices)
 
-        Args:
-            scene_data: 场景数据
-            stage: 揭示阶段（1-3）
+    async def generate_progressive_reveal(self, scene_data: SceneData, stage: int = 1) -> str:
+        """生成渐进式信息揭示（纯文本）"""
 
-        Returns:
-            揭示的文本
-        """
-        system_prompt = """你是一个规则怪谈游戏的渐进式信息揭示器。你的任务是逐步向玩家揭示场景的真相。
+        s = max(1, min(3, int(stage)))
+        system_prompt = (
+            "你是规则怪谈游戏的渐进式信息揭示器。\n"
+            "请根据阶段输出一段中文文本（150-220字），只输出纯文本。\n"
+            "阶段：1=入场与初步暗示；2=规则与结构的提示；3=真相与恐怖元素的暗示。"
+        )
 
-揭示阶段：
-- 阶段1：给出入场和初步的剧情导入
-- 阶段2：揭示部分规则和场景结构
-- 阶段3：暗示隐藏的真相和恐怖元素
-
-请根据阶段生成相应的文本，保持神秘感和恐怖氛围。"""
-
-        if stage == 1:
-            prompt = f"""场景名称：{scene_data.scene_name}
-
-背景：{scene_data.background}
-
-玩家身份：{scene_data.player_identity}
-
-氛围：{scene_data.atmosphere_description}
-
-请生成入场和初步的剧情导入（150-200字）。"""
-        elif stage == 2:
-            prompt = f"""场景名称：{scene_data.scene_name}
-
-规则：
-"""
-            for rule in scene_data.rules[:2]:
-                prompt += f"- {rule['text']}\n"
-
-            prompt += f"""
-场景结构：
-"""
-            for clue in scene_data.clues[:2]:
-                prompt += f"- {clue['location']}: {clue['content']}\n"
-
-            prompt += """
-请生成规则和场景结构的揭示（150-200字）。"""
+        if s == 1:
+            prompt = (
+                f"场景名称: {scene_data.scene_name}\n"
+                f"背景: {scene_data.background}\n"
+                f"玩家身份: {scene_data.player_identity}\n"
+                f"氛围: {scene_data.atmosphere_description}\n\n"
+                "请输出阶段1揭示。"
+            )
+        elif s == 2:
+            rules_preview = "\n".join(f"- {r.get('text', str(r))}" for r in scene_data.rules[:2])
+            clues_preview = "\n".join(
+                f"- {c.get('location', '某处')}: {c.get('content', str(c))}" for c in scene_data.clues[:2]
+            )
+            prompt = (
+                f"场景名称: {scene_data.scene_name}\n\n"
+                f"部分规则:\n{rules_preview if rules_preview else '（无）'}\n\n"
+                f"部分线索/结构:\n{clues_preview if clues_preview else '（无）'}\n\n"
+                "请输出阶段2揭示。"
+            )
         else:
-            prompt = f"""场景名称：{scene_data.scene_name}
-
-隐藏的真相：{scene_data.hidden_truth}
-
-恐怖元素：
-"""
-            for element in scene_data.horror_elements:
-                prompt += f"- {element}\n"
-
-            prompt += """
-请生成隐藏真相和恐怖元素的暗示（150-200字）。"""
+            elements = "\n".join(f"- {x}" for x in scene_data.horror_elements)
+            prompt = (
+                f"场景名称: {scene_data.scene_name}\n\n"
+                f"隐藏真相: {scene_data.hidden_truth}\n\n"
+                f"恐怖元素:\n{elements if elements else '（无）'}\n\n"
+                "请输出阶段3揭示。"
+            )
 
         try:
-            response = await self.llm_client.call(
+            resp = await self.llm_client.call(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 temperature=0.8,
-                max_tokens=300,
+                max_tokens=get_default_max_tokens(),
             )
-
-            return response.content.strip()
-
+            return resp.clean_content
         except Exception as e:
-            logger.error(f"生成渐进式揭示失败: {e}")
-            return "有些事情正在发生变化..."
+            logger.error(f"生成渐进式揭示失败: {e}", exc_info=True)
+            return "有些事情正在发生变化，但你还说不清那是什么。"
