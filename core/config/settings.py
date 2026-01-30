@@ -91,6 +91,13 @@ class PluginConfig(BaseModel):
         description="自动保存间隔(秒)"
     )
 
+    # 图片渲染字体（留空则自动选择）
+    # Linux 建议：安装 Noto CJK 或文泉驿字体，并填写字体文件的绝对路径
+    font_path: str = Field(
+        default="",
+        description="图片渲染使用的字体文件路径（留空自动选择）"
+    )
+
 
 class EnvironmentConfig(BaseModel):
     """环境演变系统配置"""

@@ -286,7 +286,10 @@ class RuleHorrorCommand(BaseCommand):
 
     command_help: str = (
         "规则怪谈游戏：\n"
-        "/rg 开始 单人/多人 - 开始新游戏（单人自动加入）\n"
+        "/rg 开始 单人 - 生成并开始单人游戏（自动加入）\n"
+        "/rg 开始 多人 - 创建多人大厅（房主自动加入）\n"
+        "/rg 开始 多人 开始 - 人数到齐后生成并开始多人游戏\n"
+
         "/rg 强制开始 单人/多人 - 覆盖存档并强制开始\n"
         "/rg 恢复 - 恢复默认存档\n"
         "/rg 保存 <存档名称> - 手动保存当前游戏状态\n"
@@ -336,6 +339,51 @@ class RuleHorrorCommand(BaseCommand):
         if self._game_generator is None:
             self._game_generator = GameGenerator()
         return self._game_generator
+
+    def _assign_multiplayer_identities(self, session: GameSession, player_order: list[str]) -> None:
+        """把多人模式生成的身份信息分配到玩家对象上。
+
+        说明：身份信息来自 `session.rule_network['multi_identity']['identities']`。
+        """
+        if session.game_mode != "多人":
+            return
+
+        mi = session.rule_network.get("multi_identity", {}) if isinstance(getattr(session, "rule_network", None), dict) else {}
+        identities = mi.get("identities", []) if isinstance(mi, dict) else []
+        if not isinstance(identities, list) or not identities:
+            return
+
+        # 补全顺序列表
+        order = [str(x) for x in (player_order or []) if str(x)]
+        for pid in session.players.keys():
+            if pid not in order:
+                order.append(pid)
+
+        # 为每个玩家分配一个身份（按加入顺序；身份数量不足时循环使用）
+        assigned: dict[str, str] = {}
+        for i, pid in enumerate(order):
+            p = session.players.get(pid)
+            if not p:
+                continue
+            ident = identities[i % len(identities)] if identities else {}
+            if not isinstance(ident, dict):
+                continue
+
+            p.identity = str(ident.get("identity_name") or "").strip() or None
+            p.identity_description = str(ident.get("identity_description") or "").strip() or None
+            ur = ident.get("unique_rules", [])
+            p.unique_rules = ur if isinstance(ur, list) else []
+            p.exclusive_info = str(ident.get("exclusive_info") or "").strip() or None
+
+            if p.identity:
+                assigned[pid] = p.identity
+
+        # 写入会话环境状态（便于后续展示/调试）
+        if isinstance(getattr(session, "environment_state", None), dict):
+            session.environment_state.setdefault("multiplayer", {})
+            if isinstance(session.environment_state.get("multiplayer"), dict):
+                session.environment_state["multiplayer"]["assigned_identities"] = assigned
+
 
     def _get_group_id(self) -> str:
         """获取群组/用户ID"""
@@ -901,7 +949,12 @@ class RuleHorrorCommand(BaseCommand):
             入场描述文本
         """
         llm_client = LLMClient()
-        system_prompt = """你是规则怪谈游戏的入场描述生成器。你需要生成玩家进入场景时的描述。
+
+        plural_hint = ""
+        if getattr(session, "game_mode", "单人") == "多人":
+            plural_hint = "\n8. 多人模式：使用第二人称复数‘你们’，把玩家视作一行人\n"
+
+        system_prompt = f"""你是规则怪谈游戏的入场描述生成器。你需要生成玩家进入场景时的描述。
 
 入场描述要求：
 1. 描述玩家如何到达这个场景
@@ -910,9 +963,10 @@ class RuleHorrorCommand(BaseCommand):
 4. 描述环境的初始状态
 5. 使用感官细节（视觉、听觉、嗅觉、触觉）
 6. 营造紧张和不安的氛围
-7. 长度：150-200字
+7. 长度：150-200字{plural_hint}
 
 返回纯文本，不要JSON格式。"""
+
 
         user_prompt = f"""场景名称：{session.scene_name}
 
@@ -943,10 +997,38 @@ class RuleHorrorCommand(BaseCommand):
         rest_input: str,
     ) -> tuple[bool, Optional[str], int]:
         """处理开始游戏命令"""
-        game_mode = rest_input.strip() if rest_input else "单人"
+        raw = (rest_input or "").strip()
+
+        game_mode = "单人"
+        multi_target: int | None = None
+        multi_start = False
+
+        if raw:
+            m = re.match(r"^(单人|多人)\s*(.*)$", raw)
+            if m:
+                game_mode = m.group(1)
+                tail = (m.group(2) or "").strip()
+            else:
+                game_mode = raw
+                tail = ""
+
+            if game_mode == "多人" and tail:
+                if re.search(r"(开始|生成|确认|立即|立刻|start|go)", tail, flags=re.IGNORECASE):
+                    multi_start = True
+
+                m2 = re.search(r"(\d{1,2})", tail)
+                if m2:
+                    try:
+                        n = int(m2.group(1))
+                        if 2 <= n <= 4:
+                            multi_target = n
+                    except Exception:
+                        pass
+
         if game_mode not in ["单人", "多人"]:
             await self.send_text("请指定游戏模式：`/rg 开始 单人` 或 `/rg 开始 多人`")
             return False, "缺少游戏模式", 2
+
 
         save_manager = SaveManager()
         existing = await save_manager.load(group_id)
@@ -958,17 +1040,159 @@ class RuleHorrorCommand(BaseCommand):
             )
             return False, "存在存档", 2
 
+        lobby_players: list[tuple[str, str]] = []
+        lobby_order: list[str] = []
+
+        # 多人模式：先创建/进入大厅（WAITING），等人数确认后再生成
+        if game_mode == "多人":
+            state_manager = GameStateManager()
+            state = await state_manager.get_or_create(group_id)
+            try:
+                sess = state.session
+                lobby: GameSession | None = None
+                if (
+                    sess
+                    and sess.game_mode == "多人"
+                    and sess.status == GameStatus.WAITING
+                    and isinstance(getattr(sess, "environment_state", None), dict)
+                    and isinstance(sess.environment_state.get("lobby"), dict)
+                ):
+                    lobby = sess
+
+                # 兼容：若磁盘上已有等待中的多人大厅存档但内存未加载，则先恢复到内存
+                if (
+                    lobby is None
+                    and existing
+                    and existing.game_mode == "多人"
+                    and existing.status == GameStatus.WAITING
+                    and isinstance(getattr(existing, "environment_state", None), dict)
+                    and isinstance(existing.environment_state.get("lobby"), dict)
+                ):
+                    lobby = existing
+                    state.session = lobby
+
+                if lobby is None:
+                    lobby = GameSession(group_id=group_id, game_mode="多人", status=GameStatus.WAITING)
+
+                    lobby.environment_state = {
+                        "lobby": {
+                            "host_id": user_id,
+                            "host_name": user_name,
+                            "target_players": multi_target,
+                            "created_at": datetime.now().isoformat(),
+                        },
+                        "lobby_player_order": [user_id],
+                    }
+                    lobby.add_player(Player(player_id=user_id, name=user_name))
+                    state.session = lobby
+                    await save_manager.save_immediately(group_id, lobby)
+
+                    target_txt = f"{multi_target}人" if multi_target else "未指定人数"
+                    await self.send_text(
+                        "**多人模式大厅已创建**\n\n"
+                        f"房主：{user_name}\n"
+                        f"目标人数：{target_txt}\n"
+                        "当前人数：1\n\n"
+                        "其他玩家请发送 `/rg 加入` 加入。\n"
+                        "房主在人数到齐后发送 `/rg 开始 多人 开始` 生成开局。"
+                    )
+                    return True, "大厅已创建", 2
+
+                env_state = lobby.environment_state
+                lobby_meta = env_state.get("lobby", {}) if isinstance(env_state.get("lobby"), dict) else {}
+                host_id = str(lobby_meta.get("host_id") or "")
+                host_name = str(lobby_meta.get("host_name") or "房主")
+
+                if not host_id:
+                    lobby_meta["host_id"] = user_id
+                    lobby_meta["host_name"] = user_name
+                    env_state["lobby"] = lobby_meta
+                    host_id = user_id
+                    host_name = user_name
+
+                if user_id != host_id:
+                    await self.send_text(
+                        f"当前已有多人大厅，由 {host_name} 创建。\n"
+                        "请使用 `/rg 加入` 加入，等待房主开始生成。"
+                    )
+                    return False, "非房主", 2
+
+                if multi_target is not None:
+                    lobby_meta["target_players"] = multi_target
+                    env_state["lobby"] = lobby_meta
+
+                # 确保房主在大厅内
+                if user_id not in lobby.players:
+                    lobby.add_player(Player(player_id=user_id, name=user_name))
+
+                order = env_state.get("lobby_player_order", [])
+                if not isinstance(order, list):
+                    order = []
+                for pid in list(lobby.players.keys()):
+                    if pid not in order:
+                        order.append(pid)
+                env_state["lobby_player_order"] = order
+
+                cur = len(lobby.players)
+                target = lobby_meta.get("target_players")
+                target_disp = f"{int(target)}" if isinstance(target, int) else "?"
+                players_disp = "、".join([p.name for p in lobby.players.values()]) if lobby.players else "（无）"
+
+                if not multi_start:
+                    await save_manager.save_immediately(group_id, lobby)
+                    await self.send_text(
+                        "**多人模式大厅**\n\n"
+                        f"房主：{host_name}\n"
+                        f"当前人数：{cur}/{target_disp}\n"
+                        f"玩家：{players_disp}\n\n"
+                        "等待其他玩家 `/rg 加入`。\n"
+                        "房主发送 `/rg 开始 多人 开始` 开始生成。"
+                    )
+                    return True, "大厅状态", 2
+
+                if cur < 2:
+                    await self.send_text("多人模式至少需要 2 名玩家。请先让其他玩家使用 `/rg 加入`。")
+                    return False, "人数不足", 2
+
+                if isinstance(target, int) and cur < target:
+                    await self.send_text(f"当前人数 {cur}/{target}，还未到齐。")
+                    return False, "未到齐", 2
+
+                # 快照：用于生成（避免长时间持锁）
+                lobby_order = list(order)
+                lobby_players = [(pid, lobby.players[pid].name) for pid in lobby_order if pid in lobby.players]
+                known_pids = {pid for pid, _ in lobby_players}
+                for pid, p in lobby.players.items():
+                    if pid not in known_pids:
+                        lobby_players.append((pid, p.name))
+                        lobby_order.append(pid)
+
+            finally:
+                state.release()
+
         await self.send_text("正在生成规则怪谈，请稍候..")
 
         try:
             # 生成游戏
-            session = await self._get_game_generator().generate_game(group_id, game_mode)
+            player_count = len(lobby_players) if (game_mode == "多人") else None
+            player_names = [n for _, n in lobby_players] if (game_mode == "多人") else None
+            session = await self._get_game_generator().generate_game(
+                group_id,
+                game_mode,
+                player_count=player_count,
+                player_names=player_names,
+            )
             session.status = GameStatus.ACTIVE
-            
-            # 单人模式自动添加玩家
+
+            # 添加玩家
             if game_mode == "单人":
                 player = Player(player_id=user_id, name=user_name)
                 session.add_player(player)
+            else:
+                for pid, name in lobby_players:
+                    session.add_player(Player(player_id=pid, name=name))
+                self._assign_multiplayer_identities(session, lobby_order or [pid for pid, _ in lobby_players])
+
             
             # 保存到状态管理器
             state_manager = GameStateManager()
@@ -1222,11 +1446,12 @@ class RuleHorrorCommand(BaseCommand):
             
             # 发送文字说明
             if game_mode == "多人":
+                players_disp = "、".join([p.name for p in session.players.values()]) if session.players else "（无）"
                 await self.send_text(
                     f"**游戏已开始！**\n\n"
                     f"模式：{game_mode}\n"
-                    f"场景：{session.scene_name}\n\n"
-                    f"其他玩家请使用 `/rg 加入` 加入游戏。\n"
+                    f"场景：{session.scene_name}\n"
+                    f"玩家：{players_disp}\n\n"
                     f"使用 `/rg 行动 <行动描述>` 进行行动。"
                 )
             else:
@@ -1237,6 +1462,7 @@ class RuleHorrorCommand(BaseCommand):
                     f"使用 `/rg 行动 <行动描述>` 进行行动。\n"
                     f"使用 `/rg 推理 <推理内容>` 记录推理。"
                 )
+
             
             logger.info(f"游戏开始成功: {group_id}, 模式: {game_mode}")
             return True, "游戏已开始", 2
@@ -1262,24 +1488,69 @@ class RuleHorrorCommand(BaseCommand):
             return False, "无游戏", 2
 
         try:
+            session = state.session
+
+            if session.game_mode != "多人":
+                await self.send_text("当前不是多人模式游戏。")
+                return False, "非多人模式", 2
+
+            # 只允许在大厅阶段加入
+            if session.status != GameStatus.WAITING:
+                await self.send_text("游戏已经开始，无法中途加入。")
+                return False, "已开始", 2
+
             # 检查玩家是否已在游戏中
-            if user_id in state.session.players:
-                await self.send_text("你已经在游戏中了。")
-                return False, "已在游戏中", 2
+            if user_id in session.players:
+                await self.send_text("你已经在大厅里了。")
+                return False, "已在大厅", 2
+
+            # 限制人数（最多4人）
+            if len(session.players) >= 4:
+                await self.send_text("大厅人数已满（最多4人）。")
+                return False, "人数已满", 2
 
             # 创建新玩家
             player = Player(player_id=user_id, name=user_name)
-            success = state.session.add_player(player)
+            success = session.add_player(player)
 
-            if success:
-                await self.send_text(f"{user_name} 加入了游戏！")
-                return True, "加入成功", 2
-            else:
-                await self.send_text("游戏人数已满（最多4人）。")
+            if not success:
+                await self.send_text("大厅人数已满（最多4人）。")
                 return False, "人数已满", 2
+
+            # 维护加入顺序
+            env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
+            order = env_state.get("lobby_player_order", [])
+            if not isinstance(order, list):
+                order = []
+            if user_id not in order:
+                order.append(user_id)
+            env_state["lobby_player_order"] = order
+            session.environment_state = env_state
+
+            lobby_meta = env_state.get("lobby", {}) if isinstance(env_state.get("lobby"), dict) else {}
+            host_name = str(lobby_meta.get("host_name") or "房主")
+            target = lobby_meta.get("target_players")
+            target_disp = f"{int(target)}" if isinstance(target, int) else "?"
+            cur = len(session.players)
+            players_disp = "、".join([p.name for p in session.players.values()])
+
+            # 保存大厅状态
+            save_manager = SaveManager()
+            await save_manager.save_immediately(group_id, session)
+
+            await self.send_text(
+                "**加入成功**\n\n"
+                f"{user_name} 加入了大厅。\n"
+                f"当前人数：{cur}/{target_disp}\n"
+                f"玩家：{players_disp}\n\n"
+                f"等待房主 {host_name} 开始生成：`/rg 开始 多人 开始`"
+            )
+            return True, "加入成功", 2
+
         finally:
             if state:
                 state.release()
+
 
     async def _handle_离开(
         self,
@@ -1331,13 +1602,21 @@ class RuleHorrorCommand(BaseCommand):
 
         try:
             session = state.session
+            title = session.scene_name
+            if not title:
+                if session.game_mode == "多人" and session.status == GameStatus.WAITING:
+                    title = "多人大厅"
+                else:
+                    title = "未生成"
+
             status_text = [
-                f"**游戏状态：{session.scene_name}**",
+                f"**游戏状态：{title}**",
                 f"模式：{session.game_mode}",
                 f"状态：{session.status.value}",
                 "",
                 "**玩家列表**",
             ]
+
 
             for pid, player in session.players.items():
                 status_emoji = "🟢" if player.status == PlayerStatus.ALIVE else "💀"
@@ -1932,15 +2211,25 @@ class RuleHorrorCommand(BaseCommand):
             session.ended_at = datetime.now()
             
             # 生成结局图片
+            # - 死亡/失败/强制结束（玩家主动结束且未通关）不展示“解释/推理分析/隐藏真相”
+            forced_end = (player.status == PlayerStatus.ALIVE and not session.has_cleared)
+            ending_type = str(getattr(ending, "ending_type", "") or "")
+            hide_explain = forced_end or (ending_type == "failed") or (player.status != PlayerStatus.ALIVE)
+
+            reasoning_analysis = "" if hide_explain else str(getattr(ending, "reasoning_analysis", "") or "")
+            truth_revealed = False if hide_explain else bool(getattr(ending, "truth_revealed", False))
+            hidden_truth = session.hidden_truth if truth_revealed else None
+
             image_generator = AsyncImageGenerator(self._temp_images_dir)
             ending_image = await image_generator.generate_ending_image(
                 ending_title=ending.title,
                 ending_description=ending.description,
-                reasoning_analysis=ending.reasoning_analysis,
-                truth_revealed=ending.truth_revealed,
-                hidden_truth=session.hidden_truth if ending.truth_revealed else None,
+                reasoning_analysis=reasoning_analysis,
+                truth_revealed=truth_revealed,
+                hidden_truth=hidden_truth,
                 ending_type=ending.ending_type,
             )
+
             
             # 发送结局图片
             with open(ending_image, 'rb') as f:
@@ -1978,7 +2267,10 @@ class RuleHorrorCommand(BaseCommand):
         help_text = (
             "**规则怪谈游戏帮助**\n\n"
             "**命令列表**\n"
-            "- `/rg 开始 单人/多人` - 开始新游戏（单人自动加入，多人需手动加入）\n"
+            "- `/rg 开始 单人` - 生成并开始单人游戏（自动加入）\n"
+            "- `/rg 开始 多人` - 创建多人大厅（房主自动加入）\n"
+            "- `/rg 开始 多人 开始` - 人数到齐后生成并开始多人游戏\n"
+
             "- `/rg 强制开始 单人/多人` - 覆盖存档并强制开始\n"
             "- `/rg 恢复` - 恢复默认存档\n"
             "- `/rg 保存 <存档名称>` - 手动保存当前游戏状态\n"
@@ -2349,10 +2641,34 @@ class RuleHorrorCommand(BaseCommand):
         rest_input: str,
     ) -> tuple[bool, Optional[str], int]:
         """处理强制开始命令"""
-        game_mode = rest_input.strip() if rest_input else "单人"
+        raw = (rest_input or "").strip()
+
+        game_mode = "单人"
+        multi_target: int | None = None
+
+        if raw:
+            m = re.match(r"^(单人|多人)\s*(.*)$", raw)
+            if m:
+                game_mode = m.group(1)
+                tail = (m.group(2) or "").strip()
+            else:
+                game_mode = raw
+                tail = ""
+
+            if game_mode == "多人" and tail:
+                m2 = re.search(r"(\d{1,2})", tail)
+                if m2:
+                    try:
+                        n = int(m2.group(1))
+                        if 2 <= n <= 4:
+                            multi_target = n
+                    except Exception:
+                        pass
+
         if game_mode not in ["单人", "多人"]:
             await self.send_text("请指定游戏模式：`/rg 强制开始 单人` 或 `/rg 强制开始 多人`")
             return False, "缺少游戏模式", 2
+
 
         # 清理现有状态
         state_manager = GameStateManager()
@@ -2361,6 +2677,37 @@ class RuleHorrorCommand(BaseCommand):
         # 删除现有存档
         save_manager = SaveManager()
         await save_manager.delete(group_id)
+
+        # 多人模式：强制开始只负责“清档并创建大厅”，避免先生成再加人
+        if game_mode == "多人":
+            state = await state_manager.get_or_create(group_id)
+            try:
+                lobby = GameSession(group_id=group_id, game_mode="多人", status=GameStatus.WAITING)
+                lobby.environment_state = {
+                    "lobby": {
+                        "host_id": user_id,
+                        "host_name": user_name,
+                        "target_players": multi_target,
+                        "created_at": datetime.now().isoformat(),
+                    },
+                    "lobby_player_order": [user_id],
+                }
+                lobby.add_player(Player(player_id=user_id, name=user_name))
+                state.session = lobby
+                await save_manager.save_immediately(group_id, lobby)
+            finally:
+                state.release()
+
+            target_txt = f"{multi_target}人" if multi_target else "未指定人数"
+            await self.send_text(
+                "**多人模式大厅已创建**\n\n"
+                f"房主：{user_name}\n"
+                f"目标人数：{target_txt}\n"
+                "当前人数：1\n\n"
+                "其他玩家请发送 `/rg 加入` 加入。\n"
+                "房主在人数到齐后发送 `/rg 开始 多人 开始` 生成开局。"
+            )
+            return True, "大厅已创建", 2
 
         await self.send_text("正在生成规则怪谈，请稍候..")
 
@@ -2373,6 +2720,7 @@ class RuleHorrorCommand(BaseCommand):
             if game_mode == "单人":
                 player = Player(player_id=user_id, name=user_name)
                 session.add_player(player)
+
             
             # 保存到状态管理器
             state = await state_manager.get_or_create(group_id)
@@ -2620,11 +2968,12 @@ class RuleHorrorCommand(BaseCommand):
             
             # 发送文字说明
             if game_mode == "多人":
+                players_disp = "、".join([p.name for p in session.players.values()]) if session.players else "（无）"
                 await self.send_text(
                     f"**游戏已开始！**\n\n"
                     f"模式：{game_mode}\n"
-                    f"场景：{session.scene_name}\n\n"
-                    f"其他玩家请使用 `/rg 加入` 加入游戏。\n"
+                    f"场景：{session.scene_name}\n"
+                    f"玩家：{players_disp}\n\n"
                     f"使用 `/rg 行动 <行动描述>` 进行行动。"
                 )
             else:
@@ -2635,6 +2984,7 @@ class RuleHorrorCommand(BaseCommand):
                     f"使用 `/rg 行动 <行动描述>` 进行行动。\n"
                     f"使用 `/rg 推理 <推理内容>` 记录推理。"
                 )
+
             
             logger.info(f"强制开始游戏成功: {group_id}, 模式: {game_mode}")
             return True, "游戏已开始", 2

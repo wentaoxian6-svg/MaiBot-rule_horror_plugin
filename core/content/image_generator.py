@@ -6,8 +6,10 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import random
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 class AsyncImageGenerator:
     """异步图片生成器（带缓存功能）"""
+
+    # 全局字体路径缓存：避免每次创建生成器都做一轮“探测字体”
+    _global_font_path: str | None = None
 
     def __init__(self, output_dir: str, max_workers: int = 4):
         self.output_dir = Path(output_dir)
@@ -34,6 +39,11 @@ class AsyncImageGenerator:
         # 缓存索引文件
         self.cache_index_file = self.cache_dir / "cache_index.json"
         self._cache_index = self._load_cache_index()
+
+        # 选择一个跨平台可用的字体（优先配置/环境变量，其次自动探测）
+        if AsyncImageGenerator._global_font_path is None:
+            AsyncImageGenerator._global_font_path = self._resolve_font_path()
+        self._font_path: str = AsyncImageGenerator._global_font_path or "msyh.ttc"
 
     def _load_cache_index(self) -> dict[str, str]:
         """加载缓存索引"""
@@ -52,6 +62,97 @@ class AsyncImageGenerator:
                 json.dump(self._cache_index, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存缓存索引失败: {e}")
+
+    def _resolve_font_path(self) -> str:
+        """解析一个可用字体路径（跨平台）。
+
+        优先级：
+        1) 环境变量 `RULE_HORROR_FONT`
+        2) 配置 `plugin.font_path`
+        3) 常见 Windows/Linux 字体路径
+
+        返回空字符串表示未找到（后续会回退到 Pillow 默认字体）。
+        """
+        candidates: list[str] = []
+
+        # 1) 环境变量覆盖
+        env_font = (os.getenv("RULE_HORROR_FONT") or "").strip()
+        if env_font:
+            candidates.append(env_font)
+
+        # 2) 配置覆盖（尽量不引入硬依赖：失败就跳过）
+        try:
+            from ..config import get_config  # 延迟导入，避免循环依赖
+
+            cfg = get_config()
+            cfg_font = (getattr(getattr(cfg, "plugin", None), "font_path", "") or "").strip()
+            if cfg_font:
+                candidates.append(cfg_font)
+        except Exception:
+            pass
+
+        # 3) 插件内可能的字体位置（若未来你决定随仓库附带字体文件，可以放这里）
+        plugin_root = Path(__file__).resolve().parents[2]
+        candidates.extend([
+            str(plugin_root / "data" / "fonts" / "NotoSansCJK-Regular.ttc"),
+            str(plugin_root / "data" / "fonts" / "NotoSansCJKsc-Regular.otf"),
+            str(plugin_root / "data" / "fonts" / "wqy-microhei.ttc"),
+        ])
+
+        # 4) Windows 常见字体
+        candidates.extend([
+            r"C:\\Windows\\Fonts\\msyh.ttc",
+            r"C:\\Windows\\Fonts\\msyh.ttf",
+            r"C:\\Windows\\Fonts\\simhei.ttf",
+            r"C:\\Windows\\Fonts\\simsun.ttc",
+        ])
+
+        # 5) Linux 常见中文字体（发行版差异较大，尽量覆盖主流路径）
+        candidates.extend([
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/arphic/ukai.ttc",
+            "/usr/share/fonts/truetype/arphic/uming.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ])
+
+        # 6) 兜底：相对文件名（Windows 上通常可用；Linux 可能不可用但尝试无害）
+        candidates.extend([
+            "msyh.ttc",
+            "simhei.ttf",
+            "simsun.ttc",
+            "arial.ttf",
+        ])
+
+        # 去重且保持顺序
+        seen = set()
+        uniq: list[str] = []
+        for c in candidates:
+            c = (c or "").strip()
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            uniq.append(c)
+
+        # 尝试加载（以能否被 Pillow/FreeType 打开为准）
+        for c in uniq:
+            p = os.path.expanduser(c)
+            # 绝对路径/相对路径都可尝试；不存在的路径直接跳过可以减少噪音
+            if ("/" in p or "\\" in p) and not Path(p).exists():
+                continue
+            try:
+                ImageFont.truetype(p, 20)
+                if sys.platform.startswith("linux"):
+                    logger.info(f"[rule_horror] Linux 字体已选择: {p}")
+                return p
+            except Exception:
+                continue
+
+        logger.warning("[rule_horror] 未找到可用中文字体，将回退到 Pillow 默认字体（可能导致中文显示为方块）")
+        return ""
 
     def _get_cache_key(self, **kwargs) -> str:
         """生成缓存键"""
@@ -303,9 +404,9 @@ class AsyncImageGenerator:
             output_path = str(self.output_dir / f"plot_{timestamp}.png")
 
         # 加载字体
-        font_title = self._get_font("msyh.ttc", 36)
-        font_subtitle = self._get_font("msyh.ttc", 28)
-        font_normal = self._get_font("msyh.ttc", 20)
+        font_title = self._get_font(self._font_path, 36)
+        font_subtitle = self._get_font(self._font_path, 28)
+        font_normal = self._get_font(self._font_path, 20)
 
         # 预估图片高度
         margin = 60
@@ -431,9 +532,9 @@ class AsyncImageGenerator:
             output_path = str(self.output_dir / f"rules_{timestamp}.png")
 
         # 加载字体
-        font_title = self._get_font("msyh.ttc", 36)
-        font_subtitle = self._get_font("msyh.ttc", 28)
-        font_normal = self._get_font("msyh.ttc", 20)
+        font_title = self._get_font(self._font_path, 36)
+        font_subtitle = self._get_font(self._font_path, 28)
+        font_normal = self._get_font(self._font_path, 20)
 
         margin = 60
         title_height = 80
@@ -660,9 +761,9 @@ class AsyncImageGenerator:
             output_path = str(self.output_dir / f"action_{timestamp}_{random.randint(1000, 9999)}.png")
 
         # 加载字体
-        font_title = self._get_font("msyh.ttc", 36)
-        font_subtitle = self._get_font("msyh.ttc", 24)
-        font_normal = self._get_font("msyh.ttc", 18)
+        font_title = self._get_font(self._font_path, 36)
+        font_subtitle = self._get_font(self._font_path, 24)
+        font_normal = self._get_font(self._font_path, 18)
 
         margin = 50
         title_height = 80
@@ -675,6 +776,9 @@ class AsyncImageGenerator:
         # 因此：即使本次行动判定死亡，也要优先进入理智崩坏展示，而不是只显示“你已死亡”。
         is_insane_mode = (sanity == 0)
 
+        # 注意：保留 action 参数是为了兼容调用方；行动长图不再复述玩家行动
+        _ = action
+
         if is_insane_mode:
             char_per_line = 35
 
@@ -683,7 +787,6 @@ class AsyncImageGenerator:
         if is_dead and not is_insane_mode:
             # 死亡但未崩坏：依然给出行动长图的关键文本（场景描述/行动反馈），避免只剩三行
             content_lines.append(f"行动结果 - {user_name}")
-            content_lines.append(f"行动：{action}")
             content_lines.append("你已死亡！")
 
             if scene_description:
@@ -720,7 +823,6 @@ class AsyncImageGenerator:
         else:
             # 正常模式
             content_lines.append(f"行动结果 - {user_name}")
-            content_lines.append(f"行动：{action}")
             content_lines.append("")
             content_lines.append("场景描述：")
 
@@ -888,9 +990,9 @@ class AsyncImageGenerator:
             output_path = str(self.output_dir / f"ending_{timestamp}.png")
 
         # 加载字体
-        font_title = self._get_font("msyh.ttc", 40)
-        font_subtitle = self._get_font("msyh.ttc", 28)
-        font_normal = self._get_font("msyh.ttc", 20)
+        font_title = self._get_font(self._font_path, 40)
+        font_subtitle = self._get_font(self._font_path, 28)
+        font_normal = self._get_font(self._font_path, 20)
 
         margin = 60
         title_height = 100
@@ -904,11 +1006,11 @@ class AsyncImageGenerator:
         for i in range(0, len(ending_description), char_per_line):
             content_lines.append(ending_description[i:i+char_per_line])
         
-        content_lines.append("")
-        
-        # 推理分析
-        for i in range(0, len(reasoning_analysis), char_per_line):
-            content_lines.append(reasoning_analysis[i:i+char_per_line])
+        # 推理分析（可选）：死亡/失败/强制结束等情况可传空字符串以隐藏解释
+        if reasoning_analysis and str(reasoning_analysis).strip():
+            content_lines.append("")
+            for i in range(0, len(reasoning_analysis), char_per_line):
+                content_lines.append(reasoning_analysis[i:i+char_per_line])
         
         # 隐藏真相
         if truth_revealed and hidden_truth:
@@ -982,9 +1084,9 @@ class AsyncImageGenerator:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = str(self.output_dir / f"inventory_{timestamp}.png")
 
-        font_title = self._get_font("msyh.ttc", 28)
-        font_item = self._get_font("msyh.ttc", 20)
-        font_desc = self._get_font("msyh.ttc", 16)
+        font_title = self._get_font(self._font_path, 28)
+        font_item = self._get_font(self._font_path, 20)
+        font_desc = self._get_font(self._font_path, 16)
 
         margin = 40
         line_height = 28
@@ -1081,9 +1183,9 @@ class AsyncImageGenerator:
             output_path = str(self.output_dir / f"scene_structure_text_{timestamp}.png")
         
         # 加载字体
-        font_title = self._get_font("msyh.ttc", 32)
-        font_subtitle = self._get_font("msyh.ttc", 24)
-        font_normal = self._get_font("msyh.ttc", 18)
+        font_title = self._get_font(self._font_path, 32)
+        font_subtitle = self._get_font(self._font_path, 24)
+        font_normal = self._get_font(self._font_path, 18)
         
         # 预估图片高度
         margin = 30
@@ -1261,9 +1363,9 @@ class AsyncImageGenerator:
             output_path = str(self.output_dir / f"entrance_{timestamp}.png")
 
         # 加载字体
-        font_title = self._get_font("msyh.ttc", 36)
-        font_subtitle = self._get_font("msyh.ttc", 28)
-        font_normal = self._get_font("msyh.ttc", 20)
+        font_title = self._get_font(self._font_path, 36)
+        font_subtitle = self._get_font(self._font_path, 28)
+        font_normal = self._get_font(self._font_path, 20)
 
         margin = 60
         title_height = 80

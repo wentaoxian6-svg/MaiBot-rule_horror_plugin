@@ -578,7 +578,29 @@ class ActionProcessor:
             if not npcs_present and isinstance(env_state.get("npcs_present"), list):
                 npcs_present = env_state.get("npcs_present", [])
 
+        # 多人模式身份信息（用于让 LLM 依据身份差异生成更合理的反馈）
+        unique_rules: list[str] = []
+        ur = getattr(player, "unique_rules", None)
+        if isinstance(ur, list):
+            for r in ur:
+                if isinstance(r, dict):
+                    t = str(r.get("text", r.get("content", "")) or "").strip()
+                else:
+                    t = str(r or "").strip()
+                if t:
+                    unique_rules.append(t)
+
+        identity_name = str(getattr(player, "identity", "") or "").strip()
+        identity_desc = str(getattr(player, "identity_description", "") or "").strip()
+        exclusive_info = str(getattr(player, "exclusive_info", "") or "").strip()
+
         return {
+            "game_mode": session.game_mode,
+            "player_name": player.name,
+            "player_identity": identity_name or session.player_identity,
+            "player_identity_description": identity_desc,
+            "player_unique_rules": unique_rules,
+            "player_exclusive_info": exclusive_info,
             "scene_name": session.scene_name,
             "background": session.background,
             "rules": [r.get("text", str(r)) for r in session.rules],
@@ -592,6 +614,7 @@ class ActionProcessor:
             "npcs_present": npcs_present,
             "recent_actions": [a.get("action", "") for a in player.action_history[-3:]],
         }
+
 
 
 
@@ -646,9 +669,21 @@ class ActionProcessor:
 - 例如："房间里很安静，只有远处传来的滴水声。墙上挂着一幅画，画中的人物似乎在注视着你..."
 """
         
+        multiplayer_style = ""
+        if context.get("game_mode") == "多人":
+            pn = str(context.get("player_name") or "玩家").strip()
+            multiplayer_style = f"""
+
+**多人模式额外要求**：
+- 当前玩家：{pn}
+- 描述应以该玩家为主；必要时用名字指代，避免群聊歧义
+- 仅当事件确实影响全体时才使用“你们”
+"""
+
         system_prompt = f"""你是规则怪谈游戏的行动判定系统。你需要根据玩家的行动和游戏规则，判定行动的结果。
 
-{sanity_style}
+{sanity_style}{multiplayer_style}
+
 
 **判定原则**：
 1. 检查行动是否违反规则
@@ -679,9 +714,10 @@ class ActionProcessor:
 
 返回JSON格式：
 {{
-    "description": "详细的场景描述（200-300字，根据理智值调整风格，包含视觉、听觉、触觉等多感官体验）",
+    "description": "行动后的场景描述（1-2段，200-300字；融合位置/视觉/听觉/嗅觉/触觉等感官细节与氛围；不要使用章节标题或分类标记；不要复述或改写玩家行动句子，直接描述行动发生后的结果）",
     "sanity_change": -5,
     "health_change": 0,
+
     "discovered_clues": ["发现的线索"],
     "found_items": ["发现的物品列表（如果有）"],
     "item_details": {{
@@ -696,7 +732,15 @@ class ActionProcessor:
     "violated_rule": "违反的规则（如果有）"
 }}"""
 
-        user_prompt = f"""场景：{context['scene_name']}
+        user_prompt = f"""游戏模式：{context.get('game_mode', '单人')}
+玩家：{context.get('player_name', '')}
+身份：{context.get('player_identity', '')}
+身份描述：{context.get('player_identity_description', '')}
+身份独有规则：
+{chr(10).join(f"- {r}" for r in (context.get('player_unique_rules') or [])) if context.get('player_unique_rules') else "（无）"}
+身份独有信息：{context.get('player_exclusive_info', '')}
+
+场景：{context['scene_name']}
 背景：{context['background']}
 
 规则：
@@ -714,7 +758,10 @@ class ActionProcessor:
 
 玩家行动：{action}
 
-请判定行动结果，并根据玩家理智值（{sanity}/100）调整描述风格。"""
+请判定行动结果，并根据玩家理智值（{sanity}/100）调整描述风格。
+注意：`description` 只写行动后的结果，不要复述或改写上面这句“玩家行动”。"""
+
+
 
         try:
             response = await self.llm_client.call(
@@ -730,13 +777,14 @@ class ActionProcessor:
             logger.error(f"判定行动失败: {e}")
             # 根据理智值返回不同的默认描述
             if sanity == 0:
-                default_desc = f"你{action}。一切都变得如此清晰，那些所谓的'规则'不过是虚妄的束缚。你感到前所未有的自由和解脱..."
+                default_desc = "动作结束后，一切都变得如此清晰。那些所谓的‘规则’不过是虚妄的束缚。你感到前所未有的自由和解脱……"
             elif sanity < 30:
-                default_desc = f"你{action}。周围的一切开始扭曲，墙壁在呼吸，影子在蠕动。你听到了低语声，但不知道是从哪里传来的..."
+                default_desc = "动作结束后，周围的一切开始扭曲：墙壁像在呼吸，影子在蠕动。你听见低语，却分不清来自哪里……"
             elif sanity < 70:
-                default_desc = f"你{action}。空气中弥漫着一股奇怪的味道，让你感到不适。你注意到周围的细节变得格外清晰..."
+                default_desc = "动作结束后，空气里弥漫着一股说不出的味道，让你胃里发紧。你注意到一些先前忽略的细节，越看越不对劲……"
             else:
-                default_desc = f"你{action}。周围的环境似乎没有什么变化，但你感觉有些不安。"
+                default_desc = "动作结束后，环境表面上没有太大变化，但那股不安仍然黏在你背后。"
+
             
             return {
                 "description": default_desc,
