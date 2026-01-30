@@ -77,8 +77,44 @@ DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 TEMP_IMAGES_DIR = os.path.join(DATA_DIR, "temp_images")
 
 
+def _is_dir_writable(path: str) -> bool:
+    """检查目录是否可写（Linux 上常见：插件目录只读导致写入失败）。"""
+    try:
+        os.makedirs(path, exist_ok=True)
+        test_file = os.path.join(path, ".write_test")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test_file)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_data_dir(plugin_dir: str) -> str:
+    """解析数据目录。
+
+    优先使用插件目录下的 `data/`；如果不可写（常见于 Linux/Docker 只读挂载），
+    则回退到用户数据目录（XDG_DATA_HOME 或 `~/.local/share`）。
+    """
+    preferred = os.path.join(plugin_dir, "data")
+    if _is_dir_writable(preferred):
+        return preferred
+
+    xdg_home = os.getenv("XDG_DATA_HOME")
+    if xdg_home:
+        base = os.path.join(xdg_home, "maibot")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".local", "share", "maibot")
+
+    fallback = os.path.join(base, "rule_horror")
+    os.makedirs(fallback, exist_ok=True)
+    logger.warning(f"插件目录不可写，已回退数据目录到: {fallback}")
+    return fallback
+
+
 @register_plugin
 class RuleHorrorPlugin(BasePlugin):
+
     """规则怪谈插件"""
 
     plugin_name: str = "rule_horror"
@@ -188,12 +224,16 @@ class RuleHorrorPlugin(BasePlugin):
         """插件加载时初始化"""
         # 使用实例的plugin_dir
         plugin_dir = self.plugin_dir
-        data_dir = os.path.join(plugin_dir, "data")
+
+        # 解析数据目录（Linux 下可能出现插件目录只读的情况）
+        data_dir = _resolve_data_dir(plugin_dir)
         temp_images_dir = os.path.join(data_dir, "temp_images")
-        
+        self._temp_images_dir = temp_images_dir
+
         # 确保目录存在
         os.makedirs(data_dir, exist_ok=True)
         os.makedirs(temp_images_dir, exist_ok=True)
+
         
         # 加载配置文件
         config_path = os.path.join(plugin_dir, "config.toml")
@@ -278,14 +318,15 @@ class RuleHorrorCommand(BaseCommand):
         self._game_generator: GameGenerator | None = None
         self._ending_judge = EndingJudge()
         
-        # 获取临时图片目录
+        # 获取临时图片目录（Linux 可能需要回退到用户目录）
         if plugin_config and 'plugin_dir' in plugin_config:
             plugin_dir = plugin_config['plugin_dir']
-            data_dir = os.path.join(plugin_dir, "data")
+            data_dir = _resolve_data_dir(plugin_dir)
             self._temp_images_dir = os.path.join(data_dir, "temp_images")
         else:
             # 回退到全局变量
             self._temp_images_dir = TEMP_IMAGES_DIR
+
         
         # 确保目录存在
         os.makedirs(self._temp_images_dir, exist_ok=True)
@@ -1407,8 +1448,13 @@ class RuleHorrorCommand(BaseCommand):
         user_name: str,
         rest_input: str,
     ) -> tuple[bool, Optional[str], int]:
-        """处理获取提示命令"""
-        hint_type = rest_input if rest_input else "规则"
+        """处理获取提示命令
+
+        目标：让 LLM 基于“完整规则 + 隐藏真相”生成**有限度**提示，但输出必须非剧透。
+        - 规则提示：只点评一条规则的措辞陷阱/关键字/边界条件，并给一个可验证建议。
+        - 线索提示：只针对背包中某个物品，提示它可能与什么相关，并给下一步行动建议。
+        """
+        hint_type = (rest_input or "规则").strip()
 
         state_manager = GameStateManager()
         state = await state_manager.get(group_id)
@@ -1419,6 +1465,10 @@ class RuleHorrorCommand(BaseCommand):
 
         try:
             session = state.session
+            player = session.players.get(user_id)
+            if not player:
+                await self.send_text("你不在游戏中。")
+                return False, "不在游戏中", 2
 
             if session.hint_count <= 0:
                 await self.send_text("你的提示次数已用完！")
@@ -1427,51 +1477,235 @@ class RuleHorrorCommand(BaseCommand):
             # 减少提示次数
             session.hint_count -= 1
 
-            # 生成“非剧透”提示：只基于已知信息给方向，不注入隐藏真相/全规则表。
-            env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
+            want_clue = "线索" in hint_type
+            hint_mode = "clue" if want_clue else "rule"
 
+            # 基于当前“玩家已知规则”做轻量提示控制：LLM 可用全规则推理，但输出尽量围绕已知信息
+            env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
             known_indices: list[int] = []
             if isinstance(env_state.get("known_rule_indices"), list):
                 known_indices = [int(x) for x in env_state.get("known_rule_indices", []) if isinstance(x, int)]
 
-            total_rules = len(session.rules or [])
-            have_unknown = bool(total_rules and len(set(known_indices)) < total_rules)
+            extra_texts: list[str] = []
+            if isinstance(env_state.get("known_rule_texts_extra"), list):
+                extra_texts = [str(x).strip() for x in env_state.get("known_rule_texts_extra", []) if str(x).strip()]
 
-            want_clue = "线索" in str(hint_type)
+            def _normalize_rule_text(r: Any) -> str:
+                if isinstance(r, dict):
+                    return str(r.get("text", r.get("content", "")) or "").strip()
+                return str(r or "").strip()
+
+            all_rules: list[str] = [_normalize_rule_text(r) for r in (session.rules or [])]
+
+            # ===== 规则提示：确定“只点评哪一条” =====
+            target_rule_index_1b: int | None = None
+            target_rule_text = ""
+
+            if not want_clue:
+                # 允许：/rg 提示 规则3  /  /rg 提示 3
+                m = re.search(r"(\d{1,2})", hint_type)
+                if m:
+                    try:
+                        n = int(m.group(1))
+                        if 1 <= n <= len(all_rules):
+                            target_rule_index_1b = n
+                    except Exception:
+                        target_rule_index_1b = None
+
+                # 未指定就从已知规则里挑一条（更符合“验证规则”的体感）
+                if target_rule_index_1b is None and known_indices:
+                    idx0 = sorted(set([i for i in known_indices if 0 <= i < len(all_rules)]))[-1]
+                    target_rule_index_1b = idx0 + 1
+
+                if target_rule_index_1b is not None and 1 <= target_rule_index_1b <= len(all_rules):
+                    target_rule_text = all_rules[target_rule_index_1b - 1]
+                elif extra_texts:
+                    # 只有口述规则但没有索引时，仍可点评一句“口述规矩”
+                    target_rule_text = extra_texts[0]
+
+            # ===== 线索提示：确定“只提示哪一个物品” =====
+            inventory = getattr(player, "inventory", []) or []
+            clue_query = ""
             if want_clue:
-                hint = (
-                    "先别做高风险动作。用低风险的方式‘确认事实’：\n"
-                    "- 观察/检查可写字的东西（告示、标签、票据、墙面痕迹）\n"
-                    "- 询问在场NPC‘这里有什么禁忌’，注意对方态度变化\n"
-                    "- 用 `/rg 道具` 复盘你拿到的物品是否暗示线索"
-                )
-            else:
-                npc_name = "NPC"
-                if isinstance(getattr(session, "npc_guidance", None), dict):
-                    npc_name = str(session.npc_guidance.get("npc_name", "NPC") or "NPC")
+                # 支持：/rg 提示 线索 钥匙
+                clue_query = hint_type.replace("线索", "", 1).strip()
 
-                if have_unknown:
-                    hint = (
-                        "你直觉觉得‘规矩’还没说完。\n"
-                        f"尝试在同一地点礼貌地询问{npc_name}，或寻找规则载体（告示/收据/标签）。\n"
-                        "注意：你越礼貌、越像在确认而非逼问，越可能得到更多信息。"
+            selected_item: dict[str, Any] | None = None
+            if want_clue and inventory:
+                # 1) 名称匹配优先
+                if clue_query:
+                    for it in inventory:
+                        if isinstance(it, dict) and clue_query in str(it.get("name", "") or ""):
+                            selected_item = it
+                            break
+
+                # 2) 关键物品优先
+                if selected_item is None:
+                    for it in reversed(inventory):
+                        if isinstance(it, dict) and bool(it.get("is_key_item", False)):
+                            selected_item = it
+                            break
+
+                # 3) 否则选最近获得的一个
+                if selected_item is None:
+                    for it in reversed(inventory):
+                        if isinstance(it, dict) and str(it.get("name", "") or "").strip():
+                            selected_item = it
+                            break
+
+            def _format_item(it: dict[str, Any]) -> str:
+                name = str(it.get("name", "") or "").strip()
+                desc = str(it.get("description", "") or "").strip()
+                oh = str(it.get("observation_hint", "") or "").strip()
+                is_key = bool(it.get("is_key_item", False))
+                parts = [name]
+                if is_key:
+                    parts.append("关键")
+                if desc:
+                    parts.append(f"描述:{desc}")
+                if oh:
+                    parts.append(f"观察提示:{oh}")
+                return " | ".join(parts)
+
+            selected_item_text = _format_item(selected_item) if (selected_item and isinstance(selected_item, dict)) else ""
+
+            # 组装 LLM 输入（包含完整规则与隐藏真相，但强制非剧透输出）
+            rules_block = "\n".join([f"{i+1}. {t}" for i, t in enumerate(all_rules) if t])
+
+            known_rules: list[str] = []
+            for idx in sorted(set([i for i in known_indices if isinstance(i, int)])):
+                if 0 <= idx < len(all_rules):
+                    t = all_rules[idx]
+                    if t:
+                        known_rules.append(t)
+            known_rules.extend([t for t in extra_texts if t])
+            known_rules_block = "\n".join([f"- {t}" for t in known_rules]) if known_rules else "（暂无）"
+
+            inv_lines: list[str] = []
+            for it in inventory:
+                if isinstance(it, dict) and str(it.get("name", "") or "").strip():
+                    inv_lines.append(_format_item(it))
+                elif it:
+                    inv_lines.append(str(it))
+            inventory_block = "\n".join([f"- {x}" for x in inv_lines]) if inv_lines else "（空）"
+
+            # 强约束：本次必须输出哪种提示，并且只能围绕选定目标
+            system_prompt = (
+                "你是规则怪谈游戏的提示生成器。你知道后台完整规则与隐藏真相，但必须严格控制剧透。\n"
+                "硬性要求：\n"
+                "1) 只输出 JSON，不要 markdown，不要多余文字。\n"
+                "2) 禁止直接复述/泄露隐藏真相内容；禁止给出‘完整答案’。\n"
+                "3) 提示要可执行：给玩家一个下一步行动建议。\n"
+                "4) 本次 kind 必须与用户请求一致：rule 或 clue。\n"
+                "5) rule 模式只能点评一条规则；clue 模式只能提示一个物品。\n\n"
+                "输出 JSON：\n"
+                "- rule：{\"kind\":\"rule\",\"rule_index\":1,\"hint\":\"...\",\"next_action\":\"...\"}（若点评的是口述规矩而非编号规则，请输出 rule_index=0）\n"
+                "- clue：{\"kind\":\"clue\",\"item\":\"...\",\"hint\":\"...\",\"next_action\":\"...\"}"
+
+            )
+
+            user_prompt = (
+                f"本次提示类型(kind)：{hint_mode}\n"
+                f"场景：{session.scene_name}\n"
+                f"背景：{session.background}\n"
+                f"通关条件：{session.win_condition}\n"
+                f"隐藏真相（仅供你内部推理，禁止输出）：{session.hidden_truth}\n\n"
+                f"完整规则表：\n{rules_block if rules_block else '（无）'}\n\n"
+                f"玩家已知规则：\n{known_rules_block}\n\n"
+                f"玩家状态：理智{player.sanity}/100 体力{player.health}/100 位置:{player.location}\n\n"
+                f"背包物品：\n{inventory_block}\n\n"
+            )
+
+            if hint_mode == "rule":
+                if target_rule_index_1b is not None and target_rule_text:
+                    user_prompt += (
+                        f"本次必须点评的规则编号：{target_rule_index_1b}\n"
+                        f"该规则原文：{target_rule_text}\n"
+                    )
+                elif target_rule_text:
+                    user_prompt += (
+                        f"本次必须点评的口述规矩：{target_rule_text}\n"
+                        "输出 rule_index=0。\n"
+                    )
+
+                else:
+                    user_prompt += "玩家目前没有可点评的已知规则，请给出如何低风险获得规则信息的提示。\n"
+            else:
+                if selected_item_text:
+                    user_prompt += f"本次必须提示的物品：{selected_item_text}\n"
+                else:
+                    user_prompt += "玩家背包为空，请给出如何低风险获得线索的提示。\n"
+
+
+            hint_text = ""
+            next_action = ""
+
+            try:
+                llm = LLMClient()
+                resp = await llm.call(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.4,
+                    max_tokens=min(600, get_default_max_tokens()),
+                )
+                data = resp.parse_json()
+
+                if isinstance(data, dict):
+                    hint_text = str(data.get("hint", "") or "").strip()
+                    next_action = str(data.get("next_action", "") or "").strip()
+
+                    # 非剧透兜底：如果模型把隐藏真相片段直接写出来，直接弃用本次输出
+                    ht = str(getattr(session, "hidden_truth", "") or "")
+                    ht_probe = ht[:20].strip() if ht else ""
+                    if ht_probe and ((ht_probe in hint_text) or (ht_probe in next_action)):
+                        logger.warning("LLM 提示疑似泄露隐藏真相片段，已弃用并回退兜底提示")
+                        hint_text = ""
+                        next_action = ""
+
+
+            except Exception as e:
+                logger.warning(f"LLM 提示生成失败，将使用兜底提示: {e}")
+
+            # 兜底：保留原先的提示策略（不依赖 LLM）
+            if not hint_text:
+                total_rules = len(session.rules or [])
+                have_unknown = bool(total_rules and len(set(known_indices)) < total_rules)
+                if want_clue:
+                    hint_text = (
+                        "先别做高风险动作。用低风险的方式‘确认事实’：\n"
+                        "- 观察/检查可写字的东西（告示、标签、票据、墙面痕迹）\n"
+                        "- 询问在场NPC‘这里有什么禁忌’，注意对方态度变化\n"
+                        "- 用 `/rg 道具` 复盘你拿到的物品是否暗示线索"
                     )
                 else:
-                    hint = (
-                        "把你已知的规则逐条对照现场：哪些能被立刻验证？\n"
-                        "用最小代价做试探（例如观察、短暂停留、轻触），再决定是否行动。"
-                    )
+                    npc_name = "NPC"
+                    if isinstance(getattr(session, "npc_guidance", None), dict):
+                        npc_name = str(session.npc_guidance.get("npc_name", "NPC") or "NPC")
+                    if have_unknown:
+                        hint_text = (
+                            "你直觉觉得‘规矩’还没说完。\n"
+                            f"尝试在同一地点礼貌地询问{npc_name}，或寻找规则载体（告示/收据/标签）。\n"
+                            "注意：你越礼貌、越像在确认而非逼问，越可能得到更多信息。"
+                        )
+                    else:
+                        hint_text = (
+                            "把你已知的规则逐条对照现场：哪些能被立刻验证？\n"
+                            "用最小代价做试探（例如观察、短暂停留、轻触），再决定是否行动。"
+                        )
 
-            
+            # 拼接下一步建议（可选）
+            if next_action:
+                hint = f"{hint_text}\n\n下一步建议：{next_action}"
+            else:
+                hint = hint_text
+
             # 保存状态
             save_manager = SaveManager()
             await save_manager.schedule_save(group_id, session)
-            
-            await self.send_text(
-                f"**提示（剩余{session.hint_count}次）**\n\n{hint}"
-            )
+
+            await self.send_text(f"**提示（剩余{session.hint_count}次）**\n\n{hint}")
             return True, "提示已发送", 2
-            
+
         except Exception as e:
             logger.error(f"生成提示失败: {e}", exc_info=True)
             await self.send_text(f"生成提示时出错：{e}")
@@ -1479,6 +1713,7 @@ class RuleHorrorCommand(BaseCommand):
         finally:
             if state:
                 state.release()
+
 
     async def _handle_推理(
         self,
