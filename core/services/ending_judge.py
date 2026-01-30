@@ -97,27 +97,34 @@ class EndingJudge:
 
     async def _judge_with_llm(self, context: dict[str, Any]) -> dict[str, Any]:
         """使用LLM判定结局"""
-        system_prompt = """你是规则怪谈游戏的结局判定系统.你需要根据玩家的表现判定结局类型.
+        system_prompt = """你是规则怪谈游戏的结局判定系统。你需要根据玩家的表现判定结局类型。
 
 结局类型:
-1. perfect(完美):推理出隐藏真相 + 达成通关条件 + 解除规则怪谈根源
-2. success(成功):推理出隐藏真相 + 达成通关条件
-3. cleared(通关):达成通关条件,但未完全理解真相
-4. failed(失败):玩家死亡或未达成通关条件
+1. perfect(完美): 推理出隐藏真相 + 达成通关条件 + 解除规则怪谈根源
+2. success(成功): 推理出隐藏真相 + 达成通关条件
+3. cleared(通关): 达成通关条件, 但未完全理解真相
+4. failed(失败): 玩家死亡或未达成通关条件
 
 判定标准:
 - 检查玩家的推理是否接近隐藏真相
 - 检查玩家是否达成通关条件
 - 检查玩家的行动是否解决了根源问题
 
+输出要求（很重要）:
+- `description` 只写结局叙事画面（200-500字），不要复盘推理过程，不要解释规则原理，不要评价玩家
+- `reasoning_analysis` 只在 perfect/success/cleared 时填写；failed 时必须是空字符串
+- failed（玩家死亡或未达成通关条件）时：`truth_revealed` 必须为 false
+- 严禁使用任何 emoji
+
 返回JSON格式:
 {
     "ending_type": "perfect/success/cleared/failed",
     "title": "结局标题",
-    "description": "结局描述:200-500字,详细描述结局场景",
-    "reasoning_analysis": "推理分析(评价玩家的推理过程)",
+    "description": "结局描述（纯叙事）",
+    "reasoning_analysis": "推理分析（可为空）",
     "truth_revealed": true/false
 }"""
+
 
         user_prompt = f"""场景:{context['scene_name']}
 隐藏真相:{context['hidden_truth']}

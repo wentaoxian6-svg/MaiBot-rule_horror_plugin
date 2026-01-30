@@ -21,7 +21,10 @@ class GameGenerator:
         self,
         group_id: str,
         game_mode: str = "单人",
+        player_count: int | None = None,
+        player_names: list[str] | None = None,
     ) -> GameSession:
+
         """
         生成完整的游戏会话
         
@@ -66,8 +69,9 @@ class GameGenerator:
         
         # 如果是多人模式，生成多身份系统和协作规则
         if game_mode == "多人":
-            await self._generate_multi_identity_system(session, game_data)
+            await self._generate_multi_identity_system(session, game_data, player_count=player_count, player_names=player_names)
             await self._generate_collaborative_rules(session)
+
         
         logger.info(f"游戏生成完成: {session.scene_name}")
         return session
@@ -157,9 +161,24 @@ class GameGenerator:
         except Exception as e:
             logger.error(f"生成协作规则失败: {e}")
 
-    async def _generate_multi_identity_system(self, session: GameSession, game_data: dict[str, Any]) -> None:
+    async def _generate_multi_identity_system(
+        self,
+        session: GameSession,
+        game_data: dict[str, Any],
+        player_count: int | None = None,
+        player_names: list[str] | None = None,
+    ) -> None:
         """生成多身份系统（多人模式）"""
-        system_prompt = """你是规则怪谈游戏的多身份系统生成器。你需要为多人模式生成2-4个不同的玩家身份。
+        desired = 3
+        if isinstance(player_count, int) and player_count > 0:
+            desired = max(2, min(4, player_count))
+
+        names_text = "、".join([str(x) for x in (player_names or []) if str(x).strip()])
+        if names_text:
+            names_text = f"玩家名单：{names_text}"
+
+        system_prompt = f"""你是规则怪谈游戏的多身份系统生成器。你需要为多人模式生成{desired}个不同的玩家身份。
+
 
 **多身份系统要求：**
 
@@ -204,7 +223,7 @@ class GameGenerator:
 **重要：**
 - 仅返回JSON，不要包含其他文字或标签
 - 严禁使用emoji表情符号
-- 生成2-4个身份
+- 必须生成{desired}个身份
 - 每个身份2-3条独特规则
 - 1-2条共同规则"""
 
@@ -214,8 +233,10 @@ class GameGenerator:
 背景：{session.background}
 玩家身份（单人模式）：{session.player_identity}
 隐藏真相：{session.hidden_truth}
+{names_text}
 
-请生成2-4个不同的玩家身份，每个身份有独特的规则和信息。"""
+请生成{desired}个不同的玩家身份，每个身份有独特的规则和信息。"""
+
 
         try:
             response = await self.llm_client.call(
@@ -229,11 +250,19 @@ class GameGenerator:
             # 保存多身份数据到session
             if "multi_identity" not in session.rule_network:
                 session.rule_network["multi_identity"] = {}
-            
-            session.rule_network["multi_identity"]["identities"] = identity_data.get("identities", [])
-            session.rule_network["multi_identity"]["common_rules"] = identity_data.get("common_rules", [])
-            
-            logger.info(f"多身份系统生成成功: {len(identity_data.get('identities', []))}个身份")
+
+            identities = identity_data.get("identities", [])
+            common_rules = identity_data.get("common_rules", [])
+
+            session.rule_network["multi_identity"]["identities"] = identities if isinstance(identities, list) else []
+            session.rule_network["multi_identity"]["common_rules"] = common_rules if isinstance(common_rules, list) else []
+
+            # 多人模式规则展示/判定：优先使用共同规则作为“公用规则表”
+            if isinstance(common_rules, list) and common_rules:
+                session.rules = common_rules
+
+            logger.info(f"多身份系统生成成功: {len(session.rule_network['multi_identity'].get('identities', []))}个身份")
+
             
         except Exception as e:
             logger.error(f"生成多身份系统失败: {e}")
