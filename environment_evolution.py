@@ -1,11 +1,22 @@
+# pyright: reportDeprecated=false
+# pyright: reportExplicitAny=false
+# pyright: reportAny=false
+# pyright: reportUnknownMemberType=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportUnknownArgumentType=false
+# pyright: reportUnknownParameterType=false
+# pyright: reportUnannotatedClassAttribute=false
+# pyright: reportUnusedParameter=false
+
 import os
 import json
 import random
 import re
-import asyncio
 import aiohttp
 from typing import List, Tuple, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime
+
+from .shared_prompts import RULE_DESIGN_PRINCIPLES
 
 PLUGIN_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
@@ -16,9 +27,6 @@ class EnvironmentEvolutionSystem:
     
     def __init__(self, game_states: Dict[str, Any]):
         self.game_states = game_states
-        self.npc_system = NPCSystem()
-        self.time_system = TimeSystem()
-        self.event_system = EventSystem()
         
     async def initialize_environment(self, group_id: str, scene_type: str, 
                                       player_identity: str, building_type: str) -> Dict[str, Any]:
@@ -60,8 +68,9 @@ class EnvironmentEvolutionSystem:
     
     async def generate_npcs(self, group_id: str, scene_type: str, 
                             player_identity: str, building_type: str,
-                            api_url: str, api_key: str, model_list: list,
-                            current_model_index: int, temperature: float) -> List[Dict[str, Any]]:
+                            api_url: str, api_key: str, model_list: List[str],
+                            current_model_index: int, temperature: float,
+                            game_mode: str = "单人") -> List[Dict[str, Any]]:
         """生成NPC角色"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -74,12 +83,15 @@ class EnvironmentEvolutionSystem:
         for i in range(num_npcs):
             existing_roles_text = ", ".join(existing_roles) if existing_roles else "无"
             
+            game_mode_text = f"游戏模式：{game_mode}" if game_mode else "游戏模式：单人"
+            
             prompt = f"""
 你是一位规则怪谈游戏设计师。请为以下场景生成1个NPC角色。
 
 场景类型：{scene_type}
 建筑类型：{building_type}
 玩家身份：{player_identity}
+{game_mode_text}
 背景故事：{game_state.get('background', '')}
 规则：{json.dumps(game_state.get('rules', []), ensure_ascii=False)}
 隐藏真相：{game_state.get('hidden_truth', '')}
@@ -97,6 +109,17 @@ class EnvironmentEvolutionSystem:
 7. **出现地点**：NPC通常出现的地点
 8. **出现时间**：NPC通常出现的时间段
 
+**多人模式NPC设计（非常重要）：**
+- 如果游戏模式是"多人"，请考虑NPC对不同玩家的态度可能不同
+- NPC可能对某种身份的玩家友好，对另一种身份的玩家敌对
+- 或者NPC对第一个遇到的玩家伪装友好，对后续玩家暴露敌意
+- 或者NPC根据玩家的行为动态调整态度
+- 请在"attitude_to_player"字段中描述这种动态关系，例如：
+  * "对医生玩家友好，对病人玩家敌对"
+  * "对第一个遇到的玩家伪装友好，对后续玩家暴露敌意"
+  * "对遵守规则的玩家友好，对违反规则的玩家敌对"
+  * "一视同仁，对所有玩家态度相同"
+
 **输出格式：**
 请以JSON格式返回，格式如下：
 {{
@@ -107,7 +130,7 @@ class EnvironmentEvolutionSystem:
       "personality": "性格特征",
       "behavior": "行为模式",
       "truth_relation": "与真相的关系",
-      "attitude_to_player": "对玩家的态度",
+      "attitude_to_player": "对玩家的态度（多人模式：描述对不同玩家的动态关系）",
       "special_ability": "特殊能力或限制",
       "location": "通常出现的地点",
       "time_appearance": "通常出现的时间段",
@@ -147,7 +170,7 @@ class EnvironmentEvolutionSystem:
     
     async def generate_complete_rules(self, group_id: str, scene_name: str,
                                           player_identity: str, building_type: str,
-                                          api_url: str, api_key: str, model_list: list,
+                                          api_url: str, api_key: str, model_list: List[str],
                                           current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
         """生成完整的场景规则
         
@@ -184,44 +207,31 @@ class EnvironmentEvolutionSystem:
 隐藏真相（非常重要）：
 {game_state.get('hidden_truth', '')}
 
-**规则设计原则：**
+{RULE_DESIGN_PRINCIPLES}
 
-1. **规则数量**：生成5-8条规则，规则应该看似合理但隐藏着诡异之处
+**额外规则要求（环境演化系统特定）：**
 
-2. **规则与场景呼应**：规则应该与剧情导入和场景结构紧密呼应
-   - 规则应该反映场景的历史和异常现象
-   - 规则应该与玩家的身份和任务相关
-   - 规则应该隐藏有一部分真相，但不直接揭示
-
-3. **通关条件**：设定明确的通关条件
-   - 如：在规定时间内找到出口、收集特定物品、存活到天亮等
-   - 通关条件应该与规则和真相有逻辑关联
-   - 通关条件应该具有一定的挑战性，但不是不可能完成
-
-4. **解除条件**：设定解除规则怪谈根源的条件
-   - 如：找到规则怪谈的根源并消除它、找到某个特定物品并使用、完成某个仪式等
-   - 解除条件应该比通关条件更难达成
-   - 解除条件应该揭示真相并彻底解决问题
-
-5. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
-   - 规则不是随意的，而是有内在的逻辑体系
-   - 规则之间应该形成推理链条
-   - 玩家需要通过观察和推理发现规则背后的真相
-
-6. **规则与环境绑定（非常重要）**：
+1. **规则与环境绑定（非常重要）：**
    - 请将至少2-3条规则与场景中特定的、可交互的环境细节直接关联
    - 例如，如果规则是"不要理会走廊尽头的呼救声"，那么与之关联的环境可以是"走廊尽头的温度总是异常低，且墙上有抓痕"
    - 这样，玩家在探索到该位置时，能通过环境感知强化对规则的记忆和怀疑
    - 环境绑定应该自然、巧妙，不要过于明显
 
-7. **规则间的潜在冲突（非常重要）**：
+2. **规则间的潜在冲突（非常重要）：**
    - 请尝试构建至少一组存在潜在矛盾的规则
    - 例如，规则A："午夜后必须留在自己的房间内。" 规则B："公寓中没有404室。"规则C："公寓中有404室。"
    - 实际上公寓中有404室，但是仅在午夜后才会出现，此时玩家将陷入遵守A还是出门寻找404室的两难境地
    - 请在 hidden_truth 中解释这种矛盾的本质（如：B、C两条规则来自不同势力）
    - 在 death_triggers 中隐含相关触发条件
 
-8. **规则与真相的因果关系（非常重要）**：
+3. **死亡触发条件要求（环境演化系统特定）：**
+   - 列出会导致死亡的行为
+   - 死亡条件应该与规则和真相有逻辑关联
+   - 死亡条件应该具有一定的隐蔽性，不是一眼就能看穿
+   - 死亡条件应该给玩家一定的容错空间
+   - 死亡条件的描述应该简洁、明确
+
+**输出格式：**
    - 每条规则都应该与隐藏真相中的某个要素有直接的因果关系
    - 规则不是孤立的，而是形成了一个相互关联的规则网络
    - 例如：
@@ -314,7 +324,8 @@ class EnvironmentEvolutionSystem:
 
     async def generate_npc_initial_guidance(self, group_id: str, scene_name: str,
                                              player_identity: str, building_type: str,
-                                             api_url: str, api_key: str, model_list: list,
+                                             game_mode: str,
+                                             api_url: str, api_key: str, model_list: List[str],
                                              current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
         """生成NPC初始引导
         
@@ -323,6 +334,7 @@ class EnvironmentEvolutionSystem:
             scene_name: 场景名称
             player_identity: 玩家身份
             building_type: 建筑类型
+            game_mode: 游戏模式（单人/多人）
             api_url: API地址
             api_key: API密钥
             model_list: 模型列表
@@ -360,6 +372,7 @@ class EnvironmentEvolutionSystem:
 场景：{scene_name}
 建筑类型：{building_type}
 玩家身份：{player_identity}
+游戏模式：{game_mode}
 背景故事：{game_state.get('background', '')}
 隐藏真相：{game_state.get('hidden_truth', '')}
 
@@ -380,10 +393,11 @@ class EnvironmentEvolutionSystem:
    - 只能选择一种方式，不要同时使用两种方式
 
 3. **引导内容**：
-   - NPC的行为描述（如：NPC走近玩家、递给玩家一张纸条、指着某个方向等）
+   - NPC的行为描述（如：NPC走近玩家，递给玩家一张纸条，指着某个方向等）
    - NPC的对话内容（如：欢迎语、工作职责、行为规范、禁止事项等）
    - 如果选择规则载体引导，则使用提供的完整规则载体信息
    - NPC的态度和语气（如：严厉、温和、神秘、不耐烦等）
+   - **重要**：如果是多人模式，NPC的引导应该面向所有玩家，使用"你们"等复数称呼，确保引导适用于多个玩家
 
 4. **规则融入**：
    - 如果选择自然语言引导：将规则融入NPC的对话和行为中，不要直接列出规则，而是让玩家通过NPC的引导自然理解规则
@@ -442,7 +456,7 @@ class EnvironmentEvolutionSystem:
     
     async def update_environment(self, group_id: str, player_actions: List[str],
                                    player_locations: List[str],
-                                   api_url: str, api_key: str, model_list: list,
+                                   api_url: str, api_key: str, model_list: List[str],
                                    current_model_index: int, temperature: float) -> Dict[str, Any]:
         """更新环境状态"""
         game_state = self.game_states.get(group_id, {})
@@ -585,7 +599,7 @@ class EnvironmentEvolutionSystem:
     
     async def generate_identity_guide(self, group_id: str, player_identity: str,
                                      building_type: str, api_url: str, api_key: str,
-                                     model_list: list, current_model_index: int,
+                                     model_list: List[str], current_model_index: int,
                                      temperature: float) -> Optional[Dict[str, Any]]:
         """生成身份引导信息（如管家引导侍者）"""
         game_state = self.game_states.get(group_id, {})
@@ -727,7 +741,7 @@ class EnvironmentEvolutionSystem:
     
     async def trigger_area_violation_consequences(self, group_id: str, player_identity: str,
                                                    target_area: str, api_url: str, api_key: str,
-                                                   model_list: list, current_model_index: int,
+                                                   model_list: List[str], current_model_index: int,
                                                    temperature: float) -> Optional[Dict[str, Any]]:
         """触发进入限制区域的负面后果"""
         game_state = self.game_states.get(group_id, {})
@@ -836,7 +850,7 @@ NPC性格：{relevant_npc.get('personality', '神秘、危险')}
         return violation_event
     
     async def update_identity_permissions(self, group_id: str, new_identity: str,
-                                          api_url: str, api_key: str, model_list: list,
+                                          api_url: str, api_key: str, model_list: List[str],
                                           current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
         """更新身份权限（当玩家身份变化时）"""
         game_state = self.game_states.get(group_id, {})
@@ -930,7 +944,7 @@ NPC性格：{relevant_npc.get('personality', '神秘、危险')}
         return identity_guides.get(player_identity)
     
     async def trigger_random_event(self, group_id: str, player_location: str,
-                                   api_url: str, api_key: str, model_list: list,
+                                   api_url: str, api_key: str, model_list: List[str],
                                    current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
         """触发随机事件"""
         game_state = self.game_states.get(group_id, {})
@@ -1011,7 +1025,7 @@ NPC性格：{relevant_npc.get('personality', '神秘、危险')}
     
     async def check_npc_interaction(self, group_id: str, player_location: str,
                                      player_action: str, api_url: str, api_key: str,
-                                     model_list: list, current_model_index: int,
+                                     model_list: List[str], current_model_index: int,
                                      temperature: float) -> Optional[Dict[str, Any]]:
         """检查NPC交互"""
         game_state = self.game_states.get(group_id, {})
@@ -1124,7 +1138,7 @@ NPC最近活动轨迹：
         return interaction
     
     async def check_npc_active_interaction(self, group_id: str, player_location: str,
-                                             api_url: str, api_key: str, model_list: list,
+                                             api_url: str, api_key: str, model_list: List[str],
                                              current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
         """检查NPC主动交互"""
         game_state = self.game_states.get(group_id, {})
@@ -1179,7 +1193,7 @@ NPC最近活动轨迹：
         if not eligible_npcs:
             return None
         
-        eligible_npcs.sort(key=lambda x: x["priority"], reverse=True)
+        eligible_npcs.sort(key=lambda x: x["priority"], reverse=True)  # pyright: ignore[reportUnknownLambdaType]
         selected_npc_data = eligible_npcs[0]
         selected_npc = selected_npc_data["npc"]
         
@@ -1401,7 +1415,7 @@ NPC信息：
             return f"在{npc_location}附近，你注意到了{npc_role}{npc_name}，{npc_activity}。"
     
     async def check_time_based_death(self, group_id: str, api_url: str, api_key: str,
-                                      model_list: list, current_model_index: int,
+                                      model_list: List[str], current_model_index: int,
                                       temperature: float) -> Tuple[bool, Optional[str]]:
         """检查基于时间的死亡条件"""
         game_state = self.game_states.get(group_id, {})
@@ -1492,7 +1506,7 @@ NPC信息：
         else:
             return "深夜"
     
-    def _parse_llm_json_response(self, llm_response: str, step_name: str = "步骤") -> Optional[dict]:
+    def _parse_llm_json_response(self, llm_response: str, step_name: str = "步骤") -> Optional[Dict[str, Any]]:
         """解析LLM返回的JSON响应，支持提取JSON部分并处理控制字符和不完整的JSON"""
         if not llm_response:
             print(f"[环境演化] {step_name} LLM返回为空")
@@ -1504,7 +1518,7 @@ NPC信息：
             json_str = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', json_str)
             return json_str
         
-        def try_parse_json(json_str: str) -> Optional[dict]:
+        def try_parse_json(json_str: str) -> Optional[Dict[str, Any]]:
             """尝试解析JSON，返回解析结果或None"""
             try:
                 cleaned_str = clean_json_string(json_str)
@@ -1513,7 +1527,7 @@ NPC信息：
             except json.JSONDecodeError:
                 return None
         
-        def fix_incomplete_json(json_str: str) -> Optional[str]:
+        def fix_incomplete_json(json_str: str) -> Optional[Dict[str, Any]]:
             """尝试修复不完整的JSON"""
             try:
                 cleaned_str = clean_json_string(json_str)
@@ -1580,7 +1594,7 @@ NPC信息：
             return None
     
     async def _call_llm_api(self, prompt: str, api_url: str, api_key: str,
-                             model_list: list, current_model_index: int,
+                             model_list: List[str], current_model_index: int,
                              temperature: float, max_tokens: int = 16000) -> Optional[str]:
         """调用LLM API，支持重试机制和截断检测"""
         import asyncio
@@ -1712,143 +1726,3 @@ NPC信息：
         
         return None
 
-
-class NPCSystem:
-    """NPC管理系统"""
-    
-    def __init__(self):
-        self.npcs = {}
-    
-    def add_npc(self, group_id: str, npc: Dict[str, Any]) -> None:
-        """添加NPC"""
-        if group_id not in self.npcs:
-            self.npcs[group_id] = []
-        self.npcs[group_id].append(npc)
-    
-    def get_npcs(self, group_id: str) -> List[Dict[str, Any]]:
-        """获取所有NPC"""
-        return self.npcs.get(group_id, [])
-    
-    def get_npc_by_name(self, group_id: str, name: str) -> Optional[Dict[str, Any]]:
-        """根据姓名获取NPC"""
-        npcs = self.get_npcs(group_id)
-        for npc in npcs:
-            if npc.get("name") == name:
-                return npc
-        return None
-    
-    def update_npc_state(self, group_id: str, npc_name: str, updates: Dict[str, Any]) -> bool:
-        """更新NPC状态"""
-        npc = self.get_npc_by_name(group_id, npc_name)
-        if npc:
-            npc.update(updates)
-            return True
-        return False
-
-
-class TimeSystem:
-    """时间管理系统"""
-    
-    def __init__(self):
-        self.time_states = {}
-    
-    def initialize_time(self, group_id: str) -> Dict[str, Any]:
-        """初始化时间系统"""
-        time_state = {
-            "start_time": datetime.now().isoformat(),
-            "current_time": "深夜",
-            "elapsed_minutes": 0,
-            "last_update": datetime.now().isoformat(),
-            "time_phase": "午夜"
-        }
-        self.time_states[group_id] = time_state
-        return time_state
-    
-    def update_time(self, group_id: str) -> Dict[str, Any]:
-        """更新时间"""
-        time_state = self.time_states.get(group_id)
-        if not time_state:
-            return {}
-        
-        current_time = datetime.now()
-        last_update = datetime.fromisoformat(time_state["last_update"])
-        elapsed_minutes = (current_time - last_update).total_seconds() / 60
-        
-        time_state["elapsed_minutes"] += elapsed_minutes
-        time_state["last_update"] = current_time.isoformat()
-        
-        return time_state
-    
-    def get_time_description(self, group_id: str) -> str:
-        """获取时间描述"""
-        time_state = self.time_states.get(group_id)
-        if not time_state:
-            return "未知时间"
-        
-        elapsed_minutes = time_state["elapsed_minutes"]
-        
-        if elapsed_minutes < 30:
-            return "午夜时分，周围一片死寂"
-        elif elapsed_minutes < 60:
-            return "凌晨时分，寒意渐浓"
-        elif elapsed_minutes < 90:
-            return "黎明前最黑暗的时刻"
-        elif elapsed_minutes < 120:
-            return "黎明破晓，微光初现"
-        elif elapsed_minutes < 180:
-            return "清晨时分，薄雾弥漫"
-        elif elapsed_minutes < 240:
-            return "上午时分，阳光微弱"
-        elif elapsed_minutes < 300:
-            return "中午时分，阳光明媚"
-        elif elapsed_minutes < 360:
-            return "下午时分，阳光西斜"
-        elif elapsed_minutes < 420:
-            return "傍晚时分，夕阳西下"
-        elif elapsed_minutes < 480:
-            return "黄昏时分，暮色四合"
-        elif elapsed_minutes < 540:
-            return "入夜时分，夜幕降临"
-        else:
-            return "深夜时分，黑暗笼罩"
-
-
-class EventSystem:
-    """事件管理系统"""
-    
-    def __init__(self):
-        self.active_events = {}
-        self.event_history = {}
-    
-    def add_event(self, group_id: str, event: Dict[str, Any]) -> None:
-        """添加事件"""
-        if group_id not in self.active_events:
-            self.active_events[group_id] = []
-        if group_id not in self.event_history:
-            self.event_history[group_id] = []
-        
-        self.active_events[group_id].append(event)
-        self.event_history[group_id].append(event)
-    
-    def get_active_events(self, group_id: str) -> List[Dict[str, Any]]:
-        """获取活跃事件"""
-        return self.active_events.get(group_id, [])
-    
-    def get_event_history(self, group_id: str) -> List[Dict[str, Any]]:
-        """获取事件历史"""
-        return self.event_history.get(group_id, [])
-    
-    def resolve_event(self, group_id: str, event_id: str, choice: str) -> Optional[Dict[str, Any]]:
-        """解决事件"""
-        active_events = self.get_active_events(group_id)
-        for event in active_events:
-            if event.get("event_id") == event_id:
-                event["resolved"] = True
-                event["player_choice"] = choice
-                event["resolution_time"] = datetime.now().isoformat()
-                return event
-        return None
-    
-    def clear_active_events(self, group_id: str) -> None:
-        """清除活跃事件"""
-        self.active_events[group_id] = []
