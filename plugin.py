@@ -2211,15 +2211,25 @@ class RuleHorrorCommand(BaseCommand):
             session.ended_at = datetime.now()
             
             # 生成结局图片
+            # - 死亡/失败/强制结束（玩家主动结束且未通关）不展示“解释/推理分析/隐藏真相”
+            forced_end = (player.status == PlayerStatus.ALIVE and not session.has_cleared)
+            ending_type = str(getattr(ending, "ending_type", "") or "")
+            hide_explain = forced_end or (ending_type == "failed") or (player.status != PlayerStatus.ALIVE)
+
+            reasoning_analysis = "" if hide_explain else str(getattr(ending, "reasoning_analysis", "") or "")
+            truth_revealed = False if hide_explain else bool(getattr(ending, "truth_revealed", False))
+            hidden_truth = session.hidden_truth if truth_revealed else None
+
             image_generator = AsyncImageGenerator(self._temp_images_dir)
             ending_image = await image_generator.generate_ending_image(
                 ending_title=ending.title,
                 ending_description=ending.description,
-                reasoning_analysis=ending.reasoning_analysis,
-                truth_revealed=ending.truth_revealed,
-                hidden_truth=session.hidden_truth if ending.truth_revealed else None,
+                reasoning_analysis=reasoning_analysis,
+                truth_revealed=truth_revealed,
+                hidden_truth=hidden_truth,
                 ending_type=ending.ending_type,
             )
+
             
             # 发送结局图片
             with open(ending_image, 'rb') as f:
