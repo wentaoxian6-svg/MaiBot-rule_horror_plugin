@@ -776,6 +776,9 @@ class AsyncImageGenerator:
         # 因此：即使本次行动判定死亡，也要优先进入理智崩坏展示，而不是只显示“你已死亡”。
         is_insane_mode = (sanity == 0)
 
+        # 注意：保留 action 参数是为了兼容调用方；行动长图不再复述玩家行动
+        _ = action
+
         if is_insane_mode:
             char_per_line = 35
 
@@ -784,7 +787,6 @@ class AsyncImageGenerator:
         if is_dead and not is_insane_mode:
             # 死亡但未崩坏：依然给出行动长图的关键文本（场景描述/行动反馈），避免只剩三行
             content_lines.append(f"行动结果 - {user_name}")
-            content_lines.append(f"行动：{action}")
             content_lines.append("你已死亡！")
 
             if scene_description:
@@ -821,7 +823,6 @@ class AsyncImageGenerator:
         else:
             # 正常模式
             content_lines.append(f"行动结果 - {user_name}")
-            content_lines.append(f"行动：{action}")
             content_lines.append("")
             content_lines.append("场景描述：")
 
@@ -1005,11 +1006,11 @@ class AsyncImageGenerator:
         for i in range(0, len(ending_description), char_per_line):
             content_lines.append(ending_description[i:i+char_per_line])
         
-        content_lines.append("")
-        
-        # 推理分析
-        for i in range(0, len(reasoning_analysis), char_per_line):
-            content_lines.append(reasoning_analysis[i:i+char_per_line])
+        # 推理分析（可选）：死亡/失败/强制结束等情况可传空字符串以隐藏解释
+        if reasoning_analysis and str(reasoning_analysis).strip():
+            content_lines.append("")
+            for i in range(0, len(reasoning_analysis), char_per_line):
+                content_lines.append(reasoning_analysis[i:i+char_per_line])
         
         # 隐藏真相
         if truth_revealed and hidden_truth:
