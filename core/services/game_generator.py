@@ -23,7 +23,9 @@ class GameGenerator:
         game_mode: str = "单人",
         player_count: int | None = None,
         player_names: list[str] | None = None,
+        player_ids: list[str] | None = None,
     ) -> GameSession:
+
 
         """
         生成完整的游戏会话
@@ -41,11 +43,18 @@ class GameGenerator:
         game_data = await self._generate_scene_and_rules(game_mode)
         
         # 创建游戏会话
+        # 多人模式下：优先把“到来原因”作为对外展示的共同叙事入口，个人身份通过私聊下发
+        player_identity = game_data.get("player_identity", "访客")
+        if game_mode == "多人":
+            arrival_reason = game_data.get("arrival_reason")
+            if isinstance(arrival_reason, str) and arrival_reason.strip():
+                player_identity = arrival_reason.strip()
+
         session = GameSession(
             group_id=group_id,
             scene_name=game_data.get("scene_name", "未知场景"),
             background=game_data.get("background", ""),
-            player_identity=game_data.get("player_identity", "访客"),
+            player_identity=player_identity,
             hidden_truth=game_data.get("hidden_truth", ""),
             game_mode=game_mode,
             rules=game_data.get("rules", []),
@@ -55,6 +64,7 @@ class GameGenerator:
             scene_structure=game_data.get("scene_structure", {}),
             npc_guidance=game_data.get("npc_guidance", {}),
         )
+
         
         # 记录场景结构信息
         if session.scene_structure:
@@ -69,8 +79,15 @@ class GameGenerator:
         
         # 如果是多人模式，生成多身份系统和协作规则
         if game_mode == "多人":
-            await self._generate_multi_identity_system(session, game_data, player_count=player_count, player_names=player_names)
+            await self._generate_multi_identity_system(
+                session,
+                game_data,
+                player_count=player_count,
+                player_names=player_names,
+                player_ids=player_ids,
+            )
             await self._generate_collaborative_rules(session)
+
 
         
         logger.info(f"游戏生成完成: {session.scene_name}")
@@ -167,18 +184,36 @@ class GameGenerator:
         game_data: dict[str, Any],
         player_count: int | None = None,
         player_names: list[str] | None = None,
+        player_ids: list[str] | None = None,
     ) -> None:
+
         """生成多身份系统（多人模式）"""
-        desired = 3
-        if isinstance(player_count, int) and player_count > 0:
+        # 保留参数以便未来扩展
+        _ = game_data
+
+        # 优先使用 QQ 号列表（更稳定），让 LLM 为“每个 QQ 号”生成一条分配结果
+
+        players: list[dict[str, str]] = []
+        if isinstance(player_ids, list) and player_ids:
+            for i, pid in enumerate(player_ids):
+                pid_str = str(pid).strip()
+                if not pid_str:
+                    continue
+                name = ""
+                if isinstance(player_names, list) and i < len(player_names):
+                    name = str(player_names[i] or "").strip()
+                players.append({"player_id": pid_str, "player_name": name})
+
+        desired = len(players) if players else 3
+        if not players and isinstance(player_count, int) and player_count > 0:
             desired = max(2, min(4, player_count))
 
         names_text = "、".join([str(x) for x in (player_names or []) if str(x).strip()])
         if names_text:
             names_text = f"玩家名单：{names_text}"
 
-        system_prompt = f"""你是规则怪谈游戏的多身份系统生成器。你需要为多人模式生成{desired}个不同的玩家身份。
 
+        system_prompt = f"""你是规则怪谈游戏的多身份系统生成器。你需要为多人模式的每一位玩家分配不同身份。
 
 **多身份系统要求：**
 
@@ -199,33 +234,49 @@ class GameGenerator:
    - 拼凑完整真相需要多个身份的信息
 
 **输出格式：**
-{
-  "identities": [
-    {
+{{
+  "assignments": [
+    {{
+      "player_id": "玩家QQ号",
+      "player_name": "玩家昵称",
       "identity_name": "身份名称",
       "identity_description": "身份描述（50字内）",
       "unique_rules": [
-        {"text": "该身份特有的规则1", "is_true": true, "hidden_meaning": "隐藏含义"},
-        {"text": "该身份特有的规则2", "is_true": false, "hidden_meaning": "隐藏含义"}
+        {{"text": "该身份特有的规则1", "is_true": true, "hidden_meaning": "隐藏含义"}},
+        {{"text": "该身份特有的规则2", "is_true": false, "hidden_meaning": "隐藏含义"}}
       ],
-      "npc_attitudes": {
+      "npc_attitudes": {{
         "NPC名称1": "对该身份的态度描述",
         "NPC名称2": "对该身份的态度描述"
-      },
+      }},
       "exclusive_info": "该身份独有的信息或线索"
-    }
+    }}
   ],
   "common_rules": [
-    {"text": "所有身份共同的规则1", "is_true": true, "hidden_meaning": "隐藏含义"}
+    {{"text": "所有身份共同的规则1", "is_true": true, "hidden_meaning": "隐藏含义"}}
   ]
-}
+}}
 
 **重要：**
 - 仅返回JSON，不要包含其他文字或标签
 - 严禁使用emoji表情符号
-- 必须生成{desired}个身份
-- 每个身份2-3条独特规则
-- 1-2条共同规则"""
+- 本次玩家数量：{desired}
+- `assignments` 必须包含 {desired} 条
+- 每个玩家 2-3 条独特规则
+- 1-2 条共同规则
+- `player_id` 必须与输入完全一致"""
+
+
+
+        players_text = "\n".join(
+            [
+                f"- {p.get('player_id','')} {p.get('player_name','')}".strip()
+                for p in players
+                if str(p.get("player_id", "")).strip()
+            ]
+        )
+        if players_text:
+            players_text = f"玩家列表（必须逐条分配，player_id 必须原样返回）：\n{players_text}"
 
         user_prompt = f"""请为以下场景生成多身份系统。
 
@@ -234,8 +285,10 @@ class GameGenerator:
 玩家身份（单人模式）：{session.player_identity}
 隐藏真相：{session.hidden_truth}
 {names_text}
+{players_text}
 
-请生成{desired}个不同的玩家身份，每个身份有独特的规则和信息。"""
+请为每位玩家分配一个不同的身份，并生成对应的个人规则与独有信息。"""
+
 
 
         try:
@@ -251,17 +304,43 @@ class GameGenerator:
             if "multi_identity" not in session.rule_network:
                 session.rule_network["multi_identity"] = {}
 
+            assignments = identity_data.get("assignments", [])
             identities = identity_data.get("identities", [])
             common_rules = identity_data.get("common_rules", [])
 
-            session.rule_network["multi_identity"]["identities"] = identities if isinstance(identities, list) else []
-            session.rule_network["multi_identity"]["common_rules"] = common_rules if isinstance(common_rules, list) else []
+            # 兼容：优先使用 assignments（按 QQ 号逐人分配），同时也生成 identities 结构便于旧逻辑回退
+            normalized_assignments: list[dict[str, Any]] = []
+            if isinstance(assignments, list):
+                for a in assignments:
+                    if isinstance(a, dict) and str(a.get("player_id", "")).strip():
+                        normalized_assignments.append(a)
+
+            if normalized_assignments:
+                identities = [
+                    {
+                        "player_id": str(a.get("player_id", "")).strip(),
+                        "player_name": str(a.get("player_name", "") or "").strip(),
+                        "identity_name": str(a.get("identity_name", "") or "").strip(),
+                        "identity_description": str(a.get("identity_description", "") or "").strip(),
+                        "unique_rules": a.get("unique_rules", []),
+                        "npc_attitudes": a.get("npc_attitudes", {}),
+                        "exclusive_info": str(a.get("exclusive_info", "") or "").strip(),
+                    }
+                    for a in normalized_assignments
+                ]
+
+            mi = session.rule_network["multi_identity"]
+            mi["assignments"] = normalized_assignments
+            mi["identities"] = identities if isinstance(identities, list) else []
+            mi["common_rules"] = common_rules if isinstance(common_rules, list) else []
 
             # 多人模式规则展示/判定：优先使用共同规则作为“公用规则表”
             if isinstance(common_rules, list) and common_rules:
                 session.rules = common_rules
 
-            logger.info(f"多身份系统生成成功: {len(session.rule_network['multi_identity'].get('identities', []))}个身份")
+            count = len(normalized_assignments) if normalized_assignments else len(mi.get("identities", []) or [])
+            logger.info(f"多身份系统生成成功: {count}个分配")
+
 
             
         except Exception as e:
@@ -363,7 +442,8 @@ class GameGenerator:
 4. 避免直接的恐怖描写
 5. 每次生成不同的场景
 
-{"多人模式特别要求：场景应该支持多种不同身份（如医院可以有护士、医生、病人、护工等）" if game_mode == "多人" else ""}
+{"多人模式特别要求：\n1. 场景应该支持多种不同身份（如医院可以有护士、医生、病人、护工等）\n2. arrival_reason 使用第二人称复数‘你们’，描述一行人来到场景的共同原因" if game_mode == "多人" else ""}
+
 
 请直接返回JSON对象，不要有任何其他文字。"""
 
