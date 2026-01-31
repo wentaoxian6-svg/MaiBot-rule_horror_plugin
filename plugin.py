@@ -349,9 +349,24 @@ class RuleHorrorCommand(BaseCommand):
             return
 
         mi = session.rule_network.get("multi_identity", {}) if isinstance(getattr(session, "rule_network", None), dict) else {}
-        identities = mi.get("identities", []) if isinstance(mi, dict) else []
-        if not isinstance(identities, list) or not identities:
+        if not isinstance(mi, dict):
             return
+
+        # 新结构：按 player_id（QQ号）逐人分配
+        assignments = mi.get("assignments", [])
+        by_pid: dict[str, dict[str, Any]] = {}
+        if isinstance(assignments, list):
+            for a in assignments:
+                if isinstance(a, dict):
+                    pid = str(a.get("player_id", "")).strip()
+                    if pid:
+                        by_pid[pid] = a
+
+        # 旧结构回退：按加入顺序/循环分配 identities
+        identities = mi.get("identities", [])
+        if (not by_pid) and (not isinstance(identities, list) or not identities):
+            return
+
 
         # 补全顺序列表
         order = [str(x) for x in (player_order or []) if str(x)]
@@ -365,9 +380,17 @@ class RuleHorrorCommand(BaseCommand):
             p = session.players.get(pid)
             if not p:
                 continue
-            ident = identities[i % len(identities)] if identities else {}
-            if not isinstance(ident, dict):
+            ident: dict[str, Any] = {}
+            if by_pid and pid in by_pid:
+                ident = by_pid[pid]
+            elif isinstance(identities, list) and identities:
+                maybe = identities[i % len(identities)]
+                if isinstance(maybe, dict):
+                    ident = maybe
+
+            if not ident:
                 continue
+
 
             p.identity = str(ident.get("identity_name") or "").strip() or None
             p.identity_description = str(ident.get("identity_description") or "").strip() or None
@@ -385,7 +408,103 @@ class RuleHorrorCommand(BaseCommand):
                 session.environment_state["multiplayer"]["assigned_identities"] = assigned
 
 
+    async def _send_private_text(self, target_user_id: str, target_user_name: str, content: str) -> bool:
+        """向指定用户发起私聊并发送文本。"""
+        try:
+            from maim_message import UserInfo
+            from src.chat.message_receive.chat_stream import get_chat_manager
+            from src.plugin_system.apis import send_api
+
+            chat_stream = getattr(self.message, "chat_stream", None)
+            platform = str(getattr(chat_stream, "platform", "qq") or "qq")
+
+            uid = str(target_user_id or "").strip()
+            if not uid:
+                return False
+
+            nickname = str(target_user_name or "").strip()
+            user_info = UserInfo(user_id=uid, user_nickname=nickname, platform=platform)
+
+            cm = get_chat_manager()
+            private_stream = await cm.get_or_create_stream(platform=platform, user_info=user_info, group_info=None)
+            return await send_api.text_to_stream(text=content, stream_id=private_stream.stream_id)
+        except Exception as e:
+            logger.error(f"发送私聊消息失败: {e}")
+            return False
+
+
+    def _build_player_private_brief(self, session: GameSession, player: Player) -> str:
+        """构造多人模式私聊身份与规则文本。"""
+        lines: list[str] = []
+        scene = str(getattr(session, "scene_name", "") or "").strip()
+        if scene:
+            lines.append(f"场景：{scene}")
+
+        if player.identity:
+            lines.append(f"你的身份：{player.identity}")
+        if player.identity_description:
+            lines.append(f"身份简介：{player.identity_description}")
+
+        # 个人规则（只展示文本，不展示真假与隐藏含义）
+        ur_texts: list[str] = []
+        for r in (player.unique_rules or []):
+            if isinstance(r, dict):
+                t = str(r.get("text", "") or "").strip()
+            else:
+                t = str(r or "").strip()
+            if t:
+                ur_texts.append(t)
+        if ur_texts:
+            lines.append("")
+            lines.append("个人规则：")
+            for i, t in enumerate(ur_texts, start=1):
+                lines.append(f"{i}. {t}")
+
+        # 共同规则
+        mi = session.rule_network.get("multi_identity", {}) if isinstance(getattr(session, "rule_network", None), dict) else {}
+        common = mi.get("common_rules", []) if isinstance(mi, dict) else []
+        common_texts: list[str] = []
+        if isinstance(common, list):
+            for r in common:
+                if isinstance(r, dict):
+                    t = str(r.get("text", "") or "").strip()
+                else:
+                    t = str(r or "").strip()
+                if t:
+                    common_texts.append(t)
+        if common_texts:
+            lines.append("")
+            lines.append("共同规则：")
+            for i, t in enumerate(common_texts, start=1):
+                lines.append(f"{i}. {t}")
+
+        if player.exclusive_info:
+            lines.append("")
+            lines.append("独有信息：")
+            lines.append(str(player.exclusive_info))
+
+        return "\n".join(lines).strip() or "身份信息生成失败。"
+
+
+    async def _send_multiplayer_private_infos(self, session: GameSession, lobby_players: list[tuple[str, str]]) -> None:
+        """多人模式：把身份与个人规则通过私聊发送给每位玩家。"""
+        try:
+            # 使用 lobby_players 的名字更可信（来自当前群聊上下文）
+            name_by_id: dict[str, str] = {str(pid): str(name) for pid, name in (lobby_players or []) if str(pid)}
+
+            for pid, p in (session.players or {}).items():
+                target_name = name_by_id.get(str(pid), p.name)
+                content = self._build_player_private_brief(session, p)
+                ok = await self._send_private_text(str(pid), str(target_name or ""), content)
+                if not ok:
+                    logger.warning(f"向玩家 {pid} 私聊发送身份信息失败")
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            logger.error(f"多人模式私聊下发失败: {e}")
+
+
     def _get_group_id(self) -> str:
+
         """获取群组/用户ID"""
         chat_stream = getattr(self, 'chat_stream', None)
         if chat_stream is None:
@@ -1176,12 +1295,15 @@ class RuleHorrorCommand(BaseCommand):
             # 生成游戏
             player_count = len(lobby_players) if (game_mode == "多人") else None
             player_names = [n for _, n in lobby_players] if (game_mode == "多人") else None
+            player_ids = [pid for pid, _ in lobby_players] if (game_mode == "多人") else None
             session = await self._get_game_generator().generate_game(
                 group_id,
                 game_mode,
                 player_count=player_count,
                 player_names=player_names,
+                player_ids=player_ids,
             )
+
             session.status = GameStatus.ACTIVE
 
             # 添加玩家
@@ -1205,8 +1327,13 @@ class RuleHorrorCommand(BaseCommand):
             finally:
                 state.release()
             
+            # 多人模式：身份与个人规则通过私聊下发
+            if game_mode == "多人":
+                await self._send_multiplayer_private_infos(session, lobby_players)
+
             # 生成图片
             image_generator = AsyncImageGenerator(self._temp_images_dir)
+
             
             # 获取核心象征符号（如果有）
             core_symbols = getattr(session, 'core_symbols', None)
@@ -1404,45 +1531,49 @@ class RuleHorrorCommand(BaseCommand):
                 dedup.append(r)
             display_rules = dedup
 
-            rules_image = await image_generator.generate_rules_image(
+            if game_mode != "多人":
+                rules_image = await image_generator.generate_rules_image(
 
-                rules_title=rules_title,
-                rules=display_rules,
-                win_condition=session.win_condition,
-                game_mode=game_mode,
-            )
-
-
-
-            
-            with open(rules_image, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            await self.send_image(image_base64)
-            await asyncio.sleep(1.0)  # 间隔1秒
-            
-            # ④ 生成并发送场景结构文字长图
-            scene_structure = getattr(session, 'scene_structure', {}) or {}
-            if scene_structure:
-                building_type = scene_structure.get('building_type', '未知建筑')
-                overall_layout = scene_structure.get('overall_layout', '未知布局')
-                floors = scene_structure.get('floors', [])
-                connections = scene_structure.get('connections', [])
-                special_areas = scene_structure.get('special_areas', [])
-                
-                scene_structure_image = await image_generator.generate_scene_structure_text_image(
-                    building_type=building_type,
-                    overall_layout=overall_layout,
-                    floors=floors,
-                    connections=connections,
-                    special_areas=special_areas,
+                    rules_title=rules_title,
+                    rules=display_rules,
+                    win_condition=session.win_condition,
+                    game_mode=game_mode,
                 )
+
+
+
                 
-                with open(scene_structure_image, 'rb') as f:
+                with open(rules_image, 'rb') as f:
                     image_bytes = f.read()
                 image_base64 = base64.b64encode(image_bytes).decode('ascii')
                 await self.send_image(image_base64)
-                await asyncio.sleep(0.5)  # 最后一张可以稍短
+                await asyncio.sleep(1.0)  # 间隔1秒
+
+            
+            # ④ 生成并发送场景结构文字长图
+            if game_mode != "多人":
+                scene_structure = getattr(session, 'scene_structure', {}) or {}
+                if scene_structure:
+                    building_type = scene_structure.get('building_type', '未知建筑')
+                    overall_layout = scene_structure.get('overall_layout', '未知布局')
+                    floors = scene_structure.get('floors', [])
+                    connections = scene_structure.get('connections', [])
+                    special_areas = scene_structure.get('special_areas', [])
+                    
+                    scene_structure_image = await image_generator.generate_scene_structure_text_image(
+                        building_type=building_type,
+                        overall_layout=overall_layout,
+                        floors=floors,
+                        connections=connections,
+                        special_areas=special_areas,
+                    )
+                    
+                    with open(scene_structure_image, 'rb') as f:
+                        image_bytes = f.read()
+                    image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                    await self.send_image(image_base64)
+                    await asyncio.sleep(0.5)  # 最后一张可以稍短
+
             
             # 发送文字说明
             if game_mode == "多人":
@@ -2924,47 +3055,51 @@ class RuleHorrorCommand(BaseCommand):
                 dedup.append(r)
             display_rules = dedup
 
-            rules_image = await image_generator.generate_rules_image(
+            if game_mode != "多人":
+                rules_image = await image_generator.generate_rules_image(
 
-                rules_title=rules_title,
-                rules=display_rules,
-                win_condition=session.win_condition,
-                game_mode=game_mode,
-                use_cache=False,  # 强制开始不使用缓存
-            )
-
-
-
-            
-            with open(rules_image, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('ascii')
-            await self.send_image(image_base64)
-            await asyncio.sleep(1.0)  # 间隔1秒
-            
-            # ④ 生成并发送场景结构文字长图
-            scene_structure = getattr(session, 'scene_structure', {}) or {}
-            if scene_structure:
-                building_type = scene_structure.get('building_type', '未知建筑')
-                overall_layout = scene_structure.get('overall_layout', '未知布局')
-                floors = scene_structure.get('floors', [])
-                connections = scene_structure.get('connections', [])
-                special_areas = scene_structure.get('special_areas', [])
-                
-                scene_structure_image = await image_generator.generate_scene_structure_text_image(
-                    building_type=building_type,
-                    overall_layout=overall_layout,
-                    floors=floors,
-                    connections=connections,
-                    special_areas=special_areas,
+                    rules_title=rules_title,
+                    rules=display_rules,
+                    win_condition=session.win_condition,
+                    game_mode=game_mode,
                     use_cache=False,  # 强制开始不使用缓存
                 )
+
+
+
                 
-                with open(scene_structure_image, 'rb') as f:
+                with open(rules_image, 'rb') as f:
                     image_bytes = f.read()
                 image_base64 = base64.b64encode(image_bytes).decode('ascii')
                 await self.send_image(image_base64)
-                await asyncio.sleep(0.5)  # 最后一张可以稍短
+                await asyncio.sleep(1.0)  # 间隔1秒
+
+            
+            # ④ 生成并发送场景结构文字长图
+            if game_mode != "多人":
+                scene_structure = getattr(session, 'scene_structure', {}) or {}
+                if scene_structure:
+                    building_type = scene_structure.get('building_type', '未知建筑')
+                    overall_layout = scene_structure.get('overall_layout', '未知布局')
+                    floors = scene_structure.get('floors', [])
+                    connections = scene_structure.get('connections', [])
+                    special_areas = scene_structure.get('special_areas', [])
+                    
+                    scene_structure_image = await image_generator.generate_scene_structure_text_image(
+                        building_type=building_type,
+                        overall_layout=overall_layout,
+                        floors=floors,
+                        connections=connections,
+                        special_areas=special_areas,
+                        use_cache=False,  # 强制开始不使用缓存
+                    )
+                    
+                    with open(scene_structure_image, 'rb') as f:
+                        image_bytes = f.read()
+                    image_base64 = base64.b64encode(image_bytes).decode('ascii')
+                    await self.send_image(image_base64)
+                    await asyncio.sleep(0.5)  # 最后一张可以稍短
+
             
             # 发送文字说明
             if game_mode == "多人":
