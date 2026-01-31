@@ -4,7 +4,12 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 from string import Template
-import yaml
+
+# PyYAML 是可选依赖：某些环境可能装在不同解释器/虚拟环境中
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore
 
 
 class PromptBuilder:
@@ -25,10 +30,10 @@ class PromptBuilder:
 
         # 尝试加载 YAML 格式的 prompt
         yaml_path = os.path.join(self.prompts_dir, f"{name}.yaml")
-        if os.path.exists(yaml_path):
+        if os.path.exists(yaml_path) and yaml is not None:
             with open(yaml_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
-                template = data.get("template", "")
+                template = (data or {}).get("template", "")
                 self._cache[name] = template
                 return template
 
@@ -39,6 +44,12 @@ class PromptBuilder:
                 template = f.read()
                 self._cache[name] = template
                 return template
+
+        # YAML 文件存在但缺少 PyYAML 时，给出更明确的错误
+        if os.path.exists(yaml_path) and yaml is None:
+            raise ModuleNotFoundError(
+                "缺少 PyYAML，无法解析 prompt 的 .yaml 文件。请使用同一个 Python 环境执行：python -m pip install pyyaml"
+            )
 
         raise FileNotFoundError(f"找不到 prompt 模板: {name}")
 
