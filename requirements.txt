@@ -1,6 +1,6 @@
 # 规则怪谈插件依赖
 # 版本：v2.1.0
-# Python 版本要求：3.10+（推荐 3.12+）
+# Python 版本要求：3.12+
 
 # 核心依赖
 aiohttp>=3.9.0          # 异步 HTTP 客户端（LLM API 调用、连接池复用）
@@ -8,7 +8,6 @@ Pillow>=10.0.0          # 图片生成（支持理智崩坏视觉效果、文本
 
 # 配置和数据模型
 pydantic>=2.5.0         # 配置验证和数据模型（GameSession、Player 等）
-tomli>=2.0.0;python_version<"3.11"  # TOML 配置文件解析（Python 3.10 需要，3.11+ 内置 tomllib）
 
 # 重试和错误处理
 tenacity>=8.2.0         # 重试机制（LLM API 调用失败重试、指数退避）

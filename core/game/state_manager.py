@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Any
 from datetime import datetime, timedelta
 
 from .models import GameSession, GameStatus
@@ -68,7 +67,7 @@ class GameStateManager:
         self._initialized: bool = True
         self._states: dict[str, GameState] = {}
         self._global_lock: asyncio.Lock = asyncio.Lock()
-        self._cleanup_task: asyncio.Task[Any] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._cleanup_interval: int = 300  # 5分钟清理一次
 
     async def start(self) -> None:

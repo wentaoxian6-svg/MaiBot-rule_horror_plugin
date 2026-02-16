@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
+from ...common.models import JsonObject
 from ..llm.client import LLMClient, get_default_max_tokens
 from ..game.models import Player, GameSession
 
@@ -76,8 +76,26 @@ class EndingJudge:
         logger.info(f"结局判定完成: {result.ending_type} - {result.title}")
         return result
 
-    def _build_context(self, session: GameSession, player: Player) -> dict[str, Any]:
+    def _build_context(self, session: GameSession, player: Player) -> JsonObject:
         """构建判定上下文"""
+        # 从多个来源收集线索
+        discovered_clues = []
+
+        # 从玩家背包中获取线索
+        for item in player.inventory:
+            if item.get("type") == "clue":
+                discovered_clues.append(item.get("name", ""))
+
+        # 从会话中获取已发现线索（如果有）
+        if hasattr(session, 'discovered_clues') and session.discovered_clues:
+            for clue in session.discovered_clues:
+                if isinstance(clue, dict):
+                    clue_name = clue.get("name", clue.get("description", ""))
+                else:
+                    clue_name = str(clue)
+                if clue_name and clue_name not in discovered_clues:
+                    discovered_clues.append(clue_name)
+
         return {
             "scene_name": session.scene_name,
             "hidden_truth": session.hidden_truth,
@@ -86,16 +104,17 @@ class EndingJudge:
             "player_alive": player.status.value == "alive",
             "player_sanity": player.sanity,
             "player_health": player.health,
+            "player_fear": getattr(player, 'fear_level', 0),
+            "player_anxiety": getattr(player, 'anxiety_level', 0),
+            "player_stress": getattr(player, 'stress_level', 0),
+            "player_fatigue": getattr(player, 'fatigue', 0),
             "reasoning_history": player.reasoning_history,
             "action_history": [a.get("action", "") for a in player.action_history],
-            "discovered_clues": [
-                item.get("name", "") for item in player.inventory
-                if item.get("type") == "clue"
-            ],
+            "discovered_clues": discovered_clues,
             "has_cleared": session.has_cleared,
         }
 
-    async def _judge_with_llm(self, context: dict[str, Any]) -> dict[str, Any]:
+    async def _judge_with_llm(self, context: JsonObject) -> JsonObject:
         """使用LLM判定结局"""
         system_prompt = """你是规则怪谈游戏的结局判定系统。你需要根据玩家的表现判定结局类型。
 
@@ -111,7 +130,7 @@ class EndingJudge:
 - 检查玩家的行动是否解决了根源问题
 
 输出要求（很重要）:
-- `description` 只写结局叙事画面（200-500字），不要复盘推理过程，不要解释规则原理，不要评价玩家
+- `description` 只写结局叙事画面（150-250字），不要复盘推理过程，不要解释规则原理，不要评价玩家，字数必须控制在250字以内避免显示问题
 - `reasoning_analysis` 只在 perfect/success/cleared 时填写；failed 时必须是空字符串
 - failed（玩家死亡或未达成通关条件）时：`truth_revealed` 必须为 false
 - 严禁使用任何 emoji
@@ -137,6 +156,10 @@ class EndingJudge:
 - 存活:{context['player_alive']}
 - 理智:{context['player_sanity']}/100
 - 体力:{context['player_health']}/100
+- 恐惧:{context['player_fear']}/100
+- 焦虑:{context['player_anxiety']}/100
+- 压力:{context['player_stress']}/100
+- 疲劳:{context['player_fatigue']}/100
 - 已通关:{context['has_cleared']}
 
 玩家推理:
@@ -155,10 +178,11 @@ class EndingJudge:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.7,
-                max_tokens=get_default_max_tokens(),
+                max_tokens=1500,  # 限制token数，约1000-1200个汉字
             )
-            
-            return response.parse_json()
+
+            data_raw = response.parse_json()
+            return data_raw if isinstance(data_raw, dict) else {}
             
         except Exception as e:
             logger.error(f"判定结局失败: {e}")
@@ -168,7 +192,7 @@ class EndingJudge:
                     "ending_type": EndingType.FAILED,
                     "title": "死亡结局",
                     "description": "你在恐怖中死去,真相永远埋藏在黑暗中.",
-                    "reasoning_analysis": "未能完成推理.",
+                    "reasoning_analysis": "",  # failed 结局必须为空
                     "truth_revealed": False,
                 }
             elif context['has_cleared']:
@@ -184,7 +208,7 @@ class EndingJudge:
                     "ending_type": EndingType.FAILED,
                     "title": "失败结局",
                     "description": "你未能达成通关条件.",
-                    "reasoning_analysis": "未能完成目标.",
+                    "reasoning_analysis": "",  # failed 结局必须为空
                     "truth_revealed": False,
                 }
 

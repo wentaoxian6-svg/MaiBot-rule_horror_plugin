@@ -2,31 +2,46 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+import re
+from typing import Optional
 from string import Template
 
 # PyYAML 是可选依赖：某些环境可能装在不同解释器/虚拟环境中
 try:
-    import yaml  # type: ignore
+    import yaml
 except Exception:  # pragma: no cover
-    yaml = None  # type: ignore
+    yaml = None
 
 
 class PromptBuilder:
     """Prompt 构建器"""
 
-    def __init__(self, prompts_dir: Optional[str] = None):
+    def __init__(self, prompts_dir: Optional[str] = None, enable_cache: bool = True):
         if prompts_dir is None:
             # 默认 prompts 目录
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             prompts_dir = os.path.join(base_dir, "prompts")
         self.prompts_dir = prompts_dir
+        self._enable_cache = enable_cache
         self._cache: dict[str, str] = {}
+        self._cache_mtime: dict[str, float] = {}  # 记录文件修改时间
 
     def _load_template(self, name: str) -> str:
         """加载模板文件"""
-        if name in self._cache:
-            return self._cache[name]
+        # 检查缓存是否有效（文件是否被修改）
+        if self._enable_cache and name in self._cache:
+            yaml_path = os.path.join(self.prompts_dir, f"{name}.yaml")
+            txt_path = os.path.join(self.prompts_dir, f"{name}.txt")
+
+            current_mtime = 0.0
+            if os.path.exists(yaml_path):
+                current_mtime = os.path.getmtime(yaml_path)
+            elif os.path.exists(txt_path):
+                current_mtime = os.path.getmtime(txt_path)
+
+            # 如果文件未修改，使用缓存
+            if current_mtime == self._cache_mtime.get(name, 0.0):
+                return self._cache[name]
 
         # 尝试加载 YAML 格式的 prompt
         yaml_path = os.path.join(self.prompts_dir, f"{name}.yaml")
@@ -34,7 +49,9 @@ class PromptBuilder:
             with open(yaml_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
                 template = (data or {}).get("template", "")
-                self._cache[name] = template
+                if self._enable_cache:
+                    self._cache[name] = template
+                    self._cache_mtime[name] = os.path.getmtime(yaml_path)
                 return template
 
         # 尝试加载纯文本格式的 prompt
@@ -42,7 +59,9 @@ class PromptBuilder:
         if os.path.exists(txt_path):
             with open(txt_path, "r", encoding="utf-8") as f:
                 template = f.read()
-                self._cache[name] = template
+                if self._enable_cache:
+                    self._cache[name] = template
+                    self._cache_mtime[name] = os.path.getmtime(txt_path)
                 return template
 
         # YAML 文件存在但缺少 PyYAML 时，给出更明确的错误
@@ -53,10 +72,15 @@ class PromptBuilder:
 
         raise FileNotFoundError(f"找不到 prompt 模板: {name}")
 
+    def clear_cache(self) -> None:
+        """清除模板缓存"""
+        self._cache.clear()
+        self._cache_mtime.clear()
+
     def build(
         self,
         template_name: str,
-        **kwargs: Any,
+        **kwargs: object,
     ) -> str:
         """
         构建 prompt
@@ -69,9 +93,22 @@ class PromptBuilder:
             构建后的 prompt 字符串
         """
         template = self._load_template(template_name)
-        return Template(template).safe_substitute(**kwargs)
+        result = Template(template).safe_substitute(**kwargs)
 
-    def build_from_string(self, template: str, **kwargs: Any) -> str:
+        # 检查是否有未替换的变量
+        unresolved = re.findall(r'\$\{(\w+)}', result)
+        if unresolved:
+            import warnings
+            warnings.warn(
+                f"模板 '{template_name}' 存在未替换的变量: {set(unresolved)}. "
+                f"请确保提供了所有必需的参数: {kwargs.keys()}",
+                UserWarning,
+                stacklevel=2
+            )
+
+        return result
+
+    def build_from_string(self, template: str, **kwargs: object) -> str:
         """从字符串模板构建 prompt"""
         return Template(template).safe_substitute(**kwargs)
 
@@ -132,7 +169,7 @@ class SimplePromptBuilder:
     def __init__(self):
         self.templates = DEFAULT_PROMPTS.copy()
 
-    def build(self, template_name: str, **kwargs: Any) -> str:
+    def build(self, template_name: str, **kwargs: object) -> str:
         """构建 prompt"""
         if template_name not in self.templates:
             raise KeyError(f"未知的模板: {template_name}")

@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
-
+from typing import TypeAlias
 
 from ..llm.client import LLMClient
 from ..game.models import GameSession
 
 logger = logging.getLogger(__name__)
+
+# 类型定义
+GameData: TypeAlias = dict[str, "str | int | float | bool | list | dict | None"]
+AssignmentData: TypeAlias = dict[str, "str | list | dict"]
+IdentityData: TypeAlias = dict[str, "str | list | dict"]
 
 
 class GameGenerator:
@@ -79,14 +83,18 @@ class GameGenerator:
         
         # 如果是多人模式，生成多身份系统和协作规则
         if game_mode == "多人":
-            await self._generate_multi_identity_system(
-                session,
-                game_data,
-                player_count=player_count,
-                player_names=player_names,
-                player_ids=player_ids,
-            )
-            await self._generate_collaborative_rules(session)
+            try:
+                await self._generate_multi_identity_system(
+                    session,
+                    game_data,
+                    player_count=player_count,
+                    player_names=player_names,
+                    player_ids=player_ids,
+                )
+                await self._generate_collaborative_rules(session)
+            except Exception as e:
+                logger.error(f"多人模式身份系统生成失败: {e}")
+                raise RuntimeError(f"多人模式身份系统生成失败: {e}") from e
 
 
         
@@ -181,7 +189,7 @@ class GameGenerator:
     async def _generate_multi_identity_system(
         self,
         session: GameSession,
-        game_data: dict[str, Any],
+        game_data: GameData,
         player_count: int | None = None,
         player_names: list[str] | None = None,
         player_ids: list[str] | None = None,
@@ -309,7 +317,7 @@ class GameGenerator:
             common_rules = identity_data.get("common_rules", [])
 
             # 兼容：优先使用 assignments（按 QQ 号逐人分配），同时也生成 identities 结构便于旧逻辑回退
-            normalized_assignments: list[dict[str, Any]] = []
+            normalized_assignments: list[AssignmentData] = []
             if isinstance(assignments, list):
                 for a in assignments:
                     if isinstance(a, dict) and str(a.get("player_id", "")).strip():
@@ -346,7 +354,7 @@ class GameGenerator:
         except Exception as e:
             logger.error(f"生成多身份系统失败: {e}")
 
-    async def _generate_scene_and_rules(self, game_mode: str) -> dict[str, Any]:
+    async def _generate_scene_and_rules(self, game_mode: str) -> GameData:
         """分步生成场景和规则（避免一次生成过多内容）"""
         
         # Step 1: 生成剧情导入和隐藏真相
@@ -376,7 +384,7 @@ class GameGenerator:
         logger.info(f"场景生成完成: {game_data.get('scene_name', 'Unknown')}")
         return game_data
     
-    async def _generate_plot_and_truth(self, game_mode: str) -> dict[str, Any]:
+    async def _generate_plot_and_truth(self, game_mode: str) -> GameData:
         """Step 1: 生成剧情导入和隐藏真相"""
         system_prompt = """你是一位精通规则怪谈创作的游戏设计师。你必须严格按照JSON格式返回数据。
 
@@ -442,7 +450,7 @@ class GameGenerator:
 4. 避免直接的恐怖描写
 5. 每次生成不同的场景
 
-{"多人模式特别要求：\n1. 场景应该支持多种不同身份（如医院可以有护士、医生、病人、护工等）\n2. arrival_reason 使用第二人称复数‘你们’，描述一行人来到场景的共同原因" if game_mode == "多人" else ""}
+{"多人模式特别要求：\n1. 场景应该支持多种不同身份（如医院可以有护士、医生、病人、护工等）\n2. 所有叙述使用第二人称复数'你们'，不要出现'你'、'你的'等单人叙述\n3. arrival_reason 描述一行人来到场景的共同原因\n4. player_identity 描述为'你们各自的身份'或'一行人的不同身份'\n5. background 中使用'你们发现'、'你们注意到'等复数表述" if game_mode == "多人" else "单人模式要求：\n1. 使用第二人称单数'你'、'你的'进行叙述\n2. 描述玩家独自来到场景的原因"}
 
 
 请直接返回JSON对象，不要有任何其他文字。"""
@@ -468,7 +476,7 @@ class GameGenerator:
             logger.error(f"生成剧情导入失败: {e}")
             raise Exception(f"生成剧情导入失败: {e}")
     
-    async def _generate_scene_structure(self, plot_data: dict[str, Any]) -> dict[str, Any]:
+    async def _generate_scene_structure(self, plot_data: GameData) -> GameData:
         """Step 2: 生成场景结构"""
         system_prompt = """你是一个专业的规则怪谈生成器。请基于剧情导入，生成场景结构。
 
@@ -523,10 +531,10 @@ class GameGenerator:
     
     async def _generate_rules_system(
         self,
-        plot_data: dict[str, Any],
-        structure_data: dict[str, Any],
+        plot_data: GameData,
+        structure_data: GameData,
         game_mode: str
-    ) -> dict[str, Any]:
+    ) -> GameData:
         """Step 3: 生成规则系统"""
         scene_structure = structure_data.get("scene_structure", {})
         
@@ -540,17 +548,34 @@ class GameGenerator:
    - 规则应该反映场景的历史和异常现象
    - 规则应该与玩家的身份和任务相关
 
-3. **通关条件**：设定明确的通关条件
+3. **规则类型标记**（重要）：为每条规则标记类型
+   - fatal: 即死规则，触犯立即导致死亡（如"午夜12点必须离开地下室"）
+   - harmful: 有害规则，触犯会受到惩罚但不立即致命（如被NPC追杀、环境恶化）
+   - double_edged: 双刃剑规则，触犯有风险但能获得关键线索或NPC帮助
+   - None: 普通规则，让系统根据剧情判断
+
+4. **矛盾规则对**（可选）：如果剧情有对抗势力（如A vs B），可以创建矛盾规则对
+   - 规则A代表势力X，规则B代表势力Y
+   - 两条规则直接矛盾，无法同时遵守
+   - 标记related_npc（该规则代表谁）和opposing_npc（对抗谁）
+
+5. **通关条件**：设定明确的通关条件
    - 如：在规定时间内找到出口、收集特定物品、存活到天亮等
    - 通关条件应该与规则和真相有逻辑关联
 
-4. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
+6. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
 
 **输出格式：**
 {
   "rules": [
-    {"text": "规则1", "is_true": true, "hidden_meaning": "隐藏含义"},
-    {"text": "规则2", "is_true": false, "hidden_meaning": "隐藏含义"}
+    {
+      "text": "规则1",
+      "is_true": true,
+      "hidden_meaning": "隐藏含义",
+      "rule_type": "fatal/harmful/double_edged/null",
+      "related_npc": "NPC名称或null",
+      "opposing_npc": "对抗NPC名称或null"
+    }
   ],
   "win_condition": "通关条件",
   "clues": ["线索1", "线索2", "线索3"]
@@ -558,7 +583,9 @@ class GameGenerator:
 
 **重要：**
 - 仅返回JSON，不要包含其他文字
-- 严禁使用emoji表情符号"""
+- 严禁使用emoji表情符号
+- rule_type字段必须填写，即使是null
+- related_npc和opposing_npc如果没有就填null"""
 
         user_prompt = f"""请基于以下信息，生成规则系统。
 
@@ -592,9 +619,9 @@ class GameGenerator:
     
     async def _generate_npc_guidance(
         self,
-        plot_data: dict[str, Any],
-        rules_data: dict[str, Any]
-    ) -> dict[str, Any]:
+        plot_data: GameData,
+        rules_data: GameData
+    ) -> GameData:
         """Step 4: 生成NPC引导"""
         system_prompt = """你是规则怪谈游戏的NPC引导生成器。请基于场景和规则，生成NPC引导系统。
 
@@ -675,6 +702,6 @@ class GameGenerator:
                 "npc_dialogue": "欢迎来到这里。记住，遵守规则，才能活下去。",
             }
 
-    def _get_default_game(self) -> dict[str, Any]:
+    def _get_default_game(self) -> GameData:
         """获取默认游戏（已废弃，不再使用）"""
         raise NotImplementedError("默认场景已移除，请确保 LLM API 正常工作")

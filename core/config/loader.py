@@ -4,13 +4,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import tomllib
 
-try:
-    import tomllib  # Python 3.11+
-except ImportError:
-    import tomli as tomllib  # Python 3.10  # pyright: ignore[reportMissingImports]
-
-from .settings import Config, LLMConfig, PluginConfig, EnvironmentConfig, SaveConfig, set_config
+from .settings import Config, LLMConfig, PluginConfig, SaveConfig, set_config
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +41,12 @@ def load_config_from_file(config_path: str | Path | None = None) -> Config:
         # 解析各个配置节
         plugin_config = PluginConfig(**config_data.get("plugin", {}))
         llm_config = LLMConfig(**config_data.get("llm", {}))
-        environment_config = EnvironmentConfig(**config_data.get("environment", {}))
         save_config = SaveConfig(**config_data.get("save", {}))
-        
+
         # 创建完整配置
         config = Config(
             plugin=plugin_config,
             llm=llm_config,
-            environment=environment_config,
             save=save_config,
         )
         
@@ -89,12 +83,6 @@ def validate_config(config: Config) -> list[str]:
         errors.append(
             f"LLM模型索引 {config.llm.current_model_index} 超出范围 "
             f"(模型列表长度: {len(config.llm.model_list)})"
-        )
-    
-    if config.environment.current_model_index >= len(config.environment.model_list):
-        errors.append(
-            f"环境系统模型索引 {config.environment.current_model_index} 超出范围 "
-            f"(模型列表长度: {len(config.environment.model_list)})"
         )
     
     # 验证API密钥

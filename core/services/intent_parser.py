@@ -14,8 +14,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from collections.abc import Mapping
 
+from ...common.models import JsonObject, JsonValue
 from ..llm.client import LLMClient, get_default_max_tokens
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class IntentParser:
     def __init__(self, llm_client: LLMClient | None = None):
         self.llm_client: LLMClient = llm_client or LLMClient()
 
-    async def parse(self, user_input: str, context: dict[str, Any]) -> PlayerAction:
+    async def parse(self, user_input: str, context: Mapping[str, JsonValue]) -> PlayerAction:
         """解析玩家自然语言输入为结构化行动"""
 
         system_prompt = self._build_system_prompt()
@@ -71,7 +72,8 @@ class IntentParser:
                 temperature=0.7,
                 max_tokens=get_default_max_tokens(),
             )
-            data = resp.parse_json()
+            data_raw = resp.parse_json()
+            data: JsonObject = data_raw if isinstance(data_raw, dict) else {}
             return self._parse_to_action(data, fallback_description=user_input)
         except Exception as e:
             logger.error(f"解析玩家意图失败: {e}", exc_info=True)
@@ -112,7 +114,7 @@ class IntentParser:
             "}"
         )
 
-    def _build_user_prompt(self, user_input: str, context: dict[str, Any]) -> str:
+    def _build_user_prompt(self, user_input: str, context: Mapping[str, JsonValue]) -> str:
         """构建用户提示词"""
 
         scene_name = context.get("scene_name", "未知场景")
@@ -145,7 +147,7 @@ class IntentParser:
             f"玩家输入: {user_input}\n"
         )
 
-    def _parse_to_action(self, data: dict[str, Any], fallback_description: str) -> PlayerAction:
+    def _parse_to_action(self, data: Mapping[str, JsonValue], fallback_description: str) -> PlayerAction:
         """将 LLM JSON 转为 PlayerAction，并做兜底"""
 
         at_raw = str(data.get("action_type", "other") or "other").lower().strip()
@@ -157,24 +159,38 @@ class IntentParser:
         target = str(data.get("target", "") or "").strip()
         description = str(data.get("description", "") or "").strip() or fallback_description
 
-        def _to_bool(v: Any) -> bool:
+        def _to_bool(v: object) -> bool:
             if isinstance(v, bool):
                 return v
             if isinstance(v, str):
                 return v.strip().lower() in {"1", "true", "yes", "y", "是"}
             return bool(v)
 
-        def _to_float(v: Any, default: float = 0.0) -> float:
-            try:
+        def _to_float(v: object, default: float = 0.0) -> float:
+            if isinstance(v, bool):
+                return 1.0 if v else 0.0
+            if isinstance(v, (int, float)):
                 return float(v)
-            except Exception:
-                return default
+            if isinstance(v, str):
+                try:
+                    return float(v.strip())
+                except Exception:
+                    return default
+            return default
 
-        def _to_int(v: Any, default: int = 0) -> int:
-            try:
+        def _to_int(v: object, default: int = 0) -> int:
+            if isinstance(v, bool):
+                return 1 if v else 0
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
                 return int(v)
-            except Exception:
-                return default
+            if isinstance(v, str):
+                try:
+                    return int(float(v.strip()))
+                except Exception:
+                    return default
+            return default
 
         risk_level = max(0.0, min(1.0, _to_float(data.get("risk_level", 0.0), 0.0)))
         violates_rule = _to_bool(data.get("violates_rule", False))
@@ -205,7 +221,7 @@ class IntentParser:
             event_description=event_description,
         )
 
-    async def is_valid_action(self, user_input: str, context: dict[str, Any]) -> bool:
+    async def is_valid_action(self, user_input: str, context: Mapping[str, JsonValue]) -> bool:
         """判断输入是否像一个“游戏行动”而非闲聊"""
 
         system_prompt = (
@@ -226,7 +242,8 @@ class IntentParser:
                 temperature=0.3,
                 max_tokens=get_default_max_tokens(),
             )
-            data = resp.parse_json()
+            data_raw = resp.parse_json()
+            data: JsonObject = data_raw if isinstance(data_raw, dict) else {}
             return bool(data.get("is_valid_action", False))
         except Exception as e:
             logger.error(f"判断行动有效性失败: {e}", exc_info=True)

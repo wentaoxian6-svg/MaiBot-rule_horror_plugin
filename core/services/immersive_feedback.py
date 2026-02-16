@@ -13,8 +13,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from collections.abc import Mapping
 
+from ...common.models import JsonValue, StateUpdatesDict
 from ..llm.client import LLMClient, get_default_max_tokens
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class FeedbackResponse:
     feedback_type: FeedbackType
     delay_seconds: int = 0
     should_update_state: bool = False
-    state_updates: dict[str, Any] = field(default_factory=dict)
+    state_updates: StateUpdatesDict = field(default_factory=dict)
 
 
 class ImmersiveFeedback:
@@ -46,7 +47,7 @@ class ImmersiveFeedback:
     def __init__(self, llm_client: LLMClient | None = None):
         self.llm_client: LLMClient = llm_client or LLMClient()
 
-    async def respond(self, action: dict[str, Any], game_state: dict[str, Any]) -> FeedbackResponse:
+    async def respond(self, action: Mapping[str, JsonValue], game_state: Mapping[str, JsonValue]) -> FeedbackResponse:
         """根据行动生成即时反馈（若违反规则则偏向延迟反馈结构）"""
 
         if bool(action.get("violates_rule", False)):
@@ -54,7 +55,7 @@ class ImmersiveFeedback:
         return await self._generate_normal_feedback(action, game_state)
 
     async def _generate_violation_feedback(
-        self, action: dict[str, Any], game_state: dict[str, Any]
+        self, action: Mapping[str, JsonValue], game_state: Mapping[str, JsonValue]
     ) -> FeedbackResponse:
         """生成违反规则的反馈（通常为“先正常后异常”的延迟结构）"""
 
@@ -97,7 +98,7 @@ class ImmersiveFeedback:
             )
 
     async def _generate_normal_feedback(
-        self, action: dict[str, Any], game_state: dict[str, Any]
+        self, action: Mapping[str, JsonValue], game_state: Mapping[str, JsonValue]
     ) -> FeedbackResponse:
         """生成正常行动反馈"""
 
@@ -137,7 +138,7 @@ class ImmersiveFeedback:
                 state_updates={},
             )
 
-    def _build_feedback_prompt(self, action: dict[str, Any], game_state: dict[str, Any]) -> str:
+    def _build_feedback_prompt(self, action: Mapping[str, JsonValue], game_state: Mapping[str, JsonValue]) -> str:
         """构建反馈提示词"""
 
         action_type = action.get("action_type", "unknown")
@@ -168,7 +169,7 @@ class ImmersiveFeedback:
             "请生成沉浸式反馈。"
         )
 
-    def _parse_feedback_response(self, data: dict[str, Any]) -> FeedbackResponse:
+    def _parse_feedback_response(self, data: Mapping[str, JsonValue]) -> FeedbackResponse:
         """把 LLM JSON 转成 FeedbackResponse，并做兜底"""
 
         ft_raw = str(data.get("feedback_type", "immediate") or "immediate").lower().strip()
@@ -177,40 +178,61 @@ class ImmersiveFeedback:
         except Exception:
             feedback_type = FeedbackType.IMMEDIATE
 
-        def _to_bool(v: Any) -> bool:
+        def _to_bool(v: object) -> bool:
             if isinstance(v, bool):
                 return v
             if isinstance(v, str):
                 return v.strip().lower() in {"1", "true", "yes", "y", "是"}
             return bool(v)
 
-        def _to_int(v: Any, default: int = 0) -> int:
-            try:
+        def _to_int(v: object, default: int = 0) -> int:
+            if isinstance(v, bool):
+                return 1 if v else 0
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
                 return int(v)
-            except Exception:
-                return default
+            if isinstance(v, str):
+                try:
+                    return int(float(v.strip()))
+                except Exception:
+                    return default
+            return default
 
         delay_seconds = max(0, _to_int(data.get("delay_seconds", 0), 0))
         should_update_state = _to_bool(data.get("should_update_state", False))
-        state_updates = data.get("state_updates", {})
-        if not isinstance(state_updates, dict):
-            state_updates = {}
 
-        # 规范更新幅度
-        if "sanity" in state_updates:
-            try:
-                state_updates["sanity"] = max(-30, min(15, int(state_updates["sanity"])))
-            except Exception:
-                state_updates.pop("sanity", None)
-        if "health" in state_updates:
-            try:
-                state_updates["health"] = max(-50, min(20, int(state_updates["health"])))
-            except Exception:
-                state_updates.pop("health", None)
+        updates: StateUpdatesDict = {}
+        raw_updates = data.get("state_updates")
+        if isinstance(raw_updates, dict):
+            # 理智值更新：限制范围 -30 ~ +15
+            if "sanity" in raw_updates:
+                delta = _to_int(raw_updates.get("sanity"), 0)
+                updates["sanity"] = max(-30, min(15, delta))
+            # 体力值更新：限制范围 -50 ~ +20
+            if "health" in raw_updates:
+                delta = _to_int(raw_updates.get("health"), 0)
+                updates["health"] = max(-50, min(20, delta))
+            # 恐惧值更新：限制范围 -15 ~ +30（允许自然恢复）
+            if "fear_level" in raw_updates:
+                delta = _to_int(raw_updates.get("fear_level"), 0)
+                updates["fear_level"] = max(-15, min(30, delta))
+            # 焦虑值更新：限制范围 -12 ~ +25（允许自然恢复）
+            if "anxiety_level" in raw_updates:
+                delta = _to_int(raw_updates.get("anxiety_level"), 0)
+                updates["anxiety_level"] = max(-12, min(25, delta))
+            # 压力值更新：限制范围 -12 ~ +25（允许自然恢复）
+            if "stress_level" in raw_updates:
+                delta = _to_int(raw_updates.get("stress_level"), 0)
+                updates["stress_level"] = max(-12, min(25, delta))
+            # 位置更新：直接设置新位置
+            if "location" in raw_updates:
+                loc = raw_updates.get("location")
+                if isinstance(loc, str):
+                    updates["location"] = loc
 
-        # delayed 类型必须有延迟，否则给个默认延迟
-        if feedback_type == FeedbackType.DELAYED and delay_seconds <= 0:
-            delay_seconds = 30
+        # 注意：delayed 类型的反馈在生成时 delay_seconds 应该为 0
+        # 因为它是在延迟时间到达后才调用的，不需要再设置延迟
 
         content = str(data.get("content", "") or "").strip()
         if not content:
@@ -221,11 +243,11 @@ class ImmersiveFeedback:
             feedback_type=feedback_type,
             delay_seconds=delay_seconds,
             should_update_state=should_update_state,
-            state_updates=state_updates,
+            state_updates=updates,
         )
 
     async def generate_delayed_feedback(
-        self, original_action: dict[str, Any], game_state: dict[str, Any]
+        self, original_action: Mapping[str, JsonValue], game_state: Mapping[str, JsonValue]
     ) -> FeedbackResponse:
         """生成延迟反馈（用于玩家违反规则后的一段时间揭示异常）"""
 
@@ -267,7 +289,7 @@ class ImmersiveFeedback:
             )
 
     def _build_delayed_feedback_prompt(
-        self, original_action: dict[str, Any], game_state: dict[str, Any]
+        self, original_action: Mapping[str, JsonValue], game_state: Mapping[str, JsonValue]
     ) -> str:
         """构建延迟反馈提示词"""
 
@@ -293,7 +315,7 @@ class ImmersiveFeedback:
             "请生成延迟反馈，揭示之前行动导致的异常。"
         )
 
-    async def generate_sensory_description(self, target: str, game_state: dict[str, Any]) -> str:
+    async def generate_sensory_description(self, target: str, game_state: Mapping[str, JsonValue]) -> str:
         """生成某个目标的感官描写（纯文本）"""
 
         system_prompt = (
