@@ -66,9 +66,9 @@ rule_horror_plugin-main/
 - 每个模块职责单一
 - 易于维护和扩展
 
-### 2. 统一的行动处理架构（v2.1.0 新增）
+### 2. 行动处理架构
 
-**设计目标**：让命令格式和自然语言输入使用相同的处理流程，确保功能一致性；同时通过配置开关避免“非命令消息”误触发行动。
+**设计目标**：通过命令格式进行游戏行动，确保功能稳定可靠。
 
 **架构图**：
 ```
@@ -76,23 +76,10 @@ rule_horror_plugin-main/
     ↓
 execute() 方法
     ↓
-├─ 命令格式 (/rg 行动 XXX)
-│   ↓
-│   _handle_行动()
-│   ↓
-│   ActionProcessor.process_action()
-│
-└─ 非命令消息 (XXX)
+命令格式 (/rg 行动 XXX)
     ↓
-    结束口令识别（"结束" / "结束游戏"）
+_handle_行动()
     ↓
-    _handle_结束()  ← 沉浸式结束
-    ↓
-    （否则）检查配置 plugin.enable_natural_language_action
-    ↓
-    ├─ true  → _handle_natural_input()
-    └─ false → 忽略（避免误触发/剧透）
-
 ActionProcessor.process_action()
     ↓
 ├─ ItemManager.check_and_use_item() ✅ 物品使用
@@ -106,24 +93,15 @@ ActionProcessor.process_action()
 ```
 
 **关键改进**：
-- ✅ 两种输入方式都经过 `ActionProcessor.process_action()`
-- ✅ 自然语言输入在开启后也能触发物品使用、休息、规则变异等完整系统
-- ✅ 默认关闭自然语言直接行动，降低误触发概率
+- ✅ 命令格式经过 `ActionProcessor.process_action()`
 - ✅ 统一的行动处理逻辑，易于维护
+- ✅ 稳定可靠，避免误触发
 
-**自然语言输入的处理流程**：
-0. **开关检查**：仅当 `plugin.enable_natural_language_action = true` 时才会处理自然语言行动
-1. **关键词过滤**：检查是否包含行动关键词（走、去、看、拿、用、喝、吃、休息等）
-2. **意图验证**：使用 `IntentParser.is_valid_action()` 判断是否是有效游戏行动
-3. **统一处理**：调用 `ActionProcessor.process_action()` 处理行动
-4. **生成反馈**：生成行动结果图片并发送
-5. **保存状态**：自动保存游戏状态
-
-**支持的自然语言示例**：
-- `检查房间的角落` → 触发探索行动
-- `喝水` → 触发物品使用系统
-- `休息30分钟` → 触发休息系统（自定义时间）
-- `打开柜子` → 触发探索行动，可能发现关键物品并触发规则变异
+**支持的行动示例**：
+- `/rg 行动 检查房间的角落` → 触发探索行动
+- `/rg 行动 喝水` → 触发物品使用系统
+- `/rg 行动 休息30分钟` → 触发休息系统（自定义时间）
+- `/rg 行动 打开柜子` → 触发探索行动，可能发现关键物品并触发规则变异
 
 
 ### 3. 状态管理
@@ -266,9 +244,72 @@ class AsyncImageGenerator:
 3. 字符错位（随机交换相邻字符）
 4. 文字缺失（随机删除部分字符）
 
-### 3. 规则变异系统
+### 3. 规则分类系统
+
+**位置**: `core/services/action_processor.py`, `common/models.py`, `core/services/game_generator.py`
+
+**规则类型**：
+- **即死规则 (fatal)**: 触犯立即导致死亡
+- **有害规则 (harmful)**: 触犯会受到惩罚但不立即致命（NPC追杀、环境恶化等）
+- **双刃剑规则 (double_edged)**: 触犯有风险但能获得关键线索或NPC帮助
+
+**类型标记**：
+- LLM生成规则时自动标记类型
+- 存储在规则的 `rule_type` 字段
+- 根据类型触发不同的后果处理流程
+
+**矛盾规则对**（可选）：
+- 当剧情有对抗势力时（如A vs B），可创建矛盾规则对
+- 标记 `related_npc`（该规则代表谁）和 `opposing_npc`（对抗谁）
+- 遵守/触犯不同规则会影响对应NPC的态度
+
+### 4. 违规后果系统
 
 **位置**: `core/services/action_processor.py`
+
+**方法**：
+- `_handle_violation_consequences()` - 统一处理违规后果
+- `_handle_area_violation()` - 处理区域违规
+- `_handle_general_violation()` - 处理一般违规
+- `_check_hunt_trigger()` - 检查追杀触发
+- `_handle_double_edged_violation()` - 处理双刃剑规则
+
+**后果类型**：
+
+**即死规则**：
+- 立即设置 `is_fatal=True`
+- 玩家死亡
+
+**有害规则**：
+- NPC态度恶化（利用现有6维态度向量）
+- 环境恶化（调用EnvironmentEvolutionSystem）
+- 被追杀（概率触发，基于NPC敌意度）
+- 理智/体力值下降
+
+**双刃剑规则**：
+- 受到惩罚（理智/体力下降）
+- 获得收益（关键线索、物品、NPC帮助）
+- 收益与剧情真相相关
+
+**对抗规则**：
+- 触犯规则A → 规则A代表方NPC态度恶化
+- 同时 → 规则A对抗方NPC态度改善
+- 通过NPC对话体现对抗（提及对方时表现厌恶）
+
+**追杀机制**：
+- 触发条件：NPC敌意度>70 + 概率判定
+- 特殊位置增加触发概率
+- 连续违规增加触发概率
+- 通过LLM生成个性化追杀场景
+
+**延迟反馈**：
+- 部分后果延迟揭示（由LLM根据剧情决定）
+- 增加悬疑感和后悔感
+- 利用 `immersive_feedback.py` 的延迟反馈系统
+
+### 5. 规则变异系统
+
+**位置**: `core/services/action_processor.py`, `systems/rule_mutation_system.py`
 
 **方法**：
 - `_trigger_rule_mutation()` - 触发规则变异
@@ -296,9 +337,16 @@ class AsyncImageGenerator:
 
 **触发条件**：
 - 发现关键物品时触发
+- 连续违反规则（3次/10次行动）
+- 多次访问特殊位置（3次）
 - 理智崩坏时不触发
 
-### 4. 关键物品系统
+**混合模式**：
+- 预设条件作为强提示传递给LLM
+- LLM根据条件和剧情综合判断是否真正需要变异
+- 避免纯条件触发的突兀感
+
+### 6. 关键物品系统
 
 **位置**: `core/services/action_processor.py`
 
@@ -317,7 +365,7 @@ class AsyncImageGenerator:
 - 触发规则变异
 - 使用时恢复理智值+5到+15
 
-### 5. 物品使用系统
+### 7. 物品使用系统
 
 **位置**: `core/services/item_manager.py`
 
@@ -338,7 +386,7 @@ class AsyncImageGenerator:
 4. 从背包中移除物品
 5. 返回效果描述
 
-### 6. 休息系统
+### 8. 休息系统
 
 **位置**: `core/services/item_manager.py`
 
@@ -385,7 +433,25 @@ class AsyncImageGenerator:
 6. 推进游戏时间
 7. 返回休息效果描述
 
-### 7. 环境记忆系统
+### 9. 情绪与心理状态系统
+
+**位置**: `core/services/action_processor.py`
+
+**情绪数值**：
+- `emotion`: 情绪描述（平静、焦虑、绝望、愤怒等）
+- `anxiety_level`: 焦虑等级 (0-100)
+- `stress_level`: 压力等级 (0-100)
+- `fear_level`: 恐惧等级 (0-100)
+
+**更新机制**：
+- 从LLM响应解析 `mental_status` 和 `psychological_pressure`
+- 每次行动后自动更新
+- 影响状态栏显示和游戏沉浸感
+
+**修复历史**：
+- v2.2.0修复：此前情绪数值永远不会更新（永远是初始值）
+
+### 10. 环境记忆系统
 
 **位置**: `core/game/models.py`, `core/services/action_processor.py`
 
@@ -396,7 +462,22 @@ class AsyncImageGenerator:
 
 这些记忆会影响场景描述，避免重复描述，增强沉浸感。
 
-### 8. 行动处理优先级
+### 11. 环境演化系统集成
+
+**位置**: `systems/environment_evolution.py`, `plugin.py`, `core/services/action_processor.py`
+
+**集成内容**：
+- 游戏开始时调用 `initialize_environment()`
+- 每次行动后调用 `update_environment()`（异步非阻塞）
+- 区域违规时调用 `trigger_area_violation_consequences()`
+
+**演化内容**：
+- NPC行为和位置动态变化
+- 环境氛围随时间变化
+- 随机事件触发
+- 区域风险评估
+
+### 12. 行动处理优先级
 
 在 `action_processor.py` 的 `process_action()` 方法中，系统按以下优先级处理玩家行动：
 
@@ -443,12 +524,6 @@ class AsyncImageGenerator:
 - **批量保存**：减少80%磁盘IO
 - **队列缓存**：保留多个版本
 - **原子写入**：防止数据损坏
-
-### 4. 自然语言处理优化
-
-- **关键词过滤**：减少90%不必要调用
-- **输入长度检查**：快速过滤
-- **错误处理**：完善的fallback
 
 ## 线程安全
 
@@ -676,7 +751,29 @@ rule_horror_plugin-main/
 
 ## 版本历史
 
-### v2.1.0（完整迁移版本 + 统一行动处理）✨ NEW
+### v2.2.0（违规后果多样化 + 情绪数值修复）✨ NEW
+- **违规后果多样化系统**：
+  - ✅ 规则分类：即死/有害/双刃剑/普通
+  - ✅ 即死规则：触犯立即死亡
+  - ✅ 有害规则：NPC态度恶化、环境恶化、追杀
+  - ✅ 双刃剑规则：风险与收益并存，获得线索/NPC帮助
+  - ✅ 对抗规则：矛盾规则对，影响不同NPC态度
+  - ✅ 追杀机制：基于NPC敌意度概率触发
+  - ✅ 延迟反馈：部分后果延迟揭示
+- **情绪数值修复**：
+  - ✅ 修复情绪、焦虑、压力、恐惧值永远不更新的问题
+  - ✅ 从LLM响应解析并更新心理状态
+- **规则变异系统优化**：
+  - ✅ 优化条件触发（删除不合理条件）
+  - ✅ 实现"条件+LLM评估"混合模式
+- **环境演化系统集成**：
+  - ✅ 游戏开始时初始化环境
+  - ✅ 行动后异步更新环境状态
+  - ✅ 区域违规调用后果生成
+- **代码清理**：
+  - ✅ 删除历史遗留的开发注释
+
+### v2.1.0（完整迁移版本 + 统一行动处理）
 - **完整迁移原版核心系统**：
   - ✅ 理智值描述系统（4个档位）
   - ✅ 理智崩坏视觉效果系统（视觉扭曲+文本扭曲）
@@ -684,11 +781,9 @@ rule_horror_plugin-main/
   - ✅ 关键物品系统（触发规则变异）
   - ✅ 物品使用系统（水类+食物类）
   - ✅ 休息系统（体力恢复+疲劳等级+时间推进+自定义时间）
-- **统一行动处理架构**：
-  - ✅ 自然语言输入和命令格式使用相同的处理流程
-  - ✅ 自然语言输入也能触发物品使用、休息、规则变异等完整系统
+- **行动处理架构**：
   - ✅ 统一的行动处理逻辑，易于维护
-  - ✅ 用户体验一致，避免混淆
+  - ✅ 稳定可靠，避免误触发
 - **新增模块**：
   - `core/services/item_manager.py` - 物品管理器
 - **优化行动处理**：
@@ -697,9 +792,8 @@ rule_horror_plugin-main/
   - 提高响应速度
 - **文档更新**：
   - 新增 `SYSTEM_INTEGRATION_ANALYSIS.md` - 系统集成分析报告
-  - 更新 `README.md` - 添加两种行动方式说明
-  - 更新 `TECHNICAL.md` - 添加统一行动处理架构说明
-  - 更新 `QUICK_REFERENCE.md` - 添加自然语言输入示例
+  - 更新 `README.md` - 添加行动方式说明
+  - 更新 `TECHNICAL.md` - 添加行动处理架构说明
 
 ### v2.0.0（重构版本）
 - 完全重构代码架构，采用模块化设计
