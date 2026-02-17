@@ -2677,12 +2677,9 @@ NPC入场对话：
             hidden_truth = (f"真相：{session.hidden_truth}" if session.hidden_truth else "真相：未知")
 
             ending_title = str(getattr(ending, "title", "") or "未知结局")
-            if is_multi:
-                # image_generator 会固定加前缀“结局：”，这里避免再拼一次“结局/冒号”造成重复显示
-                ending_title = f"总结局·{ending_title}"
-
 
             image_generator = AsyncImageGenerator(self._temp_images_dir)
+
             ending_image = await image_generator.generate_ending_image(
                 ending_title=ending_title,
                 ending_description=str(getattr(ending, "description", "") or ""),
@@ -2742,6 +2739,7 @@ NPC入场对话：
             "- `/rg 规则` - 查看当前规则\n"
             "- `/rg 场景` - 查看场景结构\n"
             "- `/rg 道具 [道具名称]` - 查看道具列表或道具详情\n"
+            "- `/rg 线索 [线索名称]` - 查看已知线索列表或详情\n"
             "- `/rg 提示 <规则/线索>` - 获取提示（默认3次）\n"
             "- `/rg 推理 <推理内容>` - 记录你的推理\n"
             "- `/rg 行动 <行动描述>` - 描述你的行动\n"
@@ -3035,25 +3033,53 @@ NPC入场对话：
 
             inventory = getattr(player, 'inventory', [])
 
-            if not inventory:
-                await self.send_text("**物品栏**\n\n你的背包是空的。")
-                return True, "物品栏已显示", 2
+            def _is_clue_item(it: JsonObject) -> bool:
+                # 线索默认会以 type="clue" 写入背包；也兼容中文/其他写法
+                t = str(it.get("type", "") or "").strip().lower()
+                if t in {"clue", "clues", "线索"}:
+                    return True
+                if "clue" in t or "线索" in t:
+                    return True
+                return False
+
+            items: list[JsonObject] = []
+            clues: list[JsonObject] = []
+            for it in inventory:
+                if not isinstance(it, dict):
+                    continue
+                (clues if _is_clue_item(it) else items).append(it)
+
+            if not items:
+                # “道具/物品栏”默认只展示可用道具，线索单独用 /rg 线索 查看
+                if clues:
+                    await self.send_text("**道具**\n\n你目前没有可用道具（背包里只有线索）。\n\n使用 `/rg 线索` 查看已知线索。")
+                else:
+                    await self.send_text("**道具**\n\n你的背包是空的。")
+                return True, "道具已显示", 2
+
 
             query = (rest_input or "").strip()
             if query:
                 # 详情模式：根据名称模糊匹配
                 matches: list[JsonObject] = []
 
-                for it in inventory:
-                    if not isinstance(it, dict):
-                        continue
+                # 详情模式：只在“道具/物品”里查，不把线索混进来
+                for it in items:
                     name = str(it.get('name', ''))
                     if query in name:
                         matches.append(it)
 
+
                 if not matches:
-                    await self.send_text(f"未找到道具：{query}\n\n你可以使用 `/rg 道具` 查看道具列表。")
+                    # 如果只在“线索”里找得到，明确告诉玩家去用 /rg 线索
+                    clue_names = [str(c.get('name', '')) for c in clues if isinstance(c, dict)]
+                    if any(query in n for n in clue_names if n):
+                        await self.send_text(f"`{query}` 看起来是一条线索，不是道具。\n\n使用 `/rg 线索` 查看已知线索。")
+                        return False, "这是线索", 2
+
+                    await self.send_text(f"未找到道具：{query}\n\n你可以使用 `/rg 道具` 查看道具列表，或用 `/rg 线索` 查看线索。")
                     return False, "未找到道具", 2
+
 
                 if len(matches) > 3:
                     await self.send_text(f"匹配到多个道具（{len(matches)}个），请提供更精确的名称。")
@@ -3082,16 +3108,19 @@ NPC入场对话：
             try:
                 image_generator = AsyncImageGenerator(self._temp_images_dir)
                 inventory_image = await image_generator.generate_inventory_image(
-                    inventory_data=inventory,
+                    inventory_data=items,
                     player_name=user_name,
+                    title="道具",
                     use_cache=True,
                 )
+
                 await self._send_image_path(inventory_image)
             except Exception as e:
                 logger.debug(f"生成或发送道具图片失败，回退到文本: {e}")
 
-            items_text = [f"**{user_name} 的物品栏**\n"]
-            for i, item in enumerate(inventory, 1):
+            items_text = [f"**{user_name} 的道具**\n"]
+            for i, item in enumerate(items, 1):
+
                 if isinstance(item, dict):
                     item_name = item.get('name', '未知物品')
                     item_desc = item.get('description', '')
@@ -3105,6 +3134,8 @@ NPC入场对话：
                     items_text.append(f"{i}. {item}")
 
             items_text.append("\n使用 `/rg 道具 <名称>` 查看详情。")
+            items_text.append("使用 `/rg 线索` 查看已知线索。")
+
             await self.send_text("\n".join(items_text))
             return True, "物品栏已显示", 2
 
@@ -3113,7 +3144,101 @@ NPC入场对话：
             if state:
                 state.release()
 
+    async def _handle_线索(
+        self,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        rest_input: str,
+    ) -> tuple[bool, str | None, int]:
+        """处理查看已知线索命令（与道具分离）"""
+        state_manager = GameStateManager()
+        state = await state_manager.get(group_id)
+
+        if not state or not state.session:
+            await self.send_text("当前没有正在进行的游戏。")
+            return False, "无游戏", 2
+
+        try:
+            player = state.session.players.get(user_id)
+            if not player:
+                await self.send_text("你不在游戏中。")
+                return False, "不在游戏中", 2
+
+            inventory = getattr(player, 'inventory', [])
+
+            def _is_clue_item(it: JsonObject) -> bool:
+                t = str(it.get("type", "") or "").strip().lower()
+                if t in {"clue", "clues", "线索"}:
+                    return True
+                if "clue" in t or "线索" in t:
+                    return True
+                return False
+
+            clues: list[JsonObject] = [it for it in inventory if isinstance(it, dict) and _is_clue_item(it)]
+
+            if not clues:
+                await self.send_text("**已知线索**\n\n你目前还没有发现任何线索。")
+                return True, "线索已显示", 2
+
+            query = (rest_input or "").strip()
+            if query:
+                matches: list[JsonObject] = []
+                for it in clues:
+                    name = str(it.get('name', ''))
+                    if query in name:
+                        matches.append(it)
+
+                if not matches:
+                    await self.send_text(f"未找到线索：{query}\n\n你可以使用 `/rg 线索` 查看线索列表。")
+                    return False, "未找到线索", 2
+
+                if len(matches) > 5:
+                    await self.send_text(f"匹配到多个线索（{len(matches)}条），请提供更精确的名称。")
+                    return False, "匹配过多", 2
+
+                lines = ["**线索详情**\n"]
+                for it in matches:
+                    name = it.get('name', '未知')
+                    desc = it.get('description', '')
+                    lines.append(f"- {name}")
+                    if desc:
+                        lines.append(f"  {desc}")
+                    lines.append("")
+
+                await self.send_text("\n".join(lines).strip())
+                return True, "线索详情已显示", 2
+
+            # 列表模式：优先发送线索清单图片（失败则降级文本）
+            try:
+                image_generator = AsyncImageGenerator(self._temp_images_dir)
+                clue_image = await image_generator.generate_inventory_image(
+                    inventory_data=clues,
+                    player_name=user_name,
+                    title="已知线索",
+                    use_cache=True,
+                )
+                await self._send_image_path(clue_image)
+            except Exception as e:
+                logger.debug(f"生成或发送线索图片失败，回退到文本: {e}")
+
+            lines = [f"**{user_name} 的已知线索**\n"]
+            for i, it in enumerate(clues, 1):
+                name = it.get('name', '未知线索')
+                desc = it.get('description', '')
+                lines.append(f"{i}. {name}")
+                if desc:
+                    lines.append(f"   {desc}")
+            lines.append("\n使用 `/rg 线索 <名称>` 查看详情。")
+            await self.send_text("\n".join(lines))
+            return True, "线索已显示", 2
+
+        finally:
+            if state:
+                state.release()
+
     async def _handle_背包(
+
         self,
         group_id: str,
         user_id: str,
@@ -3732,7 +3857,10 @@ NPC入场对话：
     _handle_status = _handle_状态
     _handle_rules = _handle_规则
     _handle_hint = _handle_提示
+    _handle_clue = _handle_线索
+    _handle_clues = _handle_线索
     _handle_reason = _handle_推理
+
     _handle_action = _handle_行动
     _handle_end = _handle_结束
     _handle_help = _handle_帮助
