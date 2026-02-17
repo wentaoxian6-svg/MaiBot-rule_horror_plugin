@@ -1,13 +1,16 @@
-"""物品管理服务 - 处理物品使用和休息逻辑（基于原版plugin_old.py）"""
+"""物品管理服务 - 处理物品使用和休息逻辑"""
 from __future__ import annotations
 
 import logging
 import random
-from typing import Any
+from typing import TypeAlias
 
 from ..game.models import Player, GameSession
 
 logger = logging.getLogger(__name__)
+
+# 类型定义
+ItemData: TypeAlias = dict[str, "str | bool | int | None"]
 
 
 class ItemManager:
@@ -48,18 +51,18 @@ class ItemManager:
         "香蕉", "糖果", "零食", "饭", "压缩饼干", "午餐肉", "蛋糕", "点心",
         "坚果", "香肠", "火腿"
     ]
-    
-    # 疲劳等级
+
+    # 疲劳等级（用于 _get_fatigue_level 方法）
     FATIGUE_LEVELS: list[str] = ["无", "轻微", "中度", "严重", "极度"]
 
     def check_and_use_item(
         self,
         action: str,
         player: Player,
-        session: GameSession,
+        session: GameSession,  # 保留参数以兼容接口，当前未使用
     ) -> tuple[bool, str | None]:
         """
-        检查并使用物品（基于原版plugin_old.py的精确逻辑）
+        检查并使用物品
         
         Args:
             action: 玩家行动描述
@@ -86,30 +89,27 @@ class ItemManager:
         # 查找对应的物品
         item_index = -1
         item_name = ""
-        item_to_use = None
-        
+
         if used_water:
             for i, item in enumerate(player.inventory):
                 if isinstance(item, dict):
                     item_name = item.get("name", "")
                 else:
                     item_name = str(item)
-                
+
                 if any(keyword in item_name.lower() for keyword in self.WATER_ITEM_KEYWORDS):
                     item_index = i
-                    item_to_use = item
                     break
-        
+
         elif used_food:
             for i, item in enumerate(player.inventory):
                 if isinstance(item, dict):
                     item_name = item.get("name", "")
                 else:
                     item_name = str(item)
-                
+
                 if any(keyword in item_name.lower() for keyword in self.FOOD_ITEM_KEYWORDS):
                     item_index = i
-                    item_to_use = item
                     break
         
         if item_index == -1:
@@ -119,35 +119,47 @@ class ItemManager:
         effect_text = ""
         
         if used_water:
-            # 水类物品：降低压力和焦虑
+            # 水类物品：降低压力、焦虑和恐惧
             stress_reduction = random.randint(3, 5)
             anxiety_reduction = random.randint(3, 5)
-            
+            fear_reduction = random.randint(2, 4)
+
             current_stress = player.stress_level
             current_anxiety = player.anxiety_level
-            
+            current_fear = player.fear_level
+
             player.stress_level = max(0, current_stress - stress_reduction)
             player.anxiety_level = max(0, current_anxiety - anxiety_reduction)
-            
+            player.fear_level = max(0, current_fear - fear_reduction)
+
             effect_text = (
                 f"你喝了{item_name}，感到一阵清凉。"
                 f"压力等级降低了{stress_reduction}点，"
-                f"焦虑等级降低了{anxiety_reduction}点。"
+                f"焦虑等级降低了{anxiety_reduction}点，"
+                f"恐惧等级降低了{fear_reduction}点。"
             )
         
         elif used_food:
-            # 食物类物品：恢复体力
+            # 食物类物品：恢复体力和少量心理状态
             health_recovery = random.randint(3, 5)
-            
+            stress_reduction = random.randint(1, 3)
+            anxiety_reduction = random.randint(1, 3)
+
             current_health = player.health
             new_health = min(100, current_health + health_recovery)
-            
+
             actual_recovery = new_health - current_health
             player.health = new_health
-            
+
+            # 食物也能带来心理安慰
+            player.stress_level = max(0, player.stress_level - stress_reduction)
+            player.anxiety_level = max(0, player.anxiety_level - anxiety_reduction)
+
             effect_text = (
                 f"你吃了{item_name}，感到体力恢复了一些。"
-                f"体力值回复了{actual_recovery}点。"
+                f"体力值回复了{actual_recovery}点，"
+                f"压力等级降低了{stress_reduction}点，"
+                f"焦虑等级降低了{anxiety_reduction}点。"
             )
         
         # 从背包中移除物品
@@ -157,7 +169,7 @@ class ItemManager:
         
         return True, f"**使用物品**\n\n{effect_text}\n\n{item_name}已从物品栏中移除。"
     
-    def get_item_by_name(self, player: Player, item_name: str) -> dict[str, Any] | None:
+    def get_item_by_name(self, player: Player, item_name: str) -> ItemData | None:
         """根据名称获取物品"""
         for item in player.inventory:
             if isinstance(item, dict):
@@ -189,7 +201,7 @@ class ItemManager:
                 return True
         return False
     
-    def get_key_items(self, player: Player) -> list[dict[str, Any]]:
+    def get_key_items(self, player: Player) -> list[ItemData]:
         """获取玩家的所有关键物品"""
         key_items = []
         for item in player.inventory:
@@ -205,7 +217,7 @@ class ItemManager:
         self,
         action: str,
         player: Player,
-        session: GameSession,
+        session: GameSession,  # 保留参数以兼容接口，当前未使用
     ) -> tuple[bool, str | None, int]:
         """
         检查并执行休息（支持自定义休息时间）
@@ -272,44 +284,55 @@ class ItemManager:
         
         # 获取当前疲劳等级
         current_fatigue = self._get_fatigue_level(player.health)
-        
+
         # 根据休息时间计算体力恢复量
         # 基础恢复：10-20点（15分钟）
         # 每增加15分钟，额外恢复10-20点
         base_recovery = random.randint(10, 20)
         extra_recovery = (time_cost // 15 - 1) * random.randint(10, 20) if time_cost > 15 else 0
         health_recovery = base_recovery + extra_recovery
-        
+
         new_health = min(100, player.health + health_recovery)
         actual_health_recovery = new_health - player.health
         player.health = new_health
-        
+
+        # 休息也能恢复心理状态（根据休息时间）
+        # 基础恢复：3-5点（15分钟），每增加15分钟额外恢复3-5点
+        base_mental_recovery = random.randint(3, 5)
+        extra_mental_recovery = (time_cost // 15 - 1) * random.randint(3, 5) if time_cost > 15 else 0
+        mental_recovery = base_mental_recovery + extra_mental_recovery
+
+        player.fear_level = max(0, player.fear_level - mental_recovery)
+        player.anxiety_level = max(0, player.anxiety_level - mental_recovery)
+        player.stress_level = max(0, player.stress_level - mental_recovery)
+
         # 降低疲劳等级
         new_fatigue = self._get_fatigue_level(player.health)
         fatigue_reduced = (current_fatigue != new_fatigue)
-        
+
         # 构建效果文本
         if custom_time:
-            rest_text = f"你休息了{time_cost}分钟，感到体力恢复了一些。体力值回复了{actual_health_recovery}点。"
+            rest_text = f"你休息了{time_cost}分钟，感到体力恢复了一些。体力值回复了{actual_health_recovery}点，心理状态也平复了一些（恐惧/焦虑/压力各降低{mental_recovery}点）。"
         else:
-            rest_text = f"你休息了一会儿，感到体力恢复了一些。体力值回复了{actual_health_recovery}点。"
-        
+            rest_text = f"你休息了一会儿，感到体力恢复了一些。体力值回复了{actual_health_recovery}点，心理状态也平复了一些（恐惧/焦虑/压力各降低{mental_recovery}点）。"
+
         if fatigue_reduced:
             rest_text += f" 疲劳等级从{current_fatigue}降低到了{new_fatigue}。"
-        
-        logger.info(f"玩家 {player.name} 休息了 {time_cost} 分钟，恢复体力 {actual_health_recovery} 点")
+
+        logger.info(f"玩家 {player.name} 休息了 {time_cost} 分钟，恢复体力 {actual_health_recovery} 点，心理状态各降低 {mental_recovery} 点")
         
         return True, f"**休息**\n\n{rest_text}\n\n休息花费了{time_cost}分钟。", time_cost
     
     def _get_fatigue_level(self, health: int) -> str:
-        """根据体力值计算疲劳等级（基于原版逻辑）"""
+        """根据体力值计算疲劳等级"""
+        # 使用 FATIGUE_LEVELS 类变量
         if health >= 76:
-            return "无"
+            return self.FATIGUE_LEVELS[0]  # 无
         elif health >= 51:
-            return "轻微"
+            return self.FATIGUE_LEVELS[1]  # 轻微
         elif health >= 26:
-            return "中度"
+            return self.FATIGUE_LEVELS[2]  # 中度
         elif health >= 1:
-            return "严重"
+            return self.FATIGUE_LEVELS[3]  # 严重
         else:
-            return "极度"
+            return self.FATIGUE_LEVELS[4]  # 极度

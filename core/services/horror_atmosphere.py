@@ -14,11 +14,14 @@ import logging
 import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TypeAlias
 
 from ..llm.client import LLMClient, get_default_max_tokens
 
 logger = logging.getLogger(__name__)
+
+# 类型定义
+EventData: TypeAlias = dict[str, "str | bool | int | None"]
 
 
 class AtmosphereIntensity(Enum):
@@ -59,6 +62,9 @@ class HorrorAtmosphereEnhancer:
         player_sanity: int,
         player_health: int,
         location: str,
+        player_fear: int = 0,
+        player_anxiety: int = 0,
+        player_stress: int = 0,
     ) -> AtmosphereEvent:
         """生成氛围事件"""
 
@@ -66,14 +72,26 @@ class HorrorAtmosphereEnhancer:
             current_intensity=current_intensity,
             player_sanity=player_sanity,
             player_health=player_health,
+            player_fear=player_fear,
+            player_anxiety=player_anxiety,
+            player_stress=player_stress,
         )
 
         system_prompt = self._build_system_prompt(target_intensity)
+        # 参数验证
+        if not scene_name:
+            scene_name = "未知场景"
+        if not location:
+            location = "未知地点"
+
         user_prompt = self._build_event_prompt(
             scene_name=scene_name,
             intensity=target_intensity,
             player_sanity=player_sanity,
             player_health=player_health,
+            player_fear=player_fear,
+            player_anxiety=player_anxiety,
+            player_stress=player_stress,
             location=location,
         )
 
@@ -84,7 +102,8 @@ class HorrorAtmosphereEnhancer:
                 temperature=0.9,
                 max_tokens=get_default_max_tokens(),
             )
-            data = response.parse_json()
+            data_raw = response.parse_json()
+            data: EventData = data_raw if isinstance(data_raw, dict) else {}
             event = self._parse_atmosphere_event(data, target_intensity)
 
             self._current_intensity = target_intensity
@@ -104,18 +123,24 @@ class HorrorAtmosphereEnhancer:
         current_intensity: AtmosphereIntensity,
         player_sanity: int,
         player_health: int,
+        player_fear: int = 0,
+        player_anxiety: int = 0,
+        player_stress: int = 0,
     ) -> AtmosphereIntensity:
         """根据玩家状态计算目标氛围强度"""
 
         sanity = max(0, min(100, int(player_sanity)))
         health = max(0, min(100, int(player_health)))
+        fear = max(0, min(100, int(player_fear)))
+        anxiety = max(0, min(100, int(player_anxiety)))
+        stress = max(0, min(100, int(player_stress)))
 
-        # 基于理智/体力给出目标强度
-        if sanity < 25 or health < 20:
+        # 基于理智/体力/心理状态给出目标强度
+        if sanity < 25 or health < 20 or fear > 80 or anxiety > 80 or stress > 80:
             desired = AtmosphereIntensity.TERRIFYING
-        elif sanity < 45 or health < 40:
+        elif sanity < 45 or health < 40 or fear > 60 or anxiety > 60 or stress > 60:
             desired = AtmosphereIntensity.UNSETTLING
-        elif sanity < 70 or health < 60:
+        elif sanity < 70 or health < 60 or fear > 40 or anxiety > 40 or stress > 40:
             desired = AtmosphereIntensity.TENSE
         else:
             desired = AtmosphereIntensity.CALM
@@ -176,6 +201,9 @@ class HorrorAtmosphereEnhancer:
         intensity: AtmosphereIntensity,
         player_sanity: int,
         player_health: int,
+        player_fear: int,
+        player_anxiety: int,
+        player_stress: int,
         location: str,
     ) -> str:
         """构建事件提示词"""
@@ -189,14 +217,17 @@ class HorrorAtmosphereEnhancer:
             f"氛围强度: {intensity.value}\n\n"
             "玩家状态:\n"
             f"- 理智: {player_sanity}/100\n"
-            f"- 体力: {player_health}/100\n\n"
+            f"- 体力: {player_health}/100\n"
+            f"- 恐惧: {player_fear}/100\n"
+            f"- 焦虑: {player_anxiety}/100\n"
+            f"- 压力: {player_stress}/100\n\n"
             "最近的事件（用于保持连续性，避免重复）：\n"
             f"{recent_text}\n\n"
             "请生成一条新的氛围事件。"
         )
 
     def _parse_atmosphere_event(
-        self, result: dict[str, Any], fallback_intensity: AtmosphereIntensity
+        self, result: EventData, fallback_intensity: AtmosphereIntensity
     ) -> AtmosphereEvent:
         """把 LLM JSON 转成 AtmosphereEvent，并做兜底校验"""
 
@@ -206,18 +237,28 @@ class HorrorAtmosphereEnhancer:
         except Exception:
             intensity = fallback_intensity
 
-        def _to_bool(v: Any) -> bool:
+        def _to_bool(v: object) -> bool:
             if isinstance(v, bool):
                 return v
+            if isinstance(v, (int, float)):
+                return bool(v)
             if isinstance(v, str):
                 return v.strip().lower() in {"1", "true", "yes", "y", "是"}
             return bool(v)
 
-        def _to_int(v: Any, default: int = 0) -> int:
-            try:
+        def _to_int(v: object, default: int = 0) -> int:
+            if isinstance(v, bool):
+                return 1 if v else 0
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
                 return int(v)
-            except Exception:
-                return default
+            if isinstance(v, str):
+                try:
+                    return int(float(v.strip()))
+                except Exception:
+                    return default
+            return default
 
         affects_sanity = _to_bool(result.get("affects_sanity", False))
         affects_health = _to_bool(result.get("affects_health", False))

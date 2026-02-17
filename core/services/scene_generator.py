@@ -1,6 +1,6 @@
 """场景生成服务
 
-使用 LLM 生成“规则怪谈”场景数据（SceneData）：背景、规则、线索、核心象征符号等。
+使用 LLM 生成"规则怪谈"场景数据（SceneData）：背景、规则、线索、核心象征符号等。
 
 该文件曾被批量替换破坏（引号缺失、字符串不闭合、全角标点落入语法层），此处按原意重写并保持对外接口：
 - SceneType
@@ -8,7 +8,7 @@
 - SceneGenerator.generate_scene()
 - SceneGenerator.generate_progressive_reveal()
 
-注意：项目中另有更复杂的 `GameGenerator`；本模块作为可复用的“场景生成器”仍保持可用。
+注意：项目中另有更复杂的 `GameGenerator`；本模块作为可复用的"场景生成器"仍保持可用。
 """
 
 from __future__ import annotations
@@ -17,11 +17,17 @@ import logging
 import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TypeAlias
 
 from ..llm.client import LLMClient, get_default_max_tokens
 
 logger = logging.getLogger(__name__)
+
+# 类型定义
+RuleData: TypeAlias = dict[str, "str | int | bool | None"]
+ClueData: TypeAlias = dict[str, "str | int | None"]
+SymbolData: TypeAlias = dict[str, "str | int | None"]
+SceneDict: TypeAlias = dict[str, "str | list | None"]
 
 
 class SceneType(Enum):
@@ -48,10 +54,10 @@ class SceneData:
     background: str
     player_identity: str
     hidden_truth: str
-    rules: list[dict[str, Any]]
+    rules: list[RuleData]
     win_condition: str
-    clues: list[dict[str, Any]]
-    core_symbols: list[dict[str, Any]]
+    clues: list[ClueData]
+    core_symbols: list[SymbolData]
     horror_elements: list[str]
     atmosphere_description: str
 
@@ -89,7 +95,8 @@ class SceneGenerator:
                 temperature=0.9,
                 max_tokens=get_default_max_tokens(),
             )
-            data = resp.parse_json()
+            data_raw = resp.parse_json()
+            data: SceneDict = data_raw if isinstance(data_raw, dict) else {}
             return self._parse_scene_data(data, scene_type)
         except Exception as e:
             logger.error(f"生成场景失败: {e}", exc_info=True)
@@ -109,7 +116,8 @@ class SceneGenerator:
                 temperature=0.9,
                 max_tokens=get_default_max_tokens(),
             )
-            data = resp.parse_json()
+            data_raw = resp.parse_json()
+            data: SceneDict = data_raw if isinstance(data_raw, dict) else {}
             return self._parse_scene_data(data, SceneType.CUSTOM)
         except Exception as e:
             logger.error(f"生成自定义场景失败: {e}", exc_info=True)
@@ -168,7 +176,7 @@ class SceneGenerator:
             "按系统提示的 JSON 格式返回。"
         )
 
-    def _parse_scene_data(self, data: dict[str, Any], scene_type: SceneType) -> SceneData:
+    def _parse_scene_data(self, data: SceneDict, scene_type: SceneType) -> SceneData:
         """解析 LLM JSON -> SceneData"""
 
         rules = data.get("rules", [])

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-from typing import Any
 
 
 class TextFormatter:
@@ -40,7 +39,7 @@ class TextFormatter:
         return "\n".join(f"{bullet} {item}" for item in items)
 
     @staticmethod
-    def format_dict(data: dict[str, Any], indent: int = 0) -> str:
+    def format_dict(data: dict[str, object], indent: int = 0) -> str:
         """格式化字典"""
         lines = []
         prefix = "  " * indent

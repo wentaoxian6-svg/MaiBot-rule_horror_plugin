@@ -1,10 +1,12 @@
-"""LLM 客户端模块 - 完全照搬 plugin_old.py 实现"""
+"""LLM 客户端模块"""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
+
+from ...common.models import JsonObject
 
 import aiohttp
 import logging
@@ -15,7 +17,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def _extract_message_content(message: Any) -> str:
+def _extract_message_content(message: object) -> str:
     """从兼容多家网关/模型的 message 结构中提取文本内容。
 
     一些网关会返回：
@@ -88,8 +90,8 @@ class LLMResponse:
     """LLM 响应数据类"""
     content: str
     model: str
-    usage: dict[str, Any]
-    raw_response: dict[str, Any]
+    usage: JsonObject
+    raw_response: JsonObject
 
     @property
     def clean_content(self) -> str:
@@ -103,7 +105,7 @@ class LLMResponse:
         
         return cleaned
 
-    def parse_json(self) -> dict[str, Any]:
+    def parse_json(self) -> JsonObject:
         """解析LLM返回的JSON响应"""
         step_name = "LLM响应"
         llm_response = self.content
@@ -132,15 +134,103 @@ class LLMResponse:
             json_str = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', json_str)
             return json_str
         
-        def try_parse_json(json_str: str) -> Optional[dict[str, Any]]:
-            """尝试解析JSON，返回解析结果或None"""
+        def fix_json_newlines(json_str: str) -> str:
+            """修复JSON字符串值中的未转义换行符
+            
+            LLM有时会在JSON字符串值中包含原始换行符，这会导致解析失败。
+            此函数尝试修复这类问题。
+            """
+            result = []
+            in_string = False
+            escape_next = False
+            
+            for i, char in enumerate(json_str):
+                if escape_next:
+                    result.append(char)
+                    escape_next = False
+                    continue
+                
+                if char == '\\':
+                    result.append(char)
+                    escape_next = True
+                    continue
+                
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    result.append(char)
+                    continue
+                
+                # 如果在字符串内部遇到换行符，将其替换为\n
+                if in_string and char in '\n\r':
+                    result.append('\\n')
+                    continue
+                
+                result.append(char)
+            
+            return ''.join(result)
+        
+        def fix_json_quotes(json_str: str) -> str:
+            """修复JSON字符串值中的未转义引号
+            
+            LLM有时会在JSON字符串值中包含未转义的双引号，这会导致解析失败。
+            此函数尝试修复这类问题（仅处理字符串内部的引号）。
+            """
+            result = []
+            in_string = False
+            escape_next = False
+            
+            for i, char in enumerate(json_str):
+                if escape_next:
+                    result.append(char)
+                    escape_next = False
+                    continue
+                
+                if char == '\\':
+                    result.append(char)
+                    escape_next = True
+                    continue
+                
+                if char == '"' and not escape_next:
+                    # 检查这是否是JSON结构中的引号（键或值的开头/结尾）
+                    # 简单启发式：如果前面是 [, {, :, ,, 或空格，可能是结构引号
+                    prev_char = json_str[i-1] if i > 0 else ''
+                    next_char = json_str[i+1] if i < len(json_str) - 1 else ''
+                    
+                    # 如果是字符串内部的引号（前面不是结构字符），转义它
+                    if in_string and prev_char not in '[{:, \n\r\t':
+                        result.append('\\"')
+                    else:
+                        in_string = not in_string
+                        result.append(char)
+                    continue
+                
+                result.append(char)
+            
+            return ''.join(result)
+        
+        def try_parse_json(json_str: str) -> JsonObject | None:
+            """尝试解析JSON，返回解析结果或 None"""
             try:
                 cleaned_str = clean_json_string(json_str)
-                result = json.loads(cleaned_str)
-                return result
-            except json.JSONDecodeError as e:
-                logger.debug(f"[规则怪谈] JSON解析失败: {e}")
-                return None
+                loaded = json.loads(cleaned_str)
+                return loaded if isinstance(loaded, dict) else None
+            except json.JSONDecodeError:
+                # 尝试修复未转义的换行符
+                try:
+                    fixed_str = fix_json_newlines(cleaned_str)
+                    loaded = json.loads(fixed_str)
+                    return loaded if isinstance(loaded, dict) else None
+                except json.JSONDecodeError:
+                    pass
+                
+                # 尝试修复未转义的引号
+                try:
+                    fixed_str = fix_json_quotes(cleaned_str)
+                    loaded = json.loads(fixed_str)
+                    return loaded if isinstance(loaded, dict) else None
+                except json.JSONDecodeError as e:
+                    logger.debug(f"[规则怪谈] JSON解析失败: {e}")
+                    return None
         
         # 第一次尝试：直接解析整个响应
         result = try_parse_json(llm_response)
@@ -251,7 +341,7 @@ def get_default_max_tokens() -> int:
 
 
 class LLMClient:
-    """LLM 客户端 - 完全照搬 plugin_old.py 的 _call_llm_api"""
+    """LLM 客户端"""
 
     def __init__(self):
         pass
@@ -279,7 +369,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         """
-        调用 LLM API - 完全照搬 plugin_old.py 的 _call_llm_api
+        调用 LLM API
         """
         # 确保配置已加载
         self._ensure_config_loaded()
@@ -302,7 +392,7 @@ class LLMClient:
             "Authorization": f"Bearer {api_key}"
         }
         
-        # 照搬 plugin_old.py 的默认 system prompt
+        # 默认 system prompt
         default_system_prompt = """你是一位精通规则怪谈创作的游戏设计师和叙事专家。你的任务是：
 1. 生成令人毛骨悚然、逻辑严密的规则怪谈场景
 2. 创造具有欺骗性和层次感的规则系统
@@ -344,7 +434,7 @@ class LLMClient:
             }
 
             try:
-                # 照搬 plugin_old.py 的超时设置 180 秒
+                # 超时设置 180 秒
                 timeout = aiohttp.ClientTimeout(total=180)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     logger.info(f"[规则怪谈] 调用 LLM API: {api_url}")

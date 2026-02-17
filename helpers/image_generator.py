@@ -1,17 +1,16 @@
-# pyright: reportDeprecated=false
-# pyright: reportUnknownVariableType=false
-# pyright: reportMissingParameterType=false
-# pyright: reportAny=false
-
 """
 图片生成工具类
 统一管理图片生成逻辑，消除重复代码
 """
 
-from typing import Any
-from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 import os
+from typing import ClassVar, TypeAlias
+
+from PIL import Image, ImageDraw, ImageFont
+
+# 类型别名
+Font: TypeAlias = ImageFont.FreeTypeFont | ImageFont.ImageFont
 
 
 class ImageGenerator:
@@ -25,14 +24,14 @@ class ImageGenerator:
     - 常用图形绘制
     """
     
-    FONT_SIZES = {
+    FONT_SIZES: ClassVar[dict[str, int]] = {
         "title": 36,
         "subtitle": 24,
         "normal": 18,
         "small": 16
     }
     
-    COLORS = {
+    COLORS: ClassVar[dict[str, str]] = {
         "background_dark": "#0a0a0a",
         "background_light": "#FFFFFF",
         "title_red": "#8B0000",
@@ -42,7 +41,7 @@ class ImageGenerator:
         "text_black": "#000000"
     }
     
-    LAYOUT = {
+    LAYOUT: ClassVar[dict[str, int]] = {
         "margin": 60,
         "title_height": 80,
         "section_height": 40,
@@ -51,12 +50,12 @@ class ImageGenerator:
         "width": 900
     }
     
-    def __init__(self, temp_images_dir: str):
-        self.temp_images_dir = temp_images_dir
-        self.fonts: dict[str, Any] = {}
+    def __init__(self, temp_images_dir: str) -> None:
+        self.temp_images_dir: str = temp_images_dir
+        self.fonts: dict[str, Font] = {}
         self._load_fonts()
     
-    def _load_fonts(self):
+    def _load_fonts(self) -> None:
         """加载字体"""
         font_configs = [
             ("title", self.FONT_SIZES["title"]),
@@ -68,7 +67,7 @@ class ImageGenerator:
         for font_name, size in font_configs:
             self.fonts[font_name] = self._load_font(size)
     
-    def _load_font(self, size: int) -> Any:
+    def _load_font(self, size: int) -> Font:
         """加载单个字体"""
         try:
             return ImageFont.truetype("msyh.ttc", size)
@@ -78,11 +77,11 @@ class ImageGenerator:
             except Exception:
                 return ImageFont.load_default()
     
-    def get_font(self, font_name: str) -> Any:
+    def get_font(self, font_name: str) -> Font:
         """获取字体"""
         return self.fonts.get(font_name, self.fonts["normal"])
     
-    def wrap_text(self, text: str, font: Any,
+    def wrap_text(self, text: str, font: Font,
                   max_width: int) -> list[str]:
         """文本换行
         
@@ -94,7 +93,7 @@ class ImageGenerator:
         Returns:
             换行后的文本列表
         """
-        lines = []
+        lines: list[str] = []
         words = list(text)
         current_line = ""
         
@@ -125,7 +124,7 @@ class ImageGenerator:
         Returns:
             换行后的文本列表
         """
-        lines = []
+        lines: list[str] = []
         for i in range(0, len(text), char_per_line):
             lines.append(text[i:i+char_per_line])
         return lines
@@ -157,7 +156,7 @@ class ImageGenerator:
         return Image.new('RGB', (width, height), color=background_color)
     
     def draw_text(self, draw: ImageDraw.ImageDraw, text: str,
-                  position: tuple[int, int], font: Any,
+                  position: tuple[int, int], font: Font,
                   fill: str = COLORS["text_red"]) -> None:
         """绘制文本
         
@@ -171,7 +170,7 @@ class ImageGenerator:
         draw.text(position, text, fill=fill, font=font)
     
     def draw_centered_text(self, draw: ImageDraw.ImageDraw, text: str,
-                           y: int, width: int, font: Any,
+                           y: int, width: int, font: Font,
                            fill: str = COLORS["title_red"]) -> None:
         """绘制居中文本
         
@@ -184,7 +183,7 @@ class ImageGenerator:
             fill: 颜色
         """
         bbox = font.getbbox(text)
-        text_width = bbox[2] - bbox[0]
+        text_width = int(bbox[2] - bbox[0])
         x = (width - text_width) // 2
         self.draw_text(draw, text, (x, y), font, fill)
     
@@ -218,7 +217,7 @@ class ImageGenerator:
         """
         draw.rectangle(coords, fill=fill, outline=outline, width=width)
     
-    def generate_inventory_image(self, inventory_data: list[Any],
+    def generate_inventory_image(self, inventory_data: list[object],
                                   player_name: str = "玩家",
                                   output_path: str | None = None) -> str:
         """生成道具清单图片
@@ -240,15 +239,15 @@ class ImageGenerator:
         line_height = self.LAYOUT["line_height"]
         char_per_line = self.LAYOUT["char_per_line"]
         width = self.LAYOUT["width"]
-        
-        content_lines = []
+
+        content_lines: list[str] = []
         if not inventory_data:
             content_lines.append("暂无道具")
         else:
             for i, item in enumerate(inventory_data, 1):
                 if isinstance(item, dict):
-                    item_name = item.get("name", "未知道具")
-                    item_desc = item.get("description", "")
+                    item_name = str(item.get("name", "未知道具") or "未知道具")
+                    item_desc = str(item.get("description", "") or "")
                     content_lines.append(f"{i}. {item_name}")
                     if item_desc:
                         desc_lines = self.wrap_text_by_chars(item_desc, char_per_line)
@@ -278,7 +277,7 @@ class ImageGenerator:
         
         return self._save_image(img, output_path, "inventory")
     
-    def generate_item_details_image(self, item_data: dict[str, Any],
+    def generate_item_details_image(self, item_data: Mapping[str, object],
                                      player_name: str = "玩家",
                                      output_path: str | None = None) -> str:
         """生成道具详情图片
@@ -302,12 +301,12 @@ class ImageGenerator:
         char_per_line = self.LAYOUT["char_per_line"]
         width = self.LAYOUT["width"]
         
-        item_name = item_data.get("name", "未知道具")
-        item_type = item_data.get("type", "其他")
-        item_desc = item_data.get("description", "")
-        item_hint = item_data.get("observation_hint", "")
+        item_name = str(item_data.get("name", "未知道具") or "未知道具")
+        item_type = str(item_data.get("type", "其他") or "其他")
+        item_desc = str(item_data.get("description", "") or "")
+        item_hint = str(item_data.get("observation_hint", "") or "")
         
-        content_lines = []
+        content_lines: list[str] = []
         content_lines.append(f"类型：{item_type}")
         content_lines.append("")
         content_lines.append("描述：")
@@ -377,8 +376,10 @@ class ImageGenerator:
         char_per_line = self.LAYOUT["char_per_line"]
         width = self.LAYOUT["width"]
         
-        content_lines = []
+        content_lines: list[str] = []
         content_lines.append(f"人物：{npc_name} ({npc_role})")
+        if npc_attitude:
+            content_lines.append(f"态度：{npc_attitude}")
         content_lines.append("")
         content_lines.append("行为：")
         

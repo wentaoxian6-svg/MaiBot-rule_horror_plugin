@@ -1,14 +1,21 @@
-# pyright: reportDeprecated=false
-# pyright: reportUnknownVariableType=false
-# pyright: reportMissingParameterType=false
-
 """
 环境状态快照系统
 维护环境状态的持久化，确保世界的一致性
 """
 
-from typing import Any
 from enum import Enum
+from typing import TypeAlias
+
+from ..common.constants import EntropyThresholds, EntropyDescriptions
+
+# 类型定义
+ItemData: TypeAlias = dict[str, "str | int | float | bool | None"]
+WallData: TypeAlias = dict[str, "list | None"]
+FloorData: TypeAlias = dict[str, "list | None"]
+ObjectState: TypeAlias = dict[str, "str | int | float | bool | None"]
+AtmosphereData: TypeAlias = dict[str, "str | int | float | None"]
+ChangesData: TypeAlias = dict[str, "str | dict | None"]
+StateDict: TypeAlias = dict[str, "str | dict | list | float | None"]
 
 
 class DoorState(Enum):
@@ -41,12 +48,12 @@ class EnvironmentState:
     
     def __init__(self):
         self.doors: dict[str, DoorState] = {}
-        self.items: dict[str, dict[str, Any]] = {}
+        self.items: dict[str, ItemData] = {}
         self.lights: dict[str, LightState] = {}
-        self.walls: dict[str, dict[str, Any]] = {}
-        self.floors: dict[str, dict[str, Any]] = {}
-        self.objects: dict[str, dict[str, Any]] = {}
-        self.atmosphere: dict[str, Any] = {}
+        self.walls: dict[str, WallData] = {}
+        self.floors: dict[str, FloorData] = {}
+        self.objects: dict[str, ObjectState] = {}
+        self.atmosphere: AtmosphereData = {}
         self.sounds: list[str] = []
         self.smells: list[str] = []
         self.temperature: float = 20.0
@@ -71,7 +78,7 @@ class EnvironmentState:
         self.items[item_id]["state"] = state
         self.changed_objects.add(item_id)
     
-    def get_item_info(self, item_id: str) -> dict[str, Any] | None:
+    def get_item_info(self, item_id: str) -> ItemData | None:
         """获取物品信息"""
         return self.items.get(item_id)
     
@@ -133,12 +140,12 @@ class EnvironmentState:
         
         self.changed_objects.add(location_id)
     
-    def set_object_state(self, object_id: str, state: dict[str, Any]):
+    def set_object_state(self, object_id: str, state: ObjectState) -> None:
         """设置物体状态"""
         self.objects[object_id] = state
         self.changed_objects.add(object_id)
 
-    def get_object_state(self, object_id: str) -> dict[str, Any] | None:
+    def get_object_state(self, object_id: str) -> ObjectState | None:
         """获取物体状态"""
         return self.objects.get(object_id)
     
@@ -170,9 +177,9 @@ class EnvironmentState:
         self.humidity = humidity
         self.changed_objects.add("humidity")
     
-    def increase_entropy(self, amount: float = 1.0):
+    def increase_entropy(self, amount: float = 1.0) -> None:
         """增加熵值（环境恶化程度）"""
-        self.entropy_level = min(100.0, self.entropy_level + amount)
+        self.entropy_level = min(EntropyThresholds.COLLAPSING, self.entropy_level + amount)
         self.changed_objects.add("entropy")
     
     def get_entropy_level(self) -> float:
@@ -181,18 +188,18 @@ class EnvironmentState:
     
     def get_entropy_description(self) -> str:
         """获取熵值描述"""
-        if self.entropy_level < 20:
-            return "环境相对稳定"
-        elif self.entropy_level < 40:
-            return "环境开始出现异常"
-        elif self.entropy_level < 60:
-            return "环境明显恶化"
-        elif self.entropy_level < 80:
-            return "环境极度危险"
+        if self.entropy_level < EntropyThresholds.STABLE:
+            return EntropyDescriptions.STABLE
+        elif self.entropy_level < EntropyThresholds.ABNORMAL:
+            return EntropyDescriptions.ABNORMAL
+        elif self.entropy_level < EntropyThresholds.DETERIORATING:
+            return EntropyDescriptions.DETERIORATING
+        elif self.entropy_level < EntropyThresholds.DANGEROUS:
+            return EntropyDescriptions.DANGEROUS
         else:
-            return "环境即将崩溃"
+            return EntropyDescriptions.COLLAPSING
     
-    def get_changes(self) -> dict[str, Any]:
+    def get_changes(self) -> ChangesData:
         """获取所有变化的对象"""
         changes = {}
         for obj_id in self.changed_objects:
@@ -259,7 +266,7 @@ class EnvironmentState:
         """清除变化记录"""
         self.changed_objects.clear()
     
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> StateDict:
         """序列化为字典"""
         return {
             "doors": {k: v.value for k, v in self.doors.items()},
@@ -277,7 +284,7 @@ class EnvironmentState:
         }
     
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "EnvironmentState":
+    def from_dict(cls, data: StateDict) -> "EnvironmentState":
         """从字典反序列化"""
         env = cls()
         

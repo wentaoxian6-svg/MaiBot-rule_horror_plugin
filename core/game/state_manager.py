@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Any
 from datetime import datetime, timedelta
 
 from .models import GameSession, GameStatus
@@ -68,7 +67,7 @@ class GameStateManager:
         self._initialized: bool = True
         self._states: dict[str, GameState] = {}
         self._global_lock: asyncio.Lock = asyncio.Lock()
-        self._cleanup_task: asyncio.Task[Any] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._cleanup_interval: int = 300  # 5分钟清理一次
 
     async def start(self) -> None:
@@ -169,8 +168,11 @@ class GameStateManager:
             raise RuntimeError(f"获取状态超时: {group_id}")
 
     async def remove(self, group_id: str) -> bool:
-        """
-        移除游戏状态
+        """移除游戏状态。
+
+        说明：
+        - 旧实现会在状态锁被持有时拒绝删除，导致像 `/rg 结束` 这类“在持锁处理器内清理状态”的场景无法真正结束游戏。
+        - 这里改为**无条件移除**，让结束流程在同一临界区内完成；即便有协程仍持有该 `GameState` 引用，也只会影响当前协程的 `finally: state.release()`，不再允许后续请求重新获取该状态。
 
         Args:
             group_id: 群组/用户ID
@@ -180,12 +182,9 @@ class GameStateManager:
         """
         async with self._global_lock:
             if group_id in self._states:
-                state = self._states[group_id]
-                # 确保状态未被锁定
-                if not state._lock.locked():
-                    del self._states[group_id]
-                    logger.info(f"移除游戏状态: {group_id}")
-                    return True
+                del self._states[group_id]
+                logger.info(f"移除游戏状态: {group_id}")
+                return True
         return False
 
     def get_active_games_count(self) -> int:

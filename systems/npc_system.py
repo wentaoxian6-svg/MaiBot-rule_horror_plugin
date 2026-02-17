@@ -1,17 +1,25 @@
-# pyright: reportDeprecated=false
-# pyright: reportUnknownVariableType=false
-# pyright: reportMissingParameterType=false
-# pyright: reportAny=false
-
 """
 NPC行为树和记忆系统
 为NPC增加目标导向性和记忆，增强NPC的真实感
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import Callable
 from enum import Enum
 from datetime import datetime
 import random
+
+from ..common.models import (
+    GameStateDict,
+    BehaviorResultDict,
+    AttitudeCheckResultDict,
+    AttitudeContradictionDict,
+    LastSeenInfoDict,
+    InteractionRecordDict,
+    LocationRecordDict,
+    ActionRecordDict,
+)
 
 
 class NPCAttitude(Enum):
@@ -33,45 +41,56 @@ class BehaviorType(Enum):
     IDLE = "待机"
 
 
+ConditionFunction = Callable[["NPC", GameStateDict], bool]
+ActionFunction = Callable[["NPC", GameStateDict], BehaviorResultDict]
+
+
 class BehaviorNode:
     """行为树节点"""
 
-    def __init__(self, behavior_type: BehaviorType, priority: int = 0):
+    def __init__(self, behavior_type: BehaviorType, priority: int = 0) -> None:
         self.behavior_type: BehaviorType = behavior_type
         self.priority: int = priority
-        self.conditions: list[Any] = []
-        self.actions: list[Any] = []
+        self.conditions: list[ConditionFunction] = []
+        self.actions: list[ActionFunction] = []
         self.children: list[BehaviorNode] = []
 
-    def add_condition(self, condition: Any):
+    def add_condition(self, condition: ConditionFunction) -> None:
         """添加条件判断"""
         self.conditions.append(condition)
 
-    def add_action(self, action: Any):
+    def add_action(self, action: ActionFunction) -> None:
         """添加动作"""
         self.actions.append(action)
 
-    def add_child(self, child: "BehaviorNode"):
+    def add_child(self, child: BehaviorNode) -> None:
         """添加子节点"""
         self.children.append(child)
 
-    def evaluate(self, npc: "NPC", game_state: dict[str, Any]) -> bool:
+    def evaluate(self, npc: NPC, game_state: GameStateDict) -> bool:
         """评估节点是否可以执行"""
         for condition in self.conditions:
             if not condition(npc, game_state):
                 return False
         return True
 
-    def execute(self, npc: "NPC", game_state: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, npc: NPC, game_state: GameStateDict) -> BehaviorResultDict:
         """执行节点动作"""
-        result: dict[str, Any] = {
+        result: BehaviorResultDict = {
+            "action": None,
+            "target": None,
+            "result": None,
+            "player_id": None,
+            "attitude": None,
             "behavior": self.behavior_type.value,
-            "actions": []
+            "actions": [],
+            "status": None
         }
 
         for action in self.actions:
             action_result = action(npc, game_state)
-            result["actions"].append(action_result)
+            if result["actions"] is not None:
+                result["actions"].append(action_result)
 
         return result
 
@@ -84,9 +103,9 @@ class NPCMemory:
     """
 
     def __init__(self):
-        self.player_interactions: dict[str, list[dict[str, Any]]] = {}
-        self.player_locations: dict[str, list[dict[str, Any]]] = {}
-        self.player_actions: dict[str, list[dict[str, Any]]] = {}
+        self.player_interactions: dict[str, list[InteractionRecordDict]] = {}
+        self.player_locations: dict[str, list[LocationRecordDict]] = {}
+        self.player_actions: dict[str, list[ActionRecordDict]] = {}
         self.player_attitudes: dict[str, NPCAttitude] = {}
         
         # 6维态度向量系统
@@ -161,7 +180,7 @@ class NPCMemory:
             "dependence": self.player_dependence[player_id]
         }
     
-    def check_extreme_attitude(self, player_id: str) -> dict[str, Any]:
+    def check_extreme_attitude(self, player_id: str) -> AttitudeCheckResultDict:
         """检查是否有极端态度（用于触发特殊事件）
         
         Returns:
@@ -171,7 +190,6 @@ class NPCMemory:
         
         vector = self.get_attitude_vector(player_id)
         
-        # 检查是否有任何维度达到极端值（>= 100 或 <= 0）
         for dimension, value in vector.items():
             if value >= 100.0:
                 return {
@@ -188,9 +206,14 @@ class NPCMemory:
                     "value": value
                 }
         
-        return {"has_extreme": False}
-    
-    def check_attitude_contradiction(self, player_id: str) -> dict[str, Any]:
+        return {
+            "has_extreme": False,
+            "extreme_type": None,
+            "dimension": None,
+            "value": None
+        }
+
+    def check_attitude_contradiction(self, player_id: str) -> AttitudeContradictionDict:
         """检查态度矛盾（如：高好感度+高怀疑度）
         
         Returns:
@@ -200,7 +223,6 @@ class NPCMemory:
         
         vector = self.get_attitude_vector(player_id)
         
-        # 高好感度 + 高怀疑度
         if vector["affection"] > 70 and vector["suspicion"] > 60:
             return {
                 "has_contradiction": True,
@@ -208,7 +230,6 @@ class NPCMemory:
                 "description": "喜欢但怀疑"
             }
         
-        # 高信任度 + 高敌意度
         if vector["trust"] > 70 and vector["hostility"] > 60:
             return {
                 "has_contradiction": True,
@@ -216,7 +237,6 @@ class NPCMemory:
                 "description": "信任但敌对"
             }
         
-        # 高恐惧度 + 高依赖度
         if vector["fear"] > 70 and vector["dependence"] > 60:
             return {
                 "has_contradiction": True,
@@ -224,14 +244,18 @@ class NPCMemory:
                 "description": "害怕但依赖"
             }
         
-        return {"has_contradiction": False}
-    
-    def record_interaction(self, player_id: str, interaction_type: str, details: dict[str, Any], game_time: int):
+        return {
+            "has_contradiction": False,
+            "contradiction_type": None,
+            "description": None
+        }
+
+    def record_interaction(self, player_id: str, interaction_type: str, details: JsonObject, game_time: int):
         """记录与玩家的互动"""
         if player_id not in self.player_interactions:
             self.player_interactions[player_id] = []
         
-        interaction = {
+        interaction: InteractionRecordDict = {
             "type": interaction_type,
             "details": details,
             "time": game_time,
@@ -326,14 +350,14 @@ class NPCMemory:
         """获取对玩家的怀疑度"""
         return self.player_suspicion_levels.get(player_id, 0.0)
     
-    def get_last_seen_info(self, player_id: str) -> dict[str, Any]:
+    def get_last_seen_info(self, player_id: str) -> LastSeenInfoDict:
         """获取最后见到玩家的信息"""
         return {
             "time": self.last_seen_time.get(player_id),
             "location": self.last_seen_location.get(player_id)
         }
 
-    def get_recent_interactions(self, player_id: str, count: int = 5) -> list[dict[str, Any]]:
+    def get_recent_interactions(self, player_id: str, count: int = 5) -> list[InteractionRecordDict]:
         """获取最近的互动记录"""
         interactions = self.player_interactions.get(player_id, [])
         return interactions[-count:] if interactions else []
@@ -348,21 +372,19 @@ class NPCMemory:
                     return True
         return False
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> JsonObject:
         """序列化为字典"""
         return {
             "player_interactions": self.player_interactions,
             "player_locations": self.player_locations,
             "player_actions": self.player_actions,
             "player_attitudes": {k: v.value for k, v in self.player_attitudes.items()},
-            # 6维态度向量
             "player_affection": self.player_affection,
             "player_suspicion": self.player_suspicion,
             "player_fear": self.player_fear,
             "player_trust": self.player_trust,
             "player_hostility": self.player_hostility,
             "player_dependence": self.player_dependence,
-            # 旧版兼容
             "player_trust_levels": self.player_trust_levels,
             "player_fear_levels": self.player_fear_levels,
             "player_suspicion_levels": self.player_suspicion_levels,
@@ -372,7 +394,7 @@ class NPCMemory:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "NPCMemory":
+    def from_dict(cls, data: JsonObject) -> "NPCMemory":
         """从字典反序列化"""
         memory = cls()
         memory.player_interactions = data.get("player_interactions", {})
@@ -382,7 +404,6 @@ class NPCMemory:
         for player_id, attitude_str in data.get("player_attitudes", {}).items():
             memory.player_attitudes[player_id] = NPCAttitude(attitude_str)
         
-        # 6维态度向量
         memory.player_affection = data.get("player_affection", {})
         memory.player_suspicion = data.get("player_suspicion", {})
         memory.player_fear = data.get("player_fear", {})
@@ -390,7 +411,6 @@ class NPCMemory:
         memory.player_hostility = data.get("player_hostility", {})
         memory.player_dependence = data.get("player_dependence", {})
         
-        # 旧版兼容
         memory.player_trust_levels = data.get("player_trust_levels", {})
         memory.player_fear_levels = data.get("player_fear_levels", {})
         memory.player_suspicion_levels = data.get("player_suspicion_levels", {})
@@ -423,9 +443,48 @@ class NPC:
         self.can_move: bool = True
         self.can_speak: bool = True
         self.danger_level: str = "低"
-        self.dialogue_history: list[dict[str, Any]] = []
+        self.dialogue_history: list[dict[str, object]] = []
+        self.max_dialogue_history: int = 50  # 最大对话历史记录数
         self.target_location: str | None = None
         self.current_behavior: BehaviorType | None = None
+
+    def record_dialogue(self, player_id: str, player_message: str, npc_response: str) -> None:
+        """记录对话历史
+
+        Args:
+            player_id: 玩家ID
+            player_message: 玩家消息
+            npc_response: NPC回复
+        """
+        dialogue_record: dict[str, object] = {
+            "player_id": player_id,
+            "player_message": player_message,
+            "npc_response": npc_response,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        self.dialogue_history.append(dialogue_record)
+
+        # 限制历史记录数量，避免内存无限增长
+        if len(self.dialogue_history) > self.max_dialogue_history:
+            self.dialogue_history = self.dialogue_history[-self.max_dialogue_history:]
+
+    def get_recent_dialogue(self, player_id: str | None = None, count: int = 5) -> list[dict[str, object]]:
+        """获取最近的对话记录
+
+        Args:
+            player_id: 玩家ID（可选，不提供则返回所有玩家的记录）
+            count: 返回记录数量
+
+        Returns:
+            对话记录列表
+        """
+        if player_id is None:
+            return self.dialogue_history[-count:] if self.dialogue_history else []
+
+        # 筛选特定玩家的记录
+        player_dialogues = [d for d in self.dialogue_history if d.get("player_id") == player_id]
+        return player_dialogues[-count:] if player_dialogues else []
 
     def set_patrol_route(self, route: list[str]):
         """设置巡逻路线"""
@@ -462,7 +521,7 @@ class NPC:
         
         self.behavior_tree = root
     
-    def _should_investigate(self, _npc: "NPC", game_state: dict[str, Any]) -> bool:
+    def _should_investigate(self, _npc: "NPC", game_state: GameStateDict) -> bool:
         """判断是否应该调查"""
         sounds = game_state.get("recent_sounds", [])
         if not sounds:
@@ -474,21 +533,21 @@ class NPC:
 
         return False
 
-    def _should_escape(self, _npc: "NPC", _game_state: dict[str, Any]) -> bool:
+    def _should_escape(self, _npc: "NPC", _game_state: GameStateDict) -> bool:
         """判断是否应该逃跑"""
         for _player_id, fear_level in self.memory.player_fear_levels.items():
             if fear_level > 0.7:
                 return True
         return False
 
-    def _should_attack(self, _npc: "NPC", _game_state: dict[str, Any]) -> bool:
+    def _should_attack(self, _npc: "NPC", _game_state: GameStateDict) -> bool:
         """判断是否应该攻击"""
         for _player_id, attitude in self.memory.player_attitudes.items():
             if attitude == NPCAttitude.HOSTILE:
                 return True
         return False
 
-    def _should_interact(self, _npc: "NPC", game_state: dict[str, Any]) -> bool:
+    def _should_interact(self, _npc: "NPC", game_state: GameStateDict) -> bool:
         """判断是否应该互动"""
         players = game_state.get("players", {})
         for _player_id, player_data in players.items():
@@ -496,7 +555,7 @@ class NPC:
                 return True
         return False
 
-    def _investigate_sound(self, _npc: "NPC", game_state: dict[str, Any]) -> dict[str, Any]:
+    def _investigate_sound(self, _npc: "NPC", game_state: GameStateDict) -> BehaviorResultDict:
         """调查声音"""
         sounds = game_state.get("recent_sounds", [])
         if not sounds:
@@ -511,7 +570,7 @@ class NPC:
             "result": f"前往{self.target_location}调查声音"
         }
 
-    def _escape_to_safety(self, _npc: "NPC", game_state: dict[str, Any]) -> dict[str, Any]:
+    def _escape_to_safety(self, _npc: "NPC", game_state: GameStateDict) -> BehaviorResultDict:
         """逃往安全地点"""
         safe_locations = game_state.get("safe_locations", [self.current_location])
         if safe_locations:
@@ -525,7 +584,7 @@ class NPC:
             "result": f"逃往{self.target_location}"
         }
 
-    def _attack_player(self, _npc: "NPC", game_state: dict[str, Any]) -> dict[str, Any]:
+    def _attack_player(self, _npc: "NPC", game_state: GameStateDict) -> BehaviorResultDict:
         """攻击玩家"""
         hostile_players = [
             pid for pid, attitude in self.memory.player_attitudes.items()
@@ -544,7 +603,7 @@ class NPC:
             "result": f"前往{self.target_location}攻击玩家"
         }
     
-    def _interact_with_player(self, _npc: "NPC", game_state: dict[str, Any]) -> dict[str, Any]:
+    def _interact_with_player(self, _npc: "NPC", game_state: GameStateDict) -> BehaviorResultDict:
         """与玩家互动"""
         players = game_state.get("players", {})
         nearby_players = [
@@ -565,7 +624,7 @@ class NPC:
 
         return {"action": "互动", "result": "附近没有玩家"}
 
-    def _patrol(self, _npc: "NPC", _game_state: dict[str, Any]) -> dict[str, Any]:
+    def _patrol(self, _npc: "NPC", _game_state: GameStateDict) -> BehaviorResultDict:
         """巡逻"""
         if not self.patrol_route:
             return {"action": "巡逻", "result": "无巡逻路线，原地待命"}
@@ -580,7 +639,7 @@ class NPC:
             "result": f"前往{next_location}巡逻"
         }
 
-    def update(self, game_state: dict[str, Any], _game_time: int) -> dict[str, Any]:
+    def update(self, game_state: GameStateDict, _game_time: int) -> BehaviorResultDict:
         """更新NPC状态"""
         if not self.is_active:
             return {"status": "inactive"}
@@ -609,36 +668,36 @@ class NPC:
         
         dialogue_prompts = {
             NPCAttitude.FRIENDLY: [
-                f"你好，{context}。",
-                f"很高兴见到你，{context}。",
-                f"有什么我可以帮助你的吗？{context}"
+                f"【{self.name}露出微笑，向你走近一步】你好，{context}。",
+                f"【{self.name}拍了拍你的肩膀，语气轻松】很高兴见到你，{context}。",
+                f"【{self.name}歪着头，眼神温和】有什么我可以帮助你的吗？{context}"
             ],
             NPCAttitude.NEUTRAL: [
-                f"嗯，{context}。",
-                f"我知道了，{context}。",
-                f"好吧，{context}。"
+                f"【{self.name}面无表情地看着你】嗯，{context}。",
+                f"【{self.name}点了点头，但眼神飘忽】我知道了，{context}。",
+                f"【{self.name}双手抱胸，保持一定距离】好吧，{context}。"
             ],
             NPCAttitude.SUSPICIOUS: [
-                f"你确定吗？{context}。",
-                f"我有点怀疑，{context}。",
-                f"你为什么要问这个？{context}"
+                f"【{self.name}眯起眼睛打量你，手悄悄移向口袋】你确定吗？{context}。",
+                f"【{self.name}后退半步，眼神警惕】我有点怀疑，{context}。",
+                f"【{self.name}压低声音，环顾四周】你为什么要问这个？{context}"
             ],
             NPCAttitude.HOSTILE: [
-                f"滚开！{context}。",
-                f"我不相信你，{context}。",
-                f"别靠近我！{context}"
+                f"【{self.name}瞪大眼睛，拳头紧握】滚开！{context}。",
+                f"【{self.name}冷笑一声，身体前倾】我不相信你，{context}。",
+                f"【{self.name}举起手，做出驱赶的动作】别靠近我！{context}"
             ],
             NPCAttitude.FEARFUL: [
-                f"别...别过来...{context}。",
-                f"我...我不知道...{context}。",
-                f"求求你...{context}。"
+                f"【{self.name}颤抖着后退，声音发颤】别...别过来...{context}。",
+                f"【{self.name}抱紧双臂，眼神躲闪】我...我不知道...{context}。",
+                f"【{self.name}几乎要哭出来，双手合十】求求你...{context}。"
             ]
         }
         
         prompts = dialogue_prompts.get(attitude, dialogue_prompts[NPCAttitude.NEUTRAL])
         return random.choice(prompts)
     
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> JsonObject:
         """序列化为字典"""
         return {
             "npc_id": self.npc_id,
@@ -660,7 +719,7 @@ class NPC:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "NPC":
+    def from_dict(cls, data: JsonObject) -> "NPC":
         """从字典反序列化"""
         npc = cls(
             data["npc_id"],

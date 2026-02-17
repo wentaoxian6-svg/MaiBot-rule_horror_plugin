@@ -11,8 +11,8 @@ import threading
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 
+from ...common.models import JsonObject
 from .models import GameSession
 from ..config import get_config
 
@@ -53,7 +53,7 @@ class SaveManager:
         # 改为使用deque存储多个版本，避免数据丢失
         self._pending_saves: dict[str, deque[tuple[datetime, GameSession]]] = {}
         self._save_lock: asyncio.Lock = asyncio.Lock()
-        self._batch_task: asyncio.Task[Any] | None = None
+        self._batch_task: asyncio.Task[None] | None = None
         self._running: bool = False
 
     async def start(self) -> None:
@@ -238,13 +238,13 @@ class SaveManager:
 
         return deleted
 
-    async def list_saves(self) -> list[dict[str, Any]]:
+    async def list_saves(self) -> list[JsonObject]:
         """列出所有存档（包含默认存档与命名存档）
 
         Returns:
             存档信息列表
         """
-        saves: list[dict[str, Any]] = []
+        saves: list[JsonObject] = []
 
         for file_path in self.data_dir.iterdir():
             if not file_path.is_file():
@@ -270,13 +270,19 @@ class SaveManager:
                     elif file_path.name.startswith("named_"):
                         name = "未命名"
 
+                players = session.get("players", {})
+                player_names = [p.get("name", "未知") for p in players.values() if p.get("name")]
+                player_ids = [p.get("player_id", "") for p in players.values() if p.get("player_id")]
+
                 saves.append({
                     "group_id": session.get("group_id", "unknown"),
                     "scene_name": session.get("scene_name", "未知场景"),
                     "game_mode": session.get("game_mode", "未知"),
                     "status": session.get("status", "unknown"),
                     "saved_at": data.get("saved_at", "unknown"),
-                    "player_count": len(session.get("players", {})),
+                    "player_count": len(players),
+                    "player_names": player_names,
+                    "player_ids": player_ids,
                     "name": name,
                     "file": file_path.name,
                     "is_named": file_path.name.startswith("named_"),

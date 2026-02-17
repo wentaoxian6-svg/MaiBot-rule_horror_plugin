@@ -1,17 +1,22 @@
-# pyright: reportDeprecated=false
-# pyright: reportUnknownVariableType=false
-# pyright: reportUnknownMemberType=false
-# pyright: reportMissingParameterType=false
-# pyright: reportAny=false
-
 """
 渐进式线索发现系统
 将线索拆分为观察、推理、NPC三类，增强探索过程
 """
 
-from typing import Any
+from typing import TypedDict, TypeAlias
 from enum import Enum
 from dataclasses import dataclass
+
+# 类型定义
+ClueDict: TypeAlias = dict[str, "str | int | bool | list | None"]
+GameState: TypeAlias = dict[str, "str | int | dict | list | None"]
+SystemDict: TypeAlias = dict[str, "dict | list | set | None"]
+
+
+class PlayerProgressDict(TypedDict, total=False):
+    """玩家进度字典类型"""
+    discovered_clues: list[str]
+    total_clues_discovered: int
 
 
 class ClueType(Enum):
@@ -161,7 +166,7 @@ class ClueDiscoverySystem:
     def __init__(self):
         self.clues: dict[str, Clue] = {}
         self.discovered_clues: set[str] = set()
-        self.player_progress: dict[str, dict[str, Any]] = {}
+        self.player_progress: dict[str, PlayerProgressDict] = {}
         self.location_clues: dict[str, list[str]] = {}
         self.item_clues: dict[str, list[str]] = {}
         self.npc_clues: dict[str, list[str]] = {}
@@ -245,7 +250,7 @@ class ClueDiscoverySystem:
         return True
     
     def get_available_clues(self, player_id: str, location: str,
-                            inventory: list[str], _game_state: dict[str, Any]) -> list[Clue]:
+                            inventory: list[str], _game_state: GameState) -> list[Clue]:
         """获取可发现的线索
         
         Args:
@@ -333,7 +338,7 @@ class ClueDiscoverySystem:
         clue_ids = self.location_clues.get(location, [])
         return [self.clues[cid] for cid in clue_ids if cid in self.clues]
 
-    def get_player_progress(self, player_id: str) -> dict[str, Any]:
+    def get_player_progress(self, player_id: str) -> PlayerProgressDict:
         """获取玩家进度"""
         return self.player_progress.get(player_id, {
             "discovered_clues": [],
@@ -422,7 +427,7 @@ class ClueDiscoverySystem:
 提示：{clue.hint}
 """
     
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> SystemDict:
         """序列化为字典"""
         return {
             "clues": {
@@ -451,7 +456,7 @@ class ClueDiscoverySystem:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ClueDiscoverySystem":
+    def from_dict(cls, data: SystemDict) -> "ClueDiscoverySystem":
         """从字典反序列化"""
         system = cls()
         

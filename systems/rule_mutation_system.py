@@ -1,15 +1,21 @@
-# pyright: reportDeprecated=false
-# pyright: reportUnknownVariableType=false
-# pyright: reportMissingParameterType=false
-
 """
 规则变异的条件触发系统
 改用条件触发制，而非随机概率，增强叙事连贯性
 """
 
-from typing import Any
+from __future__ import annotations
+
+import logging
+from typing import Callable, TypeAlias
 from enum import Enum
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+# 类型定义
+GameState: TypeAlias = dict[str, object]
+MutationDetails: TypeAlias = dict[str, object]
+SystemDict: TypeAlias = dict[str, "list | set | dict | int | None"]
 
 
 class MutationTriggerType(Enum):
@@ -22,12 +28,16 @@ class MutationTriggerType(Enum):
     LOCATION = "位置条件"
 
 
+# 定义检查函数的类型
+CheckFunction = Callable[[GameState, str | None, "RuleMutationSystem"], bool]
+
+
 @dataclass
 class MutationCondition:
     """变异条件"""
     condition_type: MutationTriggerType
     description: str
-    check_function: Any  # callable type is complex, using Any for simplicity
+    check_function: CheckFunction
     priority: int = 0
 
 
@@ -39,7 +49,7 @@ class MutationEvent:
     trigger_reason: str
     triggered_by: list[str]
     triggered_at: int
-    mutation_details: dict[str, Any]
+    mutation_details: MutationDetails
 
 
 class RuleMutationSystem:
@@ -55,6 +65,7 @@ class RuleMutationSystem:
     def __init__(self):
         self.mutation_conditions: list[MutationCondition] = []
         self.mutation_history: list[MutationEvent] = []
+        self.max_mutation_history: int = 100  # 最大变异历史记录数
         self.triggered_conditions: set[str] = set()
         self.violation_counts: dict[str, int] = {}
         self.location_visit_counts: dict[str, int] = {}
@@ -67,7 +78,7 @@ class RuleMutationSystem:
         """添加变异条件"""
         self.mutation_conditions.append(condition)
     
-    def check_conditions(self, game_state: dict[str, Any], player_action: str | None = None,
+    def check_conditions(self, game_state: GameState, player_action: str | None = None,
                          game_time: int = 0) -> list[MutationCondition]:
         """检查所有变异条件
         
@@ -94,11 +105,11 @@ class RuleMutationSystem:
                 if condition.check_function(game_state, player_action, self):
                     satisfied_conditions.append(condition)
             except Exception as e:
-                print(f"[规则变异系统] 检查条件时出错: {e}")
+                logger.error(f"[规则变异系统] 检查条件时出错: {e}")
         
         return satisfied_conditions
     
-    def trigger_mutation(self, condition: MutationCondition, game_state: dict[str, Any],
+    def trigger_mutation(self, condition: MutationCondition, game_state: GameState,
                         game_time: int, triggered_by: list[str]) -> MutationEvent:
         """触发规则变异
         
@@ -125,7 +136,11 @@ class RuleMutationSystem:
         )
         
         self.mutation_history.append(mutation_event)
-        
+
+        # 限制历史记录数量，避免内存无限增长
+        if len(self.mutation_history) > self.max_mutation_history:
+            self.mutation_history = self.mutation_history[-self.max_mutation_history:]
+
         return mutation_event
     
     def record_violation(self, rule_id: str, player_id: str):
@@ -174,7 +189,7 @@ class RuleMutationSystem:
         self.key_clues_found.clear()
         self.last_mutation_time = -999
     
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> SystemDict:
         """序列化为字典"""
         return {
             "mutation_history": [
@@ -197,7 +212,7 @@ class RuleMutationSystem:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RuleMutationSystem":
+    def from_dict(cls, data: SystemDict) -> "RuleMutationSystem":
         """从字典反序列化"""
         system = cls()
         
@@ -226,34 +241,15 @@ class RuleMutationSystem:
 def create_default_mutation_conditions() -> list[MutationCondition]:
     """创建默认的变异条件"""
     conditions: list[MutationCondition] = []
-
-    def check_environment_condition(game_state: dict[str, Any], player_action: str | None,
-                                    system: RuleMutationSystem) -> bool:
-        """环境条件：特定时间+特定区域"""
-        time_system = game_state.get("time_system", {})
-        elapsed_minutes = time_system.get("elapsed_minutes", 0)
-        
-        if elapsed_minutes < 120:
-            return False
-        
-        players = game_state.get("players", {})
-        for player_id, player_data in players.items():
-            location = player_data.get("location", "")
-            if "地下室" in location or "密室" in location:
-                return True
-        
-        return False
     
-    conditions.append(MutationCondition(
-        condition_type=MutationTriggerType.ENVIRONMENT,
-        description="玩家在特定时间进入危险区域",
-        check_function=check_environment_condition,
-        priority=1
-    ))
-    
-    def check_behavior_condition(game_state: dict[str, Any], player_action: str | None,
+    def check_behavior_condition(game_state: GameState, player_action: str | None,
                                 system: RuleMutationSystem) -> bool:
-        """行为条件：连续违反规则"""
+        """行为条件：连续违反规则
+        
+        说明：当玩家在短时间内多次违反规则时触发。
+        这代表玩家没有理解或故意挑战规则，
+        "场景意识"感知到这种挑战，可能通过规则变异来回应。
+        """
         players = game_state.get("players", {})
         rules = game_state.get("rules", [])
         
@@ -280,83 +276,63 @@ def create_default_mutation_conditions() -> list[MutationCondition]:
         condition_type=MutationTriggerType.BEHAVIOR,
         description="玩家连续违反规则",
         check_function=check_behavior_condition,
-        priority=2
+        priority=1
     ))
     
-    def check_plot_condition(game_state: dict[str, Any], player_action: str | None,
-                            system: RuleMutationSystem) -> bool:
-        """剧情条件：收集到关键线索"""
-        key_clues = game_state.get("key_clues", [])
-        discovered_clues = len([clue for clue in key_clues if system.has_found_key_clue(clue)])
+    def check_special_location_condition(game_state: GameState, player_action: str | None,
+                                         system: RuleMutationSystem) -> bool:
+        """位置条件：多次访问特殊位置
         
-        return discovered_clues >= 2
-    
-    conditions.append(MutationCondition(
-        condition_type=MutationTriggerType.PLOT,
-        description="收集到足够的关键线索",
-        check_function=check_plot_condition,
-        priority=3
-    ))
-    
-    def check_time_condition(game_state: dict[str, Any], player_action: str | None,
-                            system: RuleMutationSystem) -> bool:
-        """时间条件：游戏时间超过阈值"""
-        time_system = game_state.get("time_system", {})
-        elapsed_minutes = time_system.get("elapsed_minutes", 0)
+        说明：当玩家反复访问特殊/关键位置时触发。
+        特殊位置包括：
+        - 场景结构中的 special_areas
+        - 发现过关键物品的位置
+        - NPC提到过的"禁区"
         
-        return elapsed_minutes >= 180
-    
-    conditions.append(MutationCondition(
-        condition_type=MutationTriggerType.TIME,
-        description="游戏时间超过3小时",
-        check_function=check_time_condition,
-        priority=4
-    ))
-    
-    def check_item_condition(game_state: dict[str, Any], player_action: str | None,
-                            system: RuleMutationSystem) -> bool:
-        """物品条件：发现关键物品"""
+        这种重复访问暗示玩家的执念或异常行为，
+        可能引起"场景意识"的注意，通过规则变异来回应。
+        """
         players = game_state.get("players", {})
+        scene_structure = game_state.get("scene_structure", {})
+        special_areas = scene_structure.get("special_areas", []) if isinstance(scene_structure, dict) else []
         
         for player_id, player_data in players.items():
-            inventory = player_data.get("inventory", [])
-            for item in inventory:
-                if isinstance(item, dict):
-                    item_name = item.get("name", "")
-                else:
-                    item_name = str(item)
-                
-                if "日记" in item_name or "笔记" in item_name or "档案" in item_name:
+            location = player_data.get("location", "")
+            if not location:
+                continue
+            
+            # 检查是否是特殊位置
+            is_special = False
+            
+            # 1. 检查是否在 special_areas 中
+            if isinstance(special_areas, list):
+                for area in special_areas:
+                    if isinstance(area, str) and area in location:
+                        is_special = True
+                        break
+            
+            # 2. 检查是否在此位置发现过关键物品
+            if not is_special:
+                key_items_found = game_state.get("key_items_found", {})
+                if isinstance(key_items_found, dict):
+                    for item_info in key_items_found.values():
+                        if isinstance(item_info, dict) and item_info.get("location") == location:
+                            is_special = True
+                            break
+            
+            # 3. 检查访问次数
+            if is_special:
+                visit_count = system.get_location_visit_count(location, player_id)
+                if visit_count >= 3:  # 特殊位置只需3次访问即可触发
                     return True
         
         return False
     
     conditions.append(MutationCondition(
-        condition_type=MutationTriggerType.ITEM,
-        description="发现关键物品（日记/笔记/档案）",
-        check_function=check_item_condition,
-        priority=5
-    ))
-    
-    def check_location_condition(game_state: dict[str, Any], player_action: str | None,
-                                 system: RuleMutationSystem) -> bool:
-        """位置条件：多次访问同一位置"""
-        players = game_state.get("players", {})
-        
-        for player_id, player_data in players.items():
-            location = player_data.get("location", "")
-            visit_count = system.get_location_visit_count(location, player_id)
-            
-            if visit_count >= 5:
-                return True
-        
-        return False
-    
-    conditions.append(MutationCondition(
         condition_type=MutationTriggerType.LOCATION,
-        description="多次访问同一位置",
-        check_function=check_location_condition,
-        priority=6
+        description="多次访问特殊位置",
+        check_function=check_special_location_condition,
+        priority=2
     ))
     
     return conditions

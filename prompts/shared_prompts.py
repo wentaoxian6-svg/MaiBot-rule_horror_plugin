@@ -1,23 +1,12 @@
-# pyright: reportDeprecated=false
-# pyright: reportUnknownVariableType=false
-# pyright: reportUnknownMemberType=false
-# pyright: reportUnknownParameterType=false
-# pyright: reportMissingParameterType=false
-# pyright: reportExplicitAny=false
-# pyright: reportAny=false
-# pyright: reportUnannotatedClassAttribute=false
-# pyright: reportImplicitOverride=false
-# pyright: reportAssignmentType=false
-# pyright: reportUnusedCallResult=false
-# pyright: reportImplicitStringConcatenation=false
-# pyright: reportUnnecessaryComparison=false
-# pyright: reportUnnecessaryIsInstance=false
-# pyright: reportUnusedVariable=false
+"""
+共享Prompt模板
 
-"""共享Prompt模板"""
+提供用于LLM的提示词模板，包括规则设计原则、场景描述要求等。
+"""
 
 import re
-from typing import Any, Dict
+
+from ..common.models import JsonObject
 
 RULE_DESIGN_PRINCIPLES = """
 1. **规则数量**：生成5-8条规则
@@ -279,11 +268,22 @@ def build_clear_condition_prompt() -> str:
 - 允许"接近"状态，给玩家正向反馈
 """
 
-def build_action_prompt_base(game_state: Dict[str, Any], current_player_name: str, current_player_location: str, 
-                          current_player_sanity: int, location_info: str, user_name: str, 
-                          action: str, is_action_player: bool, elapsed_minutes: int,
-                          environment: Dict[str, Any], environment_memory: Dict[str, Any], rule_network: Dict[str, Any],
-                          pending_rules_info: str, death_rule_info: str) -> str:
+def build_action_prompt_base(
+    game_state: JsonObject, 
+    current_player_name: str, 
+    current_player_location: str, 
+    current_player_sanity: int, 
+    location_info: str, 
+    user_name: str, 
+    action: str, 
+    is_action_player: bool, 
+    elapsed_minutes: int,
+    environment: JsonObject, 
+    environment_memory: JsonObject, 
+    rule_network: JsonObject,
+    pending_rules_info: str, 
+    death_rule_info: str
+) -> str:
     """构建行动判定的基础Prompt（公共部分）"""
     time_system = game_state.get("time_system", {})
     
@@ -881,8 +881,12 @@ def clean_llm_response(response: str) -> str:
     return cleaned
 
 
-def build_immersion_enhancement(current_player_name: str, current_player_sanity: int, 
-                                elapsed_minutes: int, _game_state: Dict[str, Any]) -> str:
+def build_immersion_enhancement(
+    current_player_name: str, 
+    current_player_sanity: int, 
+    elapsed_minutes: int, 
+    _game_state: JsonObject
+) -> str:
     """构建沉浸感增强提示
     
     增强游戏的沉浸感和恐怖氛围
@@ -966,7 +970,18 @@ def build_immersion_enhancement(current_player_name: str, current_player_sanity:
    - "尝到"恐惧：金属味、血腥味、腐臭味混合在口中
    - "触摸到"恐惧：空气变得粘稠、触感带有情绪
 
-10. **叙事视角切换**：
+10. **玩家内在独白（非常重要）**：
+    - 在场景描述中穿插玩家的内心想法和感受
+    - 理智值高时：理性的分析、逻辑的推理、冷静的判断
+    - 理智值中等时：开始怀疑、不安的猜测、矛盾的直觉
+    - 理智值低时：破碎的念头、混乱的思绪、无法控制的联想
+    - 独白应该自然融入描述，不要打断叙事节奏
+    - 例如：
+      * "角落里那个影子...不，应该只是错觉，但为什么我的心跳这么快？"
+      * "温度似乎在下降，或者只是我的错觉？不对，呼出的气变成了白雾..."
+      * "那个声音听起来像是...不，不可能，那只是风声，一定是风声..."
+
+11. **叙事视角切换**：
     - 偶尔使用第二人称直接对玩家说话（理智值低时）
     - "你感觉到了吗？它在靠近..."
     - "不要回头，它就在你身后..."

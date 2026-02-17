@@ -2,7 +2,6 @@
 from .settings import (
     LLMConfig,
     PluginConfig,
-    EnvironmentConfig,
     SaveConfig,
     Config,
     get_config,
@@ -13,7 +12,6 @@ from .loader import load_config_from_file
 __all__ = [
     "LLMConfig",
     "PluginConfig",
-    "EnvironmentConfig",
     "SaveConfig",
     "Config",
     "get_config",

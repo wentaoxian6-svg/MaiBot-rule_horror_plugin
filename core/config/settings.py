@@ -99,19 +99,6 @@ class PluginConfig(BaseModel):
     )
 
 
-class EnvironmentConfig(BaseModel):
-    """环境演变系统配置"""
-    enabled: bool = Field(default=True, description="是否启用环境演变系统")
-    api_url: str = Field(default="", description="环境演变系统LLM API地址，留空使用主配置")
-    api_key: str = Field(default="", description="环境演变系统LLM API密钥，留空使用主配置")
-    model_list: list[str] = Field(
-        default=["deepseek-ai/DeepSeek-V3"],
-        description="环境演变系统LLM模型列表"
-    )
-    current_model_index: int = Field(default=0, ge=0)
-    temperature: float = Field(default=0.7, ge=0.0, le=1.0)
-
-
 class SaveConfig(BaseModel):
     """存档配置"""
     batch_save_interval: int = Field(
@@ -136,7 +123,6 @@ class Config(BaseModel):
     """完整配置"""
     plugin: PluginConfig = Field(default_factory=PluginConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
-    environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     save: SaveConfig = Field(default_factory=SaveConfig)
 
 

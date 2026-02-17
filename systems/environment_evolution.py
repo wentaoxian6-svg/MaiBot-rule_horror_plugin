@@ -1,22 +1,26 @@
-# pyright: reportDeprecated=false
-# pyright: reportExplicitAny=false
-# pyright: reportAny=false
-# pyright: reportUnknownMemberType=false
-# pyright: reportUnknownVariableType=false
-# pyright: reportUnknownArgumentType=false
-# pyright: reportUnknownParameterType=false
-# pyright: reportUnannotatedClassAttribute=false
-# pyright: reportUnusedParameter=false
-
 import os
 import json
 import random
 import re
+import asyncio
 import aiohttp
-from typing import List, Tuple, Optional, Dict, Any
+import logging
 from datetime import datetime
+from typing import TypeAlias
 
-from .shared_prompts import RULE_DESIGN_PRINCIPLES
+from ..prompts.shared_prompts import RULE_DESIGN_PRINCIPLES
+from ..core.llm.client import LLMClient, get_default_max_tokens
+
+logger = logging.getLogger(__name__)
+
+# 类型定义
+GameState: TypeAlias = dict[str, "str | dict | list | None"]
+EnvironmentData: TypeAlias = dict[str, "str | dict | list | None"]
+NPCData: TypeAlias = dict[str, "str | int | bool | list | None"]
+EventData: TypeAlias = dict[str, "str | int | bool | dict | list | None"]
+IdentityData: TypeAlias = dict[str, "str | dict | list | None"]
+AccessResult: TypeAlias = dict[str, "bool | str | list | None"]
+LLMResponse: TypeAlias = dict[str, "str | int | bool | dict | list | None"]
 
 PLUGIN_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
@@ -24,19 +28,37 @@ DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 class EnvironmentEvolutionSystem:
     """环境演化系统 - 独立控制游戏环境、NPC和随机事件"""
-    
-    def __init__(self, game_states: Dict[str, Any]):
+
+    def __init__(self, game_states: dict[str, GameState], llm_client: LLMClient | None = None):
         self.game_states = game_states
-        
-    async def initialize_environment(self, group_id: str, scene_type: str, 
-                                      player_identity: str, building_type: str) -> Dict[str, Any]:
-        """初始化环境演化系统"""
+        self.llm_client = llm_client or LLMClient()
+
+    async def initialize_environment(self, group_id: str, scene_type: str,
+                                      player_identity: str, building_type: str,
+                                      use_llm: bool = True,
+                                      temperature: float = 0.7) -> EnvironmentData:
+        """初始化环境演化系统
+
+        Args:
+            group_id: 群组ID
+            scene_type: 场景类型
+            player_identity: 玩家身份
+            building_type: 建筑类型
+            use_llm: 是否使用LLM生成环境（默认True）
+            temperature: 温度参数（可选）
+
+        Returns:
+            环境数据
+        """
         game_state = self.game_states.get(group_id, {})
         if not game_state:
             return {}
-        
-        environment_data = {
+
+        # 基础环境数据
+        environment_data: EnvironmentData = {
             "npcs": [],
+            "scene_type": scene_type,
+            "building_type": building_type,
             "time": {
                 "current_time": "深夜",
                 "elapsed_minutes": 0,
@@ -61,16 +83,105 @@ class EnvironmentEvolutionSystem:
                 "identity_guides": {}
             }
         }
-        
+
+        # 如果使用LLM，调用LLM生成环境
+        if use_llm:
+            llm_environment = await self._generate_environment_with_llm(
+                scene_type, building_type, player_identity, temperature
+            )
+            if llm_environment:
+                environment_data["environment_state"] = llm_environment
+
         game_state["environment_evolution"] = environment_data
-        
+
         return environment_data
+
+    async def _generate_environment_with_llm(
+        self, scene_type: str, building_type: str, player_identity: str,
+        temperature: float = 0.7
+    ) -> dict[str, object] | None:
+        """使用LLM生成环境状态
+
+        Args:
+            scene_type: 场景类型
+            building_type: 建筑类型
+            player_identity: 玩家身份
+            temperature: 温度参数
+
+        Returns:
+            环境状态字典或None
+        """
+        prompt = f"""
+你是一位规则怪谈环境设计师。请为以下场景生成初始环境状态。
+
+场景类型：{scene_type}
+建筑类型：{building_type}
+玩家身份：{player_identity}
+当前时间：深夜（午夜）
+
+**环境设计要求：**
+
+1. **光线状况**：描述场景的光线（如：昏暗、闪烁不定、完全黑暗、微弱的月光等）
+2. **温度感受**：描述温度给人的感受（如：寒冷、阴冷、温暖、闷热等）
+3. **声音**：列出2-4个场景中可听到的声音（如：风声、滴水声、远处的脚步声、寂静等）
+4. **气味**：列出2-3个场景中的气味（如：霉味、消毒水味、血腥味、陈旧纸张味等）
+5. **整体氛围**：描述场景的整体氛围（如：压抑、诡异、神秘、恐怖、不安等）
+
+**设计要求：**
+- 环境描述应该符合场景类型和建筑类型的特点
+- 环境应该营造恐怖、诡异、压抑的氛围
+- 环境细节应该暗示隐藏的真相或规则
+- 不要使用emoji表情符号
+
+**输出格式：**
+请以JSON格式返回，格式如下：
+{{
+  "lighting": "光线状况",
+  "temperature": "温度感受",
+  "sounds": ["声音1", "声音2", "声音3"],
+  "smells": ["气味1", "气味2"],
+  "atmosphere": "整体氛围描述"
+}}
+
+请仅返回JSON，不要包含任何其他文字。
+"""
+
+        try:
+            response = await self.llm_client.call(
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=2000
+            )
+
+            result = response.parse_json()
+
+            # 验证必要的字段
+            required_fields = ["lighting", "temperature", "sounds", "smells", "atmosphere"]
+            for field in required_fields:
+                if field not in result:
+                    result[field] = self._get_default_environment_field(field)
+
+            return result
+        except Exception as e:
+            logger.error(f"[环境演化] 使用LLM生成环境失败: {e}")
+            return None
+
+    def _get_default_environment_field(self, field: str) -> object:
+        """获取环境字段的默认值"""
+        defaults = {
+            "lighting": "昏暗",
+            "temperature": "寒冷",
+            "sounds": ["寂静"],
+            "smells": ["霉味"],
+            "atmosphere": "压抑"
+        }
+        return defaults.get(field, "")
     
-    async def generate_npcs(self, group_id: str, scene_type: str, 
+    async def generate_npcs(self, group_id: str, scene_type: str,
                             player_identity: str, building_type: str,
-                            api_url: str, api_key: str, model_list: List[str],
+                            api_url: str, api_key: str, model_list: list[str],
                             current_model_index: int, temperature: float,
-                            game_mode: str = "单人") -> List[Dict[str, Any]]:
+                            game_mode: str = "单人") -> list[NPCData]:
         """生成NPC角色"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -146,12 +257,12 @@ class EnvironmentEvolutionSystem:
             
             llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
             if not llm_response:
-                print(f"[环境演化] 生成第{i+1}个NPC失败：LLM API调用失败")
+                logger.error(f"[环境演化] 生成第{i+1}个NPC失败：LLM API调用失败")
                 continue
             
             result = self._parse_llm_json_response(llm_response, "生成NPC")
             if not result:
-                print(f"[环境演化] 生成第{i+1}个NPC失败：JSON解析失败")
+                logger.error(f"[环境演化] 生成第{i+1}个NPC失败：JSON解析失败")
                 continue
             
             npcs = result.get("npcs", [])
@@ -161,7 +272,7 @@ class EnvironmentEvolutionSystem:
                     if role and role not in existing_roles:
                         existing_roles.append(role)
                 all_npcs.extend(npcs)
-                print(f"[环境演化] 成功生成第{i+1}个NPC")
+                logger.info(f"[环境演化] 成功生成第{i+1}个NPC")
         
         if game_state.get("environment_evolution"):
             game_state["environment_evolution"]["npcs"] = all_npcs
@@ -170,8 +281,8 @@ class EnvironmentEvolutionSystem:
     
     async def generate_complete_rules(self, group_id: str, scene_name: str,
                                           player_identity: str, building_type: str,
-                                          api_url: str, api_key: str, model_list: List[str],
-                                          current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
+                                          api_url: str, api_key: str, model_list: list[str],
+                                          current_model_index: int, temperature: float) -> dict[str, "str | list"] | None:
         """生成完整的场景规则
         
         Args:
@@ -309,24 +420,24 @@ class EnvironmentEvolutionSystem:
         
         llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
-            print("[环境演化] 生成完整规则失败：LLM API调用失败")
-            print("[环境演化] 可能原因：API服务不可用、网络连接问题或API密钥错误")
+            logger.error("[环境演化] 生成完整规则失败：LLM API调用失败")
+            logger.error("[环境演化] 可能原因：API服务不可用、网络连接问题或API密钥错误")
             return None
         
         result = self._parse_llm_json_response(llm_response, "生成完整规则")
         if not result:
-            print("[环境演化] 生成完整规则失败：JSON解析失败")
-            print(f"[环境演化] LLM返回内容（前500字符）: {llm_response[:500]}")
+            logger.error("[环境演化] 生成完整规则失败：JSON解析失败")
+            logger.debug(f"[环境演化] LLM返回内容（前500字符）: {llm_response[:500]}")
             return None
         
-        print(f"[环境演化] 生成完整规则成功，包含 {len(result.get('rules', []))} 条规则")
+        logger.info(f"[环境演化] 生成完整规则成功，包含 {len(result.get('rules', []))} 条规则")
         return result
 
     async def generate_npc_initial_guidance(self, group_id: str, scene_name: str,
                                              player_identity: str, building_type: str,
                                              game_mode: str,
-                                             api_url: str, api_key: str, model_list: List[str],
-                                             current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
+                                             api_url: str, api_key: str, model_list: list[str],
+                                             current_model_index: int, temperature: float) -> dict[str, "str | dict"] | None:
         """生成NPC初始引导
         
         Args:
@@ -444,20 +555,20 @@ class EnvironmentEvolutionSystem:
         
         llm_response = await self._call_llm_api(prompt, api_url, api_key, model_list, current_model_index, temperature)
         if not llm_response:
-            print("[环境演化] 生成NPC初始引导失败：LLM API调用失败")
+            logger.error("[环境演化] 生成NPC初始引导失败：LLM API调用失败")
             return None
         
         result = self._parse_llm_json_response(llm_response, "生成NPC初始引导")
         if not result:
-            print("[环境演化] 生成NPC初始引导失败：JSON解析失败")
+            logger.error("[环境演化] 生成NPC初始引导失败：JSON解析失败")
             return None
         
         return result
     
-    async def update_environment(self, group_id: str, player_actions: List[str],
-                                   player_locations: List[str],
-                                   api_url: str, api_key: str, model_list: List[str],
-                                   current_model_index: int, temperature: float) -> Dict[str, Any]:
+    async def update_environment(self, group_id: str, player_actions: list[str],
+                                   player_locations: list[str],
+                                   api_url: str, api_key: str, model_list: list[str],
+                                   current_model_index: int, temperature: float) -> EnvironmentData:
         """更新环境状态"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -574,7 +685,7 @@ class EnvironmentEvolutionSystem:
         
         return environment_evolution
     
-    def format_environment_update(self, group_id: str) -> Optional[str]:
+    def format_environment_update(self, group_id: str) -> str | None:
         """格式化环境更新信息，返回场景描述
         
         Args:
@@ -599,8 +710,8 @@ class EnvironmentEvolutionSystem:
     
     async def generate_identity_guide(self, group_id: str, player_identity: str,
                                      building_type: str, api_url: str, api_key: str,
-                                     model_list: List[str], current_model_index: int,
-                                     temperature: float) -> Optional[Dict[str, Any]]:
+                                     model_list: list[str], current_model_index: int,
+                                     temperature: float) -> IdentityData | None:
         """生成身份引导信息（如管家引导侍者）"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -679,7 +790,7 @@ class EnvironmentEvolutionSystem:
         return result
     
     async def check_area_access(self, group_id: str, player_identity: str,
-                               target_area: str) -> Dict[str, Any]:
+                               target_area: str) -> AccessResult:
         """评估玩家进入目标区域的风险（不再强制禁止，而是提供风险评估）"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -741,8 +852,8 @@ class EnvironmentEvolutionSystem:
     
     async def trigger_area_violation_consequences(self, group_id: str, player_identity: str,
                                                    target_area: str, api_url: str, api_key: str,
-                                                   model_list: List[str], current_model_index: int,
-                                                   temperature: float) -> Optional[Dict[str, Any]]:
+                                                   model_list: list[str], current_model_index: int,
+                                                  temperature: float) -> EventData | None:
         """触发进入限制区域的负面后果"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -850,8 +961,8 @@ NPC性格：{relevant_npc.get('personality', '神秘、危险')}
         return violation_event
     
     async def update_identity_permissions(self, group_id: str, new_identity: str,
-                                          api_url: str, api_key: str, model_list: List[str],
-                                          current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
+                                          api_url: str, api_key: str, model_list: list[str],
+                                          current_model_index: int, temperature: float) -> IdentityData | None:
         """更新身份权限（当玩家身份变化时）"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -928,7 +1039,7 @@ NPC性格：{relevant_npc.get('personality', '神秘、危险')}
         
         return result
     
-    async def get_identity_guide_npc(self, group_id: str, player_identity: str) -> Optional[Dict[str, Any]]:
+    async def get_identity_guide_npc(self, group_id: str, player_identity: str) -> IdentityData | None:
         """获取身份引导NPC信息"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -944,8 +1055,8 @@ NPC性格：{relevant_npc.get('personality', '神秘、危险')}
         return identity_guides.get(player_identity)
     
     async def trigger_random_event(self, group_id: str, player_location: str,
-                                   api_url: str, api_key: str, model_list: List[str],
-                                   current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
+                                   api_url: str, api_key: str, model_list: list[str],
+                                   current_model_index: int, temperature: float) -> EventData | None:
         """触发随机事件"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -1025,8 +1136,8 @@ NPC性格：{relevant_npc.get('personality', '神秘、危险')}
     
     async def check_npc_interaction(self, group_id: str, player_location: str,
                                      player_action: str, api_url: str, api_key: str,
-                                     model_list: List[str], current_model_index: int,
-                                     temperature: float) -> Optional[Dict[str, Any]]:
+                                     model_list: list[str], current_model_index: int,
+                                     temperature: float) -> EventData | None:
         """检查NPC交互"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -1138,8 +1249,8 @@ NPC最近活动轨迹：
         return interaction
     
     async def check_npc_active_interaction(self, group_id: str, player_location: str,
-                                             api_url: str, api_key: str, model_list: List[str],
-                                             current_model_index: int, temperature: float) -> Optional[Dict[str, Any]]:
+                                             api_url: str, api_key: str, model_list: list[str],
+                                             current_model_index: int, temperature: float) -> EventData | None:
         """检查NPC主动交互"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -1192,8 +1303,11 @@ NPC最近活动轨迹：
         
         if not eligible_npcs:
             return None
-        
-        eligible_npcs.sort(key=lambda x: x["priority"], reverse=True)  # pyright: ignore[reportUnknownLambdaType]
+
+        def _get_priority(item: dict[str, object]) -> int:
+            return int(item.get("priority", 0))
+
+        eligible_npcs.sort(key=_get_priority, reverse=True)
         selected_npc_data = eligible_npcs[0]
         selected_npc = selected_npc_data["npc"]
         
@@ -1323,7 +1437,7 @@ NPC信息：
         
         return (location1, location2) in common_adjacent_pairs
     
-    def check_npc_discovery(self, group_id: str, player_location: str) -> List[Dict[str, Any]]:
+    def check_npc_discovery(self, group_id: str, player_location: str) -> list[dict[str, str]]:
         """检查玩家是否发现了NPC
         
         根据玩家当前位置和NPC的位置关系来判断是否发现NPC。
@@ -1415,8 +1529,8 @@ NPC信息：
             return f"在{npc_location}附近，你注意到了{npc_role}{npc_name}，{npc_activity}。"
     
     async def check_time_based_death(self, group_id: str, api_url: str, api_key: str,
-                                      model_list: List[str], current_model_index: int,
-                                      temperature: float) -> Tuple[bool, Optional[str]]:
+                                      model_list: list[str], current_model_index: int,
+                                      temperature: float) -> tuple[bool, str | None]:
         """检查基于时间的死亡条件"""
         game_state = self.game_states.get(group_id, {})
         if not game_state:
@@ -1506,19 +1620,18 @@ NPC信息：
         else:
             return "深夜"
     
-    def _parse_llm_json_response(self, llm_response: str, step_name: str = "步骤") -> Optional[Dict[str, Any]]:
+    def _parse_llm_json_response(self, llm_response: str, step_name: str = "步骤") -> JsonObject | None:
         """解析LLM返回的JSON响应，支持提取JSON部分并处理控制字符和不完整的JSON"""
         if not llm_response:
-            print(f"[环境演化] {step_name} LLM返回为空")
+            logger.warning(f"[环境演化] {step_name} LLM返回为空")
             return None
         
         def clean_json_string(json_str: str) -> str:
             """清理JSON字符串中的无效控制字符"""
-            import re
             json_str = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', json_str)
             return json_str
         
-        def try_parse_json(json_str: str) -> Optional[Dict[str, Any]]:
+        def try_parse_json(json_str: str) -> LLMResponse | None:
             """尝试解析JSON，返回解析结果或None"""
             try:
                 cleaned_str = clean_json_string(json_str)
@@ -1527,45 +1640,42 @@ NPC信息：
             except json.JSONDecodeError:
                 return None
         
-        def fix_incomplete_json(json_str: str) -> Optional[Dict[str, Any]]:
+        def fix_incomplete_json(json_str: str) -> LLMResponse | None:
             """尝试修复不完整的JSON"""
             try:
                 cleaned_str = clean_json_string(json_str)
                 
-                # 检查是否缺少闭合括号
                 open_braces = cleaned_str.count('{')
                 close_braces = cleaned_str.count('}')
                 
                 if open_braces > close_braces:
                     missing_braces = open_braces - close_braces
-                    print(f"[环境演化] {step_name} 检测到不完整的JSON，缺少 {missing_braces} 个闭合括号")
+                    logger.warning(f"[环境演化] {step_name} 检测到不完整的JSON，缺少 {missing_braces} 个闭合括号")
                     
-                    # 尝试补全括号
                     fixed_str = cleaned_str + '}' * missing_braces
                     
-                    # 尝试解析修复后的JSON
                     try:
                         result = json.loads(fixed_str)
-                        print(f"[环境演化] {step_name} 成功修复并解析JSON")
+                        logger.info(f"[环境演化] {step_name} 成功修复并解析JSON")
                         return result
                     except json.JSONDecodeError as e:
-                        print(f"[环境演化] {step_name} 修复JSON失败: {e}")
+                        logger.error(f"[环境演化] {step_name} 修复JSON失败: {e}")
                         return None
                 
                 return None
             except Exception as e:
-                print(f"[环境演化] {step_name} 修复JSON时发生异常: {e}")
+                logger.error(f"[环境演化] {step_name} 修复JSON时发生异常: {e}")
                 return None
         
         try:
             result = try_parse_json(llm_response)
             if result:
-                print(f"[环境演化] {step_name} JSON解析成功")
+                logger.info(f"[环境演化] {step_name} JSON解析成功")
                 return result
         except Exception as e:
-            print(f"[环境演化] {step_name} JSON解析失败: {e}")
+            logger.error(f"[环境演化] {step_name} JSON解析失败: {e}")
         
-        print(f"[环境演化] {step_name} 尝试提取JSON部分...")
+        logger.debug(f"[环境演化] {step_name} 尝试提取JSON部分...")
         
         json_match = re.search(r'\{[\s\S]*\}', llm_response)
         if json_match:
@@ -1573,31 +1683,29 @@ NPC信息：
                 json_str = json_match.group()
                 result = try_parse_json(json_str)
                 if result:
-                    print(f"[环境演化] {step_name} 成功提取JSON")
+                    logger.info(f"[环境演化] {step_name} 成功提取JSON")
                     return result
                 else:
-                    print(f"[环境演化] {step_name} 提取JSON后仍然解析失败，尝试修复...")
+                    logger.debug(f"[环境演化] {step_name} 提取JSON后仍然解析失败，尝试修复...")
                     
-                    # 尝试修复不完整的JSON
                     fixed_result = fix_incomplete_json(json_str)
                     if fixed_result:
                         return fixed_result
                     
-                    print(f"[环境演化] {step_name} 提取的JSON内容（前500字符）: {json_str[:500]}")
+                    logger.debug(f"[环境演化] {step_name} 提取的JSON内容（前500字符）: {json_str[:500]}")
                     return None
             except Exception as e2:
-                print(f"[环境演化] {step_name} 提取JSON后仍然解析失败: {e2}")
+                logger.error(f"[环境演化] {step_name} 提取JSON后仍然解析失败: {e2}")
                 return None
         else:
-            print(f"[环境演化] {step_name} 未找到JSON部分")
-            print(f"[环境演化] LLM返回内容（前500字符）: {llm_response[:500]}")
+            logger.warning(f"[环境演化] {step_name} 未找到JSON部分")
+            logger.debug(f"[环境演化] LLM返回内容（前500字符）: {llm_response[:500]}")
             return None
     
     async def _call_llm_api(self, prompt: str, api_url: str, api_key: str,
-                             model_list: List[str], current_model_index: int,
-                             temperature: float, max_tokens: int = 16000) -> Optional[str]:
+                             model_list: list[str], current_model_index: int,
+                             temperature: float, max_tokens: int = 16000) -> str | None:
         """调用LLM API，支持重试机制和截断检测"""
-        import asyncio
         
         max_retries = 3
         base_delay = 3
@@ -1626,7 +1734,7 @@ NPC信息：
                             result = await response.json()
                             choices = result.get("choices", [])
                             if not choices:
-                                print(f"[环境演化] LLM API返回choices为空")
+                                logger.warning("[环境演化] LLM API返回choices为空")
                                 return None
                             
                             first_choice = choices[0]
@@ -1634,94 +1742,94 @@ NPC信息：
                             content = first_choice.get("message", {}).get("content", "")
                             
                             if not content:
-                                print(f"[环境演化] LLM API返回内容为空")
+                                logger.warning("[环境演化] LLM API返回内容为空")
                                 return None
                             
-                            print(f"[环境演化] LLM API调用成功 (尝试 {attempt + 1}/{max_retries})")
-                            print(f"[环境演化] 返回内容长度: {len(content)} 字符")
-                            print(f"[环境演化] finish_reason: {finish_reason}")
+                            logger.info(f"[环境演化] LLM API调用成功 (尝试 {attempt + 1}/{max_retries})")
+                            logger.debug(f"[环境演化] 返回内容长度: {len(content)} 字符")
+                            logger.debug(f"[环境演化] finish_reason: {finish_reason}")
                             
                             if finish_reason == "length":
-                                print(f"[环境演化] 检测到响应被截断，当前max_tokens: {current_max_tokens}")
+                                logger.warning(f"[环境演化] 检测到响应被截断，当前max_tokens: {current_max_tokens}")
                                 
                                 if attempt < max_retries - 1:
                                     current_max_tokens = min(current_max_tokens * 2, 16000)
-                                    print(f"[环境演化] 增加max_tokens到 {current_max_tokens} 并重试...")
+                                    logger.info(f"[环境演化] 增加max_tokens到 {current_max_tokens} 并重试...")
                                     await asyncio.sleep(1)
                                     continue
                                 else:
-                                    print(f"[环境演化] 已达到最大重试次数，使用截断的响应")
+                                    logger.warning("[环境演化] 已达到最大重试次数，使用截断的响应")
                                     return content
                             
                             return content
                         elif response.status in [503, 504]:
                             error_text = await response.text()
                             status_name = "503 服务不可用" if response.status == 503 else "504 网关超时"
-                            print(f"[环境演化] LLM API调用失败: {status_name} (尝试 {attempt + 1}/{max_retries})")
-                            print(f"[环境演化] 错误详情: {error_text[:200]}")
+                            logger.error(f"[环境演化] LLM API调用失败: {status_name} (尝试 {attempt + 1}/{max_retries})")
+                            logger.debug(f"[环境演化] 错误详情: {error_text[:200]}")
                             
                             if attempt < max_retries - 1:
                                 delay = base_delay * (2 ** attempt)
-                                print(f"[环境演化] 等待 {delay} 秒后重试...")
+                                logger.info(f"[环境演化] 等待 {delay} 秒后重试...")
                                 await asyncio.sleep(delay)
                                 continue
                             else:
-                                print(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
+                                logger.error(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
                                 return None
                         elif response.status == 429:
                             error_text = await response.text()
-                            print(f"[环境演化] LLM API调用失败: 429 请求过于频繁 (尝试 {attempt + 1}/{max_retries})")
-                            print(f"[环境演化] 错误详情: {error_text[:200]}")
+                            logger.error(f"[环境演化] LLM API调用失败: 429 请求过于频繁 (尝试 {attempt + 1}/{max_retries})")
+                            logger.debug(f"[环境演化] 错误详情: {error_text[:200]}")
                             
                             if attempt < max_retries - 1:
                                 delay = base_delay * (3 ** attempt)
-                                print(f"[环境演化] 等待 {delay} 秒后重试...")
+                                logger.info(f"[环境演化] 等待 {delay} 秒后重试...")
                                 await asyncio.sleep(delay)
                                 continue
                             else:
-                                print(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
+                                logger.error(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
                                 return None
                         else:
                             error_text = await response.text()
-                            print(f"[环境演化] LLM API调用失败: HTTP {response.status} (尝试 {attempt + 1}/{max_retries})")
-                            print(f"[环境演化] 错误详情: {error_text[:200]}")
+                            logger.error(f"[环境演化] LLM API调用失败: HTTP {response.status} (尝试 {attempt + 1}/{max_retries})")
+                            logger.debug(f"[环境演化] 错误详情: {error_text[:200]}")
                             
                             if attempt < max_retries - 1 and response.status >= 500:
                                 delay = base_delay * (2 ** attempt)
-                                print(f"[环境演化] 服务器错误，等待 {delay} 秒后重试...")
+                                logger.info(f"[环境演化] 服务器错误，等待 {delay} 秒后重试...")
                                 await asyncio.sleep(delay)
                                 continue
                             else:
                                 return None
             except asyncio.TimeoutError:
-                print(f"[环境演化] LLM API调用超时 (尝试 {attempt + 1}/{max_retries})")
+                logger.error(f"[环境演化] LLM API调用超时 (尝试 {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    print(f"[环境演化] 等待 {delay} 秒后重试...")
+                    logger.info(f"[环境演化] 等待 {delay} 秒后重试...")
                     await asyncio.sleep(delay)
                     continue
                 else:
-                    print(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
+                    logger.error(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
                     return None
             except aiohttp.ClientError as e:
-                print(f"[环境演化] LLM API网络错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+                logger.error(f"[环境演化] LLM API网络错误 (尝试 {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    print(f"[环境演化] 等待 {delay} 秒后重试...")
+                    logger.info(f"[环境演化] 等待 {delay} 秒后重试...")
                     await asyncio.sleep(delay)
                     continue
                 else:
-                    print(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
+                    logger.error(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
                     return None
             except Exception as e:
-                print(f"[环境演化] LLM API调用异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                logger.error(f"[环境演化] LLM API调用异常 (尝试 {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    print(f"[环境演化] 等待 {delay} 秒后重试...")
+                    logger.info(f"[环境演化] 等待 {delay} 秒后重试...")
                     await asyncio.sleep(delay)
                     continue
                 else:
-                    print(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
+                    logger.error(f"[环境演化] 已达到最大重试次数 {max_retries}，放弃重试")
                     return None
         
         return None

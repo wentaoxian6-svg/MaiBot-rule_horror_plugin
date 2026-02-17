@@ -1,6 +1,6 @@
 """多人模式规则矛盾系统
 
-为不同玩家生成“表面一致、细节矛盾”的规则集合，用于多人模式的信息不对称与合作推理。
+为不同玩家生成"表面一致、细节矛盾"的规则集合，用于多人模式的信息不对称与合作推理。
 
 该文件曾被批量替换破坏（引号/全角标点落入语法层等），此处按原意重写并保持对外接口：
 - PlayerRuleset
@@ -11,11 +11,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from collections.abc import Mapping
+from typing import TypeAlias
 
 from ..llm.client import LLMClient, get_default_max_tokens
 
 logger = logging.getLogger(__name__)
+
+# 类型定义
+RuleData: TypeAlias = dict[str, "str | int | bool | None"]
+RulesetData: TypeAlias = dict[str, "str | bool | list | None"]
+ContradictionSummary: TypeAlias = dict[str, dict[str, "bool | str | list[int]"]]
 
 
 @dataclass
@@ -24,7 +30,7 @@ class PlayerRuleset:
 
     player_id: str
     player_name: str
-    rules: list[dict[str, Any]]
+    rules: list[RuleData]
     is_deceptive: bool
     deception_target: str | None = None
 
@@ -37,8 +43,8 @@ class MultiplayerContradictionSystem:
 
     async def generate_contradictory_rules(
         self,
-        base_rules: list[dict[str, Any]],
-        players: dict[str, Any],
+        base_rules: list[RuleData],
+        players: Mapping[str, object],
     ) -> dict[str, PlayerRuleset]:
         """为不同玩家生成矛盾规则集"""
 
@@ -77,7 +83,7 @@ class MultiplayerContradictionSystem:
 
         return result
 
-    def _get_player_name(self, player_obj: Any, default: str) -> str:
+    def _get_player_name(self, player_obj: object, default: str) -> str:
         if player_obj is None:
             return default
         # 兼容：player_obj 可能是 dict 或 Player
@@ -89,7 +95,7 @@ class MultiplayerContradictionSystem:
         self,
         player_id: str,
         player_name: str,
-        base_rules: list[dict[str, Any]],
+        base_rules: list[RuleData],
         target_player_id: str,
     ) -> PlayerRuleset:
         """生成欺骗性规则集"""
@@ -129,7 +135,9 @@ class MultiplayerContradictionSystem:
                 temperature=0.8,
                 max_tokens=get_default_max_tokens(),
             )
-            data = resp.parse_json()
+            data_raw = resp.parse_json()
+            data: RulesetData = data_raw if isinstance(data_raw, dict) else {}
+
             rules = data.get("rules", base_rules)
             if not isinstance(rules, list):
                 rules = base_rules
@@ -152,7 +160,7 @@ class MultiplayerContradictionSystem:
 
     async def generate_role_specific_rules(
         self,
-        base_rules: list[dict[str, Any]],
+        base_rules: list[RuleData],
         player_id: str,
         player_name: str,
         role: str,
@@ -189,7 +197,9 @@ class MultiplayerContradictionSystem:
                 temperature=0.8,
                 max_tokens=get_default_max_tokens(),
             )
-            data = resp.parse_json()
+            data_raw = resp.parse_json()
+            data: RulesetData = data_raw if isinstance(data_raw, dict) else {}
+
             rules = data.get("rules", base_rules)
             if not isinstance(rules, list):
                 rules = base_rules
@@ -213,7 +223,7 @@ class MultiplayerContradictionSystem:
         self,
         player_rulesets: dict[str, PlayerRuleset],
         player_id: str,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RuleData]:
         """获取某个玩家的规则列表"""
 
         ruleset = player_rulesets.get(player_id)
@@ -240,10 +250,10 @@ class MultiplayerContradictionSystem:
 
     def get_contradiction_summary(
         self, player_rulesets: dict[str, PlayerRuleset]
-    ) -> dict[str, Any]:
+    ) -> ContradictionSummary:
         """生成矛盾摘要"""
 
-        summary: dict[str, Any] = {}
+        summary: ContradictionSummary = {}
         for rs in player_rulesets.values():
             summary[rs.player_id] = {
                 "is_deceptive": rs.is_deceptive,
