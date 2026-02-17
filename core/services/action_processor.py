@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -254,8 +255,23 @@ class ActionProcessor:
         if not action.strip():
             return None
 
-        talk_keywords = ["询问", "问", "打听", "请教", "搭话", "对话", "交谈", "叫住", "喊", "招呼"]
-        if not any(k in action for k in talk_keywords):
+        # 注意：不要用单字“问”做简单包含匹配，否则“问题/问号/提问”等名词短语会误触发“搭话”分支，
+        # 进而把“前往/检查/搜索”等真实行动直接短路掉。
+        talk_patterns = [
+            r"询问",
+            r"打听",
+            r"请教",
+            r"搭话",
+            r"对话",
+            r"交谈",
+            r"叫住",
+            r"招呼",
+            # “问”只在其后不是“题”时才按动词对待（避免误匹配“问题”）
+            r"问(?!题)",
+            # “喊”保持兼容（常见：喊住/喊他/喊一声…）
+            r"喊",
+        ]
+        if not any(re.search(p, action) for p in talk_patterns):
             return None
 
         env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
@@ -268,29 +284,49 @@ class ActionProcessor:
         def npc_loc(npc: Mapping[str, JsonValue]) -> str:
             return str(npc.get("current_location") or npc.get("location") or npc.get("home_location") or "")
 
+        # 如果行动里有明显“移动/检查/探索”等强动作意图，默认不要被 NPC 搭话短路
+        # （除非玩家明确点名某个 NPC）
+        non_talk_keywords = [
+            "前往", "去", "到", "进入", "离开", "返回", "回到",
+            "检查", "查看", "调查", "搜索", "探索", "翻找",
+            "打开", "关闭", "使用", "拿起", "放下", "触摸", "推", "拉", "按",
+        ]
+        has_non_talk_intent = any(k in action for k in non_talk_keywords)
+
         # 选择目标NPC：优先匹配名字，其次取同地点的第一个
         target: JsonObject | None = None
+        mentioned_name = False
         for npc in npcs:
             if not isinstance(npc, dict):
                 continue
             name = str(npc.get("name") or "")
             if name and name in action:
                 target = npc
+                mentioned_name = True
                 break
 
         if target is None:
             same_place = [npc for npc in npcs if isinstance(npc, dict) and npc_loc(npc) == player_loc]
             target = same_place[0] if same_place else None
 
+        # 未点名 + 行动包含强动作意图：交给正常行动判定流程处理
+        if has_non_talk_intent and not mentioned_name:
+            return None
+
         if target is None:
             # 玩家在聊天但附近没有任何NPC
             return None
 
         name = str(target.get("name") or session.npc_guidance.get("npc_name") or "NPC")
-        loc = npc_loc(target) or "附近"
+        target_loc = npc_loc(target).strip()
+        loc = target_loc or "未知位置"
+
+        # 位置未知：不允许“隔空对话”，给出符合直觉的反馈
+        if player_loc and not target_loc:
+            return ActionResult(description=f"你压低声音叫了叫{name}，但你看不见他，也无法确定他是否在{player_loc}附近。")
 
         # 不在场：允许玩家“喊人”，但给出符合直觉的反馈
-        if player_loc and npc_loc(target) and npc_loc(target) != player_loc:
+        if player_loc and target_loc and target_loc != player_loc:
             return ActionResult(description=f"你朝{loc}的方向叫了叫{name}，回应只有回声。你此刻在{player_loc}，而他不在这里。")
 
         # 载入/初始化记忆
@@ -1041,7 +1077,8 @@ class ActionProcessor:
         # 从场景结构收集候选区域
         candidates: list[str] = []
         ss = session.scene_structure if isinstance(session.scene_structure, dict) else {}
-        floors = ss.get("floors") if isinstance(ss.get("floors"), list) else []
+        floors_raw = ss.get("floors")
+        floors: list[object] = floors_raw if isinstance(floors_raw, list) else []
         for fl in floors:
             if not isinstance(fl, dict):
                 continue
