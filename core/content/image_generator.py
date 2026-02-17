@@ -812,8 +812,26 @@ class AsyncImageGenerator:
         # 注意：保留 action 参数是为了兼容调用方；行动长图不再复述玩家行动
         _ = action
 
+        def _truncate_text(text: str, max_chars: int) -> str:
+            t = str(text or "")
+            if len(t) <= max_chars:
+                return t
+            # 避免截断在空白上导致末尾很丑
+            t = t[:max_chars].rstrip()
+            return t + "…"
+
         if is_insane_mode:
             char_per_line = 35
+
+        # 限制长度，避免文本过长导致错位/重叠观感变差
+        if scene_description:
+            scene_description = _truncate_text(scene_description, 320 if is_insane_mode else 420)
+        if action_feedback:
+            action_feedback = _truncate_text(action_feedback, 220 if is_insane_mode else 320)
+        if new_location:
+            new_location = _truncate_text(new_location, 60)
+        if random_event:
+            random_event = _truncate_text(random_event, 180)
 
         content_lines: list[str] = []
 
