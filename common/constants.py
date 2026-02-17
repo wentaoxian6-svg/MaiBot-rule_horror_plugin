@@ -20,6 +20,7 @@ class GameCommands(str, Enum):
     RULES = "规则"
     SCENE = "场景"
     ITEMS = "道具"
+    CLUES = "线索"
     HINT = "提示"
     REASON = "推理"
     ACTION = "行动"
