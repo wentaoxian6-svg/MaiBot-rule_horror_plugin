@@ -556,31 +556,46 @@ class RuleHorrorCommand(BaseCommand):
         return "unknown"
 
     def _get_user_info(self) -> tuple[str, str]:
-        """获取用户信息 (user_id, user_name)"""
+        """获取用户信息 (user_id, user_name)。
+
+        兼容说明：
+        - MaiBot 的 `UserInfo` 标准字段是 `user_nickname`（见 typings）。
+        - 部分适配器可能仍提供 `user_name`，这里做兼容回退。
+        """
+        def _pick_name(user_info: object, user_id: str) -> str:
+            nickname = getattr(user_info, 'user_nickname', '')
+            if isinstance(nickname, str) and nickname.strip():
+                return nickname.strip()
+
+            legacy = getattr(user_info, 'user_name', '')
+            if isinstance(legacy, str) and legacy.strip():
+                return legacy.strip()
+
+            return f"玩家{user_id}"
+
         # 首先尝试从 chat_stream 获取
         chat_stream = getattr(self, 'chat_stream', None)
         if chat_stream is None:
             message_obj = getattr(self, 'message', None)
             if message_obj:
                 chat_stream = getattr(message_obj, 'chat_stream', None)
-        
+
         if chat_stream:
             user_info = getattr(chat_stream, 'user_info', None)
             if user_info:
                 user_id = str(getattr(user_info, 'user_id', 'unknown'))
-                user_name = getattr(user_info, 'user_name', f'玩家{user_id}')
-                return user_id, user_name
-        
+                return user_id, _pick_name(user_info, user_id)
+
         # 回退到从 message 获取
         message_obj = getattr(self, 'message', None)
         if message_obj:
             user_info = getattr(message_obj, 'user_info', None)
             if user_info:
                 user_id = str(getattr(user_info, 'user_id', 'unknown'))
-                user_name = getattr(user_info, 'user_name', f'玩家{user_id}')
-                return user_id, user_name
-        
+                return user_id, _pick_name(user_info, user_id)
+
         return "unknown", "未知玩家"
+
 
     async def execute(self) -> tuple[bool, str | None, int]:
         """执行命令"""
@@ -2273,7 +2288,9 @@ NPC入场对话：
             # 记录推理
             player.reasoning_history.append(rest_input)
 
-            await self.send_text(f"**{user_name} 的推理**\n\n{rest_input}\n\n推理已记录。")
+            display_name = player.name or user_name or "玩家"
+            await self.send_text(f"**{display_name} 的推理**\n\n{rest_input}\n\n推理已记录。")
+
             return True, "推理已记录", 2
         finally:
             if state:
@@ -2308,6 +2325,20 @@ NPC入场对话：
                 await self.send_text("你已经死亡，无法行动。")
                 return False, "已死亡", 2
 
+            # 如果当前会话里保存的名字像是 QQ 号/回退名，则用本次消息解析到的昵称刷新（提升观感）
+            try:
+                bad_name = False
+                if not isinstance(player.name, str) or not player.name.strip():
+                    bad_name = True
+                else:
+                    pn = player.name.strip()
+                    if pn == user_id or pn == f"玩家{user_id}" or pn.isdigit():
+                        bad_name = True
+                if bad_name and isinstance(user_name, str) and user_name.strip() and not user_name.strip().isdigit():
+                    player.name = user_name.strip()
+            except Exception:
+                pass
+
             # 处理行动
             result = await self._action_processor.process_action(
                 action=rest_input,
@@ -2321,6 +2352,7 @@ NPC入场对话：
                 "timestamp": datetime.now().isoformat(),
             })
             player.last_action_at = datetime.now()
+
             
             # 更新游戏时间
             env_state = state.session.environment_state if isinstance(getattr(state.session, 'environment_state', None), dict) else {}
@@ -2402,7 +2434,8 @@ NPC入场对话：
             if hasattr(player, 'injury'):
                 injury = player.injury
             if hasattr(player, 'fatigue'):
-                fatigue = player.fatigue
+                fatigue = str(player.fatigue)
+
             if hasattr(player, 'state'):
                 state_desc = player.state
             if hasattr(player, 'emotion'):
@@ -2418,10 +2451,12 @@ NPC入场对话：
             
             # 生成行动结果图片（增强版，支持理智崩坏效果）
             image_generator = AsyncImageGenerator(self._temp_images_dir)
+            display_name = player.name or user_name or "玩家"
             action_image = await image_generator.generate_action_result_image(
-                user_name=user_name,
+                user_name=display_name,
                 action=rest_input,
                 is_dead=(player.status != PlayerStatus.ALIVE),
+
                 scene_description=result.description,
                 action_feedback="",
                 health=player.health,
@@ -2451,17 +2486,22 @@ NPC入场对话：
                     )
                 
                 # 检查是否所有玩家都已死亡
-                all_dead = all(p.status != PlayerStatus.ALIVE for p in session.players.values())
+                all_dead = all(p.status != PlayerStatus.ALIVE for p in state.session.players.values())
+
                 
                 # 单人模式死亡，或多人模式所有玩家死亡：自动结束游戏
                 if len(session.players) == 1 or all_dead:
-                    await self.send_text("正在判定结局...")
+                    if len(session.players) > 1 and all_dead:
+                        await self.send_text("全员已死亡，正在判定【总结局】...")
+                    else:
+                        await self.send_text("正在判定结局...")
                     # 释放状态锁，避免死锁
                     if state:
                         state.release()
                         state = None
                     # 自动触发结局判定
                     return await self._handle_结束(group_id, user_id, user_name, "")
+
             
             # 更新环境演化系统（非阻塞，失败不影响主流程）
             try:
@@ -2512,7 +2552,12 @@ NPC入场对话：
         user_name: str,
         rest_input: str,
     ) -> tuple[bool, str | None, int]:
-        """处理结束游戏命令"""
+        """处理结束游戏命令
+
+        约定：
+        - 单人模式：生成该玩家结局。
+        - 多人模式：任意玩家触发一次即可**结束整局**，只生成一次“总结局 + 真相”。
+        """
         _ = rest_input  # 结束命令不需要额外参数
         state_manager = GameStateManager()
         state = await state_manager.get(group_id)
@@ -2521,61 +2566,141 @@ NPC入场对话：
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
 
+        def _build_aggregate_player(session: GameSession) -> Player:
+            """构造一个用于多人总结局判定的“聚合玩家”。"""
+            players = list(session.players.values())
+            if not players:
+                return Player(player_id="__group__", name="全体玩家")
+
+            alive_any = any(p.status == PlayerStatus.ALIVE for p in players)
+            n = max(1, len(players))
+
+            # 合并行动（按时间排序，保留最近一段）
+            merged_actions: list[JsonObject] = []
+            for p in players:
+                for a in (p.action_history or []):
+                    if isinstance(a, dict):
+                        act = str(a.get("action", "") or "").strip()
+                        if act:
+                            merged_actions.append({
+                                "action": f"{p.name}: {act}",
+                                "timestamp": str(a.get("timestamp", "") or ""),
+                            })
+            merged_actions.sort(key=lambda x: str(x.get("timestamp", "")))
+            merged_actions = merged_actions[-25:]
+
+            # 合并推理（保留最近一段）
+            merged_reasoning: list[str] = []
+            for p in sorted(players, key=lambda x: x.joined_at):
+                for r in (p.reasoning_history or [])[-8:]:
+                    rr = str(r or "").strip()
+                    if rr:
+                        merged_reasoning.append(f"{p.name}: {rr}")
+            merged_reasoning = merged_reasoning[-25:]
+
+            # 线索/物品：EndingJudge 只识别 type=="clue"，这里做一次兼容
+            merged_inventory: list[JsonObject] = []
+            for p in players:
+                for item in (p.inventory or []):
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "") or "").strip()
+                    itype = str(item.get("type", "") or "").strip()
+                    if not name:
+                        continue
+                    if itype in {"clue", "线索", "Clue", "线索物品"}:
+                        merged_inventory.append({"name": name, "type": "clue"})
+
+            agg = Player(player_id="__group__", name="全体玩家")
+            agg.status = PlayerStatus.ALIVE if alive_any else PlayerStatus.DEAD
+            agg.health = int(sum(max(0, int(p.health)) for p in players) / n)
+            agg.sanity = int(sum(max(0, int(p.sanity)) for p in players) / n)
+            agg.fear_level = int(sum(max(0, int(getattr(p, "fear_level", 0))) for p in players) / n)
+            agg.anxiety_level = int(sum(max(0, int(getattr(p, "anxiety_level", 0))) for p in players) / n)
+            agg.stress_level = int(sum(max(0, int(getattr(p, "stress_level", 0))) for p in players) / n)
+            agg.fatigue = int(sum(max(0, int(getattr(p, "fatigue", 0))) for p in players) / n)
+            agg.location = " / ".join(sorted({str(getattr(p, "location", "") or "") for p in players if getattr(p, "location", None)})) or (session.scene_name or "未知")
+            agg.inventory = merged_inventory
+            agg.reasoning_history = merged_reasoning
+            agg.action_history = merged_actions
+            return agg
+
         try:
             session = state.session
-            player = session.players.get(user_id)
-            
-            if not player:
+
+            # 已结束则不再重复生成结局
+            if session.status == GameStatus.ENDED:
+                await self.send_text("游戏已经结束。请使用 `/rg 开始` 开始新游戏。")
+                return False, "已结束", 2
+
+            caller = session.players.get(user_id)
+            if not caller:
                 await self.send_text("你不在游戏中。")
                 return False, "不在游戏中", 2
 
-            # 使用玩家名称个性化消息
-            display_name = player.name or user_name or "玩家"
-            await self.send_text(f"{display_name}，正在判定结局...")
-            
-            # 判定结局
-            ending = await self._ending_judge.judge_ending(
-                session=session,
-                player=player,
-            )
-            
+            is_multi = (session.game_mode == GameModes.MULTI.value and len(session.players) > 1)
+
+            display_name = caller.name or user_name or "玩家"
+            if is_multi:
+                await self.send_text("正在判定【总结局】...")
+                ending = await self._ending_judge.judge_group_ending(session=session)
+            else:
+                await self.send_text(f"{display_name}，正在判定结局...")
+                ending = await self._ending_judge.judge_ending(
+                    session=session,
+                    player=caller,
+                )
+
+
             # 更新会话状态
             session.status = GameStatus.ENDED
             session.ended_at = datetime.now()
-            
+
             # 生成结局图片
-            # - 死亡/失败/强制结束（玩家主动结束且未通关）不展示“解释/推理分析/隐藏真相”
-            forced_end = (player.status == PlayerStatus.ALIVE and not session.has_cleared)
             ending_type = str(getattr(ending, "ending_type", "") or "")
-            # 只有强制结束才隐藏推理分析，但始终显示真相
+
+            # 强制结束（未通关时主动结束）：隐藏推理分析，但始终显示真相
+            forced_end = (not session.has_cleared)
             hide_reasoning = forced_end
-            
             reasoning_analysis = "" if hide_reasoning else str(getattr(ending, "reasoning_analysis", "") or "")
-            # 游戏结束时始终显示真相
+
+            # 多人模式：附加玩家结局概览（不算“逐人结算”，只是总览）
+            if is_multi and not hide_reasoning:
+                parts = ["【玩家结局概览】"]
+                for p in sorted(session.players.values(), key=lambda x: x.joined_at):
+                    st = "存活" if p.status == PlayerStatus.ALIVE else "死亡"
+                    parts.append(f"- {p.name}: {st}（理智{p.sanity}/体力{p.health}）")
+                overview = "\n".join(parts)
+                reasoning_analysis = (reasoning_analysis + "\n\n" + overview).strip() if reasoning_analysis else overview
+
             truth_revealed = True
-            hidden_truth = session.hidden_truth
+            hidden_truth = (f"真相：{session.hidden_truth}" if session.hidden_truth else "真相：未知")
+
+            ending_title = str(getattr(ending, "title", "") or "未知结局")
+            if is_multi:
+                # image_generator 会固定加前缀“结局：”，这里避免再拼一次“结局/冒号”造成重复显示
+                ending_title = f"总结局·{ending_title}"
+
 
             image_generator = AsyncImageGenerator(self._temp_images_dir)
             ending_image = await image_generator.generate_ending_image(
-                ending_title=ending.title,
-                ending_description=ending.description,
+                ending_title=ending_title,
+                ending_description=str(getattr(ending, "description", "") or ""),
                 reasoning_analysis=reasoning_analysis,
                 truth_revealed=truth_revealed,
                 hidden_truth=hidden_truth,
                 ending_type=ending_type,
             )
             await self._send_image_path(ending_image)
-            
-            # 清理状态
+
+            # 清理状态与存档（结束整局）
             await state_manager.remove(group_id)
-            
-            # 删除存档
             save_manager = SaveManager()
             await save_manager.delete(group_id)
-            
+
             logger.info(f"游戏结束: {group_id}, 结局: {ending.ending_type}")
             return True, "游戏已结束", 2
-            
+
         except Exception as e:
             logger.error(f"判定结局失败: {e}", exc_info=True)
             await self.send_text(f"判定结局时出错：{e}")
@@ -2583,6 +2708,7 @@ NPC入场对话：
         finally:
             if state:
                 state.release()
+
 
     async def _handle_帮助(
         self,
@@ -3076,9 +3202,12 @@ NPC入场对话：
         # 清理现有状态
         state_manager = GameStateManager()
         await state_manager.remove(group_id)
-        
-        # 删除现有存档
+
+        # 标记现有存档为结束并清理相关图片
         save_manager = SaveManager()
+        await save_manager.mark_ended_and_cleanup(group_id)
+
+        # 删除现有存档
         await save_manager.delete(group_id)
 
         # 多人模式：强制开始只负责“清档并创建大厅”，避免先生成再加人
