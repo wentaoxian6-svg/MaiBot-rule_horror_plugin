@@ -4,18 +4,18 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
 from ..common.constants import GameCommands
 
-if TYPE_CHECKING:
-    from ..plugin import RuleHorrorCommand
+
 
 
 CommandHandler = Callable[
-    ['RuleHorrorCommand', str, str, str, str],
+    [object, str, str, str, str],
     Awaitable[tuple[bool, str | None, int]]
 ]
+
 
 
 class CommandRouter:
@@ -84,6 +84,7 @@ def create_default_router() -> CommandRouter:
         GameCommands.RULES.value: "_handle_规则",
         GameCommands.SCENE.value: "_handle_场景",
         GameCommands.ITEMS.value: "_handle_道具",
+        GameCommands.CLUES.value: "_handle_线索",
         GameCommands.HINT.value: "_handle_提示",
         GameCommands.REASON.value: "_handle_推理",
         GameCommands.ACTION.value: "_handle_行动",
@@ -92,6 +93,7 @@ def create_default_router() -> CommandRouter:
         GameCommands.HELP.value: "_handle_帮助",
         GameCommands.IDENTITY.value: "_handle_身份",
     }
+
     
     # 注册路由（实际处理器将通过方法名动态获取）
     for command, handler_name in command_map.items():
@@ -125,6 +127,7 @@ def get_handler_method_name(command: str) -> str | None:
         GameCommands.RULES.value: "_handle_规则",
         GameCommands.SCENE.value: "_handle_场景",
         GameCommands.ITEMS.value: "_handle_道具",
+        GameCommands.CLUES.value: "_handle_线索",
         GameCommands.HINT.value: "_handle_提示",
         GameCommands.REASON.value: "_handle_推理",
         GameCommands.ACTION.value: "_handle_行动",
@@ -133,5 +136,6 @@ def get_handler_method_name(command: str) -> str | None:
         GameCommands.HELP.value: "_handle_帮助",
         GameCommands.IDENTITY.value: "_handle_身份",
     }
+
     
     return command_map.get(command)
