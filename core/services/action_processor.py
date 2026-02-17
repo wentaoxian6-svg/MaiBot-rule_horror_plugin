@@ -134,6 +134,26 @@ class ActionProcessor:
         
         # 调用LLM判定行动结果
         result_data = await self._judge_action(action, context)
+        if not isinstance(result_data, dict):
+            result_data = {}
+
+        def _to_int(v: object, default: int = 0) -> int:
+            if isinstance(v, bool):
+                return 1 if v else 0
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
+                return int(v)
+            if isinstance(v, str):
+                try:
+                    return int(float(v.strip()))
+                except Exception:
+                    return default
+            return default
+
+        # 规范化数值字段，避免 LLM 返回字符串导致状态不更新
+        result_data["sanity_change"] = _to_int(result_data.get("sanity_change", 0), 0)
+        result_data["health_change"] = _to_int(result_data.get("health_change", 0), 0)
 
         
         # 检查是否发现关键物品
@@ -172,10 +192,19 @@ class ActionProcessor:
                     "is_key_item": False,
                 })
         
-        # 提取新位置（如果LLM返回了位置变化）
+        # 提取/推断新位置（优先使用 LLM 返回；否则根据行动文本与场景结构做启发式推断）
         new_location = result_data.get("new_location")
+        inferred_location: str | None = None
+
         if new_location and isinstance(new_location, str) and new_location.strip():
-            player.location = new_location.strip()
+            inferred_location = new_location.strip()
+        else:
+            inferred_location = self._infer_new_location(action, session)
+            if inferred_location:
+                result_data["new_location"] = inferred_location
+
+        if inferred_location:
+            player.location = inferred_location
             logger.info(f"玩家 {player.name} 移动到新位置: {player.location}")
         
         # 创建行动结果
@@ -855,6 +884,7 @@ class ActionProcessor:
     "description": "行动后的场景描述（1-2段，200-300字；融合位置/视觉/听觉/嗅觉/触觉等感官细节与氛围；不要使用章节标题或分类标记；不要复述或改写玩家行动句子，直接描述行动发生后的结果）",
     "sanity_change": -5,
     "health_change": 0,
+    "new_location": "行动后位置（如果行动导致移动/进入/离开某区域；没有变化则留空或不返回）",
 
     "discovered_clues": ["发现的线索"],
     "found_items": ["发现的物品列表（如果有）"],
@@ -949,8 +979,24 @@ class ActionProcessor:
 
     def _apply_changes(self, player: Player, result: ActionResult, action: str = "") -> None:
         """应用状态变化"""
-        player.sanity = max(0, min(100, player.sanity + result.sanity_change))
-        player.health = max(0, min(100, player.health + result.health_change))
+        player.sanity = max(0, min(100, player.sanity + int(result.sanity_change)))
+        player.health = max(0, min(100, player.health + int(result.health_change)))
+
+        # 体力（health）基础消耗：让“行动=消耗体力”稳定生效，不完全依赖 LLM 输出
+        # - 休息类行动不扣
+        # - 逃跑/奔跑/攀爬/战斗等额外消耗
+        if action and not self._is_rest_action(action) and player.health > 0:
+            cost = 1
+            a = action.lower()
+            if any(k in a for k in ["跑", "冲", "逃", "追", "狂奔", "冲刺"]):
+                cost += 2
+            if any(k in a for k in ["爬", "攀爬", "跳", "翻墙", "游泳"]):
+                cost += 2
+            if any(k in a for k in ["战斗", "攻击", "搏斗", "打斗", "挥拳", "砍", "刺", "射击"]):
+                cost += 1
+            if any(k in a for k in ["搬", "抬", "扛", "推", "拉"]):
+                cost += 1
+            player.health = max(0, player.health - cost)
         
         # 更新疲劳值：每次行动固定+1，根据行动类型额外增加
         fatigue_increase = self._calculate_fatigue_increase(action)
@@ -977,6 +1023,58 @@ class ActionProcessor:
             from ..game.models import PlayerStatus
             player.status = PlayerStatus.DEAD
     
+    def _infer_new_location(self, action: str, session: GameSession) -> str | None:
+        """从行动文本里启发式推断新位置。
+
+        目标：
+        - LLM 未返回 `new_location` 时也能“实时更新位置”。
+        - 优先匹配场景结构里已存在的区域名称，避免凭空造地点。
+        """
+        a = str(action or "").strip()
+        if not a:
+            return None
+
+        move_keywords = ["去", "到", "前往", "进入", "走向", "走到", "来到", "返回", "回到", "离开"]
+        if not any(k in a for k in move_keywords):
+            return None
+
+        # 从场景结构收集候选区域
+        candidates: list[str] = []
+        ss = session.scene_structure if isinstance(session.scene_structure, dict) else {}
+        floors = ss.get("floors") if isinstance(ss.get("floors"), list) else []
+        for fl in floors:
+            if not isinstance(fl, dict):
+                continue
+            for key in ("areas", "rooms"):
+                arr = fl.get(key)
+                if isinstance(arr, list):
+                    for x in arr:
+                        if isinstance(x, str) and x.strip():
+                            candidates.append(x.strip())
+
+        sp = ss.get("special_areas")
+        if isinstance(sp, list):
+            for x in sp:
+                if isinstance(x, str) and x.strip():
+                    candidates.append(x.strip())
+
+        # 去重并按长度降序（优先长匹配）
+        uniq = sorted({c for c in candidates if c}, key=len, reverse=True)
+
+        # 1) 直接包含匹配
+        for c in uniq:
+            if c in a:
+                return c
+
+        # 2) 常见位置兜底（仅当场景结构缺失时启用）
+        if not uniq:
+            fallback = ["大厅", "大堂", "走廊", "门口", "入口", "前台", "楼梯", "电梯", "房间", "厕所", "卫生间"]
+            for c in fallback:
+                if c in a:
+                    return c
+
+        return None
+
     def _calculate_fatigue_increase(self, action: str) -> int:
         """根据行动类型计算疲劳增加值
         
