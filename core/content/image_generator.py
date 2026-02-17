@@ -1295,12 +1295,17 @@ class AsyncImageGenerator:
         special_text = f"特殊区域：{', '.join(special_areas)}"
         special_lines = self._wrap_text_by_width(special_text, font_normal, line_length)
 
-        # 计算总高度：按“实际绘制时的 y 递增逻辑”推导，避免漏算段落间距导致贴底
+        # 计算建筑类型需要的行数（修复：添加换行处理）
+        building_type_text = f"建筑类型：{building_type}"
+        building_type_lines = self._wrap_text_by_width(building_type_text, font_subtitle, line_length)
+
+        # 计算总高度：按"实际绘制时的 y 递增逻辑"推导，避免漏算段落间距导致贴底
         bottom_padding = 60
         y = margin + 100  # 与绘制一致：分隔线之后开始
 
-        # 建筑类型（绘制后向下推进一个 section_height）
+        # 建筑类型（根据实际行数计算高度）
         y += section_height
+        y += (len(building_type_lines) - 1) * line_height
 
         # 总体布局：标题一行 + 标题后间距（合计一个 section_height 推进到内容起始）
         y += section_height
@@ -1338,10 +1343,12 @@ class AsyncImageGenerator:
         # 绘制分隔线
         draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#000000', width=2)
         
-        # 绘制建筑类型
+        # 绘制建筑类型（修复：支持多行显示）
         current_y = margin + 100
-        draw.text((margin, current_y), f"建筑类型：{building_type}", fill='#000000', font=font_subtitle)
-        
+        for i, line in enumerate(building_type_lines):
+            draw.text((margin, current_y), line, fill='#000000', font=font_subtitle)
+            current_y += line_height if i < len(building_type_lines) - 1 else 0
+
         # 绘制总体布局
         current_y += section_height
         draw.text((margin, current_y), "总体布局", fill='#000000', font=font_subtitle)
