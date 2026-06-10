@@ -46,7 +46,7 @@
 - 如果系统字体位置比较特殊，建议显式配置 `RULE_HORROR_FONT` 或 `plugin.font_path`
 - 如果插件目录是只读挂载，插件会优先回退到 `XDG_DATA_HOME`、`~/.local/share/maibot/rule_horror/`，再不行会回退到系统临时目录
 
-！！！一键包用户使用控制台"交互式安装pip模块"安装依赖！！！
+！！！一键包用户不要手动安装依赖！！！
 
 ## 配置说明
 
