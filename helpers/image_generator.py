@@ -5,6 +5,7 @@
 
 from datetime import datetime
 import os
+from pathlib import Path
 from typing import ClassVar, TypeAlias
 
 from PIL import Image, ImageDraw, ImageFont
@@ -69,13 +70,27 @@ class ImageGenerator:
     
     def _load_font(self, size: int) -> Font:
         """加载单个字体"""
-        try:
-            return ImageFont.truetype("msyh.ttc", size)
-        except Exception:
+        candidates = [
+            os.getenv("RULE_HORROR_FONT", "").strip(),
+            str(Path(self.temp_images_dir).resolve().parents[1] / "data" / "fonts" / "NotoSansCJK-Regular.ttc"),
+            str(Path(self.temp_images_dir).resolve().parents[1] / "data" / "fonts" / "NotoSansCJKsc-Regular.otf"),
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "NotoSansCJK-Regular.ttc",
+            "wqy-microhei.ttc",
+            "msyh.ttc",
+            "simhei.ttf",
+        ]
+        for candidate in candidates:
+            candidate = (candidate or "").strip()
+            if not candidate:
+                continue
             try:
-                return ImageFont.truetype("simhei.ttf", size)
+                return ImageFont.truetype(candidate, size)
             except Exception:
-                return ImageFont.load_default()
+                continue
+        return ImageFont.load_default()
     
     def get_font(self, font_name: str) -> Font:
         """获取字体"""

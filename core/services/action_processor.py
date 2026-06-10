@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from ...common.models import JsonObject, JsonValue
 from ...systems.npc_system import NPCMemory, NPCAttitude
+from ...systems.room_topology import build_room_graph, can_hear_between_rooms, get_audible_npcs, get_visible_npcs
+from ..config import get_config
 from ..llm.client import LLMClient, get_default_max_tokens
 
-from ..game.models import Player, GameSession
+from ..game.models import GameSession, GameStatus, Player, PlayerStatus
 from .item_manager import ItemManager
 
 logger = logging.getLogger(__name__)
@@ -45,15 +48,104 @@ class ActionResult:
 class ActionProcessor:
     """行动处理器 - 处理玩家行动"""
 
-    def __init__(self, llm_client: LLMClient | None = None):
+    def __init__(
+        self,
+        llm_client: LLMClient | None = None,
+        message_sender: Callable[[str], Awaitable[bool]] | None = None,
+        session_saver: Callable[[str, GameSession], Awaitable[None]] | None = None,
+    ):
         self.llm_client: LLMClient = llm_client or LLMClient()
         self.item_manager: ItemManager = ItemManager()
+        self._message_sender = message_sender
+        self._session_saver = session_saver
+
+    @staticmethod
+    def _normalize_rule_text_for_dedup(text: str) -> str:
+        return re.sub(r"\s+", "", str(text or "").strip()).lower()
+
+    def _record_rule_texts(self, player: Player, rule_texts: list[str]) -> int:
+        merged_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
+        seen = {self._normalize_rule_text_for_dedup(text) for text in merged_rules if text}
+        added_count = 0
+
+        for raw_text in rule_texts:
+            text = str(raw_text or "").strip()
+            key = self._normalize_rule_text_for_dedup(text)
+            if not text or not key or key in seen:
+                continue
+            merged_rules.append(text)
+            seen.add(key)
+            added_count += 1
+
+        player.recorded_rules = merged_rules
+        return added_count
+
+    def _apply_feedback_state_updates(self, player: Player, updates: Mapping[str, Any]) -> None:
+        """应用沉浸式反馈带来的额外状态变化。"""
+        sanity_delta = updates.get("sanity")
+        if isinstance(sanity_delta, int):
+            player.sanity = max(0, min(100, player.sanity + sanity_delta))
+
+        health_delta = updates.get("health")
+        if isinstance(health_delta, int):
+            player.health = max(0, min(100, player.health + health_delta))
+
+        fear_delta = updates.get("fear_level")
+        if isinstance(fear_delta, int):
+            player.fear_level = max(0, min(100, player.fear_level + fear_delta))
+
+        anxiety_delta = updates.get("anxiety_level")
+        if isinstance(anxiety_delta, int):
+            player.anxiety_level = max(0, min(100, player.anxiety_level + anxiety_delta))
+
+        stress_delta = updates.get("stress_level")
+        if isinstance(stress_delta, int):
+            player.stress_level = max(0, min(100, player.stress_level + stress_delta))
+
+        location = updates.get("location")
+        if isinstance(location, str) and location.strip():
+            player.location = location.strip()
+
+        if player.health <= 0:
+            player.status = PlayerStatus.DEAD
+
+    @staticmethod
+    def _iter_runtime_npcs(session: GameSession) -> list[JsonObject]:
+        env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
+        npcs = env_state.get("npcs", [])
+        return [npc for npc in npcs if isinstance(npc, dict)] if isinstance(npcs, list) else []
+
+    def _find_runtime_npc(self, session: GameSession, npc_name: str) -> JsonObject | None:
+        target_name = str(npc_name or "").strip()
+        if not target_name:
+            return None
+
+        lowered_target = target_name.lower()
+        partial_match: JsonObject | None = None
+        for npc in self._iter_runtime_npcs(session):
+            name = str(npc.get("name", "") or "").strip()
+            npc_id = str(npc.get("npc_id", "") or "").strip()
+            lowered_name = name.lower()
+            if name == target_name or npc_id == target_name:
+                return npc
+            if lowered_target in lowered_name or lowered_name in lowered_target:
+                partial_match = npc
+        return partial_match
+
+    def _get_runtime_npc_memory(self, session: GameSession, npc_name: str) -> tuple[JsonObject | None, NPCMemory | None]:
+        npc = self._find_runtime_npc(session, npc_name)
+        if npc is None:
+            return None, None
+        raw_memory = npc.get("memory", {})
+        memory_data = raw_memory if isinstance(raw_memory, dict) else {}
+        return npc, NPCMemory.from_dict(memory_data)
 
     async def process_action(
         self,
         action: str,
         player: Player,
         session: GameSession,
+        group_id: str = "",
     ) -> ActionResult:
         """
         处理玩家行动
@@ -200,7 +292,7 @@ class ActionProcessor:
         if new_location and isinstance(new_location, str) and new_location.strip():
             inferred_location = new_location.strip()
         else:
-            inferred_location = self._infer_new_location(action, session)
+            inferred_location = self._infer_new_location(action, session, player.location)
             if inferred_location:
                 result_data["new_location"] = inferred_location
 
@@ -232,7 +324,8 @@ class ActionProcessor:
                 player=player,
                 session=session,
                 violated_rule=result.violated_rule,
-                action=action
+                    action=action,
+                    group_id=group_id,
             )
         
         # 更新环境记忆
@@ -250,7 +343,7 @@ class ActionProcessor:
         目标：
         - 不再“硬编码 NPC 永远回答/永远知道一切”。
         - NPC 是否回应、回应多少、是否回避，取决于：在场性 + 态度/记忆 + 玩家语气。
-        - 行为结果会推进 `environment_state.known_rule_indices`，形成可追踪的客观变化。
+        - 玩家通过互动获得的信息会写入 `player.recorded_rules`，不再依赖旧的全局已知规则索引。
         """
         if not action.strip():
             return None
@@ -405,13 +498,15 @@ class ActionProcessor:
                     text = f"你试着向{loc}的{name}搭话。他压低嗓音：『别大声。这里不喜欢热闹。』"
             return ActionResult(description=text)
 
-        # 询问规则：根据态度决定是否补充“新的已知规则”
-        known: list[int] = []
-        if isinstance(env_state.get("known_rule_indices"), list):
-            known = [int(x) for x in env_state.get("known_rule_indices", []) if isinstance(x, int)]
-
+        # 询问规则：根据态度决定是否补充新的玩家规则笔记
+        recorded_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
+        recorded_rule_keys = {self._normalize_rule_text_for_dedup(rule) for rule in recorded_rules if rule}
         all_rules: list[str] = [r.get("text", str(r)) for r in (session.rules or [])]
-        unknown = [i for i in range(len(all_rules)) if i not in set(known)]
+        unknown = [
+            i
+            for i, rule_text in enumerate(all_rules)
+            if self._normalize_rule_text_for_dedup(rule_text) not in recorded_rule_keys
+        ]
 
         if help_level == 0 or not unknown:
             if attitude == NPCAttitude.HOSTILE:
@@ -424,16 +519,15 @@ class ActionProcessor:
 
         reveal_count = min(help_level, len(unknown))
         newly = unknown[:reveal_count]
-        known2 = sorted(set(known + newly))
-        env_state["known_rule_indices"] = known2
+        new_rule_texts = [all_rules[idx].strip() for idx in newly if all_rules[idx].strip()]
+        self._record_rule_texts(player, new_rule_texts)
 
         def cn_num(n: int) -> str:
             table = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
             return table[n - 1] if 1 <= n <= len(table) else str(n)
 
         parts: list[str] = []
-        for j, idx in enumerate(newly, 1):
-            rule_text = all_rules[idx].strip()
+        for j, rule_text in enumerate(new_rule_texts, 1):
             if rule_text:
                 parts.append(f"第{cn_num(j)}，{rule_text}")
 
@@ -733,44 +827,126 @@ class ActionProcessor:
 
         env_state = session.environment_state or {}
 
-        # 优先基于结构化的 env_state['npcs'] 推断“当前在场NPC”，避免出现叙事割裂
+        room_graph = env_state.get("room_graph", {})
+        if not isinstance(room_graph, dict) or not room_graph:
+            room_graph = build_room_graph(session.scene_structure or {})
+
+        npcs = env_state.get("npcs", [])
+        npcs_list = [npc for npc in npcs if isinstance(npc, dict)] if isinstance(npcs, list) else []
+        try:
+            hearing_radius = int(getattr(get_config().npc_sim, "room_hearing_radius", 1) or 1)
+        except Exception:
+            hearing_radius = 1
+
         npcs_present: list[JsonObject] = []
-        if isinstance(env_state, dict):
-            npcs = env_state.get("npcs", [])
-            if isinstance(npcs, list):
-                for npc in npcs:
-                    if not isinstance(npc, dict):
+        for npc in get_visible_npcs(npcs_list, player.location):
+            npcs_present.append(
+                {
+                    "name": npc.get("name", ""),
+                    "role": npc.get("role", ""),
+                    "attitude": npc.get("attitude", ""),
+                    "location": npc.get("current_location", npc.get("location", "")),
+                    "danger_level": npc.get("danger_level", ""),
+                    "last_action": npc.get("last_action", ""),
+                }
+            )
+
+        audible_npcs: list[JsonObject] = []
+        for npc in get_audible_npcs(room_graph, npcs_list, player.location, hearing_radius=hearing_radius):
+            audible_npcs.append(
+                {
+                    "name": npc.get("name", ""),
+                    "location": npc.get("current_location", npc.get("location", "")),
+                    "audible_signature": npc.get("audible_signature", ""),
+                }
+            )
+
+        room_events = env_state.get("npc_runtime", {}).get("room_events", []) if isinstance(env_state.get("npc_runtime"), dict) else []
+        audible_events: list[str] = []
+        if isinstance(room_events, list):
+            for item in room_events:
+                if not isinstance(item, dict):
+                    continue
+                room_name = str(item.get("room", "") or "").strip()
+                event_text = str(item.get("event", "") or "").strip()
+                if room_name and event_text and can_hear_between_rooms(room_graph, player.location, room_name, hearing_radius=hearing_radius):
+                    audible_events.append(event_text)
+
+        rule_carriers = env_state.get("rule_carriers", [])
+        visible_rule_carriers: list[JsonObject] = []
+        groups: dict[str, set[str]] = {}
+        rule_network = session.rule_network if isinstance(getattr(session, "rule_network", None), dict) else {}
+        multi_identity = rule_network.get("multi_identity", {})
+        if isinstance(multi_identity, dict):
+            for key in ("identity_groups", "shared_visibility_groups"):
+                raw_groups = multi_identity.get(key, [])
+                if not isinstance(raw_groups, list):
+                    continue
+                for item in raw_groups:
+                    if not isinstance(item, dict):
                         continue
-                    npc_location = str(npc.get("current_location") or npc.get("location") or "")
-                    if npc_location and npc_location == str(player.location or ""):
-                        npcs_present.append(
-                            {
-                                "name": npc.get("name", ""),
-                                "role": npc.get("role", ""),
-                                "attitude": npc.get("attitude", ""),
-                                "location": npc_location,
-                                "danger_level": npc.get("danger_level", ""),
-                            }
-                        )
+                    group_name = str(item.get("group_name", "") or "").strip()
+                    if not group_name:
+                        continue
+                    members = {
+                        str(member).strip()
+                        for member in item.get("members", [])
+                        if str(member).strip()
+                    } if isinstance(item.get("members", []), list) else set()
+                    if members:
+                        groups[group_name] = members
 
-            # 兼容旧字段：如果没有结构化NPC，就回退到 npcs_present
-            if not npcs_present and isinstance(env_state.get("npcs_present"), list):
-                npcs_present = env_state.get("npcs_present", [])
+        def _carrier_visible_to_player(carrier: Mapping[str, JsonValue]) -> bool:
+            visible_to = carrier.get("visible_to", {})
+            if not isinstance(visible_to, dict):
+                return True
+            if bool(visible_to.get("all_players", False)):
+                return True
 
-        # 多人模式身份信息（用于让 LLM 依据身份差异生成更合理的反馈）
-        unique_rules: list[str] = []
-        ur = getattr(player, "unique_rules", None)
-        if isinstance(ur, list):
-            for r in ur:
-                if isinstance(r, dict):
-                    t = str(r.get("text", r.get("content", "")) or "").strip()
-                else:
-                    t = str(r or "").strip()
-                if t:
-                    unique_rules.append(t)
+            checks: list[bool] = []
+            player_ids = visible_to.get("player_ids", [])
+            if isinstance(player_ids, list):
+                checks.append(player.player_id in {str(item).strip() for item in player_ids})
+
+            identity_names = visible_to.get("identity_names", [])
+            if isinstance(identity_names, list):
+                checks.append(bool(player.identity) and player.identity in {str(item).strip() for item in identity_names})
+
+            duty_areas = visible_to.get("duty_areas", [])
+            if isinstance(duty_areas, list):
+                checks.append(bool(player.duty_area) and player.duty_area in {str(item).strip() for item in duty_areas})
+
+            group_names = visible_to.get("group_names", [])
+            if isinstance(group_names, list):
+                checks.append(any(player.player_id in groups.get(str(name).strip(), set()) for name in group_names))
+
+            if not checks:
+                return True
+            return any(checks)
+
+        if isinstance(rule_carriers, list):
+            for carrier in rule_carriers:
+                if not isinstance(carrier, dict):
+                    continue
+                if str(carrier.get("location", "") or "").strip() != str(player.location or "").strip():
+                    continue
+                if not _carrier_visible_to_player(carrier):
+                    continue
+                visible_rule_carriers.append(
+                    {
+                        "carrier_id": carrier.get("carrier_id", ""),
+                        "title": carrier.get("title", ""),
+                        "description": carrier.get("description", ""),
+                        "carrier_type": carrier.get("carrier_type", ""),
+                        "requires_action": carrier.get("requires_action", True),
+                    }
+                )
 
         identity_name = str(getattr(player, "identity", "") or "").strip()
         identity_desc = str(getattr(player, "identity_description", "") or "").strip()
+        task_brief = str(getattr(player, "task_brief", "") or "").strip()
+        duty_area = str(getattr(player, "duty_area", "") or "").strip()
+        recorded_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
         exclusive_info = str(getattr(player, "exclusive_info", "") or "").strip()
 
         return {
@@ -778,7 +954,9 @@ class ActionProcessor:
             "player_name": player.name,
             "player_identity": identity_name or session.player_identity,
             "player_identity_description": identity_desc,
-            "player_unique_rules": unique_rules,
+            "player_task_brief": task_brief,
+            "player_duty_area": duty_area,
+            "player_recorded_rules": recorded_rules,
             "player_exclusive_info": exclusive_info,
             "scene_name": session.scene_name,
             "background": session.background,
@@ -789,8 +967,12 @@ class ActionProcessor:
             "player_location": player.location,
             "time": session.time_manager or {},
             "scene_structure": scene_structure_summary,
+            "room_graph": room_graph,
             "npc_guidance": npc_guidance_summary,
             "npcs_present": npcs_present,
+            "audible_npcs": audible_npcs,
+            "audible_events": audible_events,
+            "visible_rule_carriers": visible_rule_carriers,
             "recent_actions": [a.get("action", "") for a in player.action_history[-3:]],
         }
 
@@ -871,6 +1053,7 @@ class ActionProcessor:
 4. 使用感官描述而非状态描述（不要说"你感到恐惧"，而是描述让人恐惧的场景）
 5. 营造恐怖和不安的氛围
 6. **根据玩家当前理智值（{sanity}/100）调整描述风格**
+7. 不要把后台完整规则当成玩家已经知道的事实；玩家视角只能基于其当前可感知信息、任务、独有信息和规则笔记
 
 **行动余波要求（非常重要）**：
 在场景描述后，必须包含以下余波效果：
@@ -951,8 +1134,10 @@ class ActionProcessor:
 玩家：{context.get('player_name', '')}
 身份：{context.get('player_identity', '')}
 身份描述：{context.get('player_identity_description', '')}
-身份独有规则：
-{chr(10).join(f"- {r}" for r in (context.get('player_unique_rules') or [])) if context.get('player_unique_rules') else "（无）"}
+当前任务：{context.get('player_task_brief', '')}
+责任区域：{context.get('player_duty_area', '')}
+玩家规则笔记：
+{chr(10).join(f"- {r}" for r in (context.get('player_recorded_rules') or [])) if context.get('player_recorded_rules') else "（暂无）"}
 身份独有信息：{context.get('player_exclusive_info', '')}
 
 场景：{context['scene_name']}
@@ -967,6 +1152,18 @@ class ActionProcessor:
 - 理智：{context['player_sanity']}/100
 - 体力：{context['player_health']}/100
 - 位置：{context['player_location']}
+
+同房间 NPC：
+{json.dumps(context.get('npcs_present', []), ensure_ascii=False)}
+
+可听范围内的 NPC：
+{json.dumps(context.get('audible_npcs', []), ensure_ascii=False)}
+
+可听见的 NPC 动静：
+{json.dumps(context.get('audible_events', []), ensure_ascii=False)}
+
+当前房间可见载体：
+{json.dumps(context.get('visible_rule_carriers', []), ensure_ascii=False)}
 
 最近行动：
 {chr(10).join(f"- {a}" for a in context['recent_actions']) if context['recent_actions'] else "无"}
@@ -1059,12 +1256,18 @@ class ActionProcessor:
             from ..game.models import PlayerStatus
             player.status = PlayerStatus.DEAD
     
-    def _infer_new_location(self, action: str, session: GameSession) -> str | None:
+    def _infer_new_location(
+        self,
+        action: str,
+        session: GameSession,
+        current_location: str | None = None,
+    ) -> str | None:
         """从行动文本里启发式推断新位置。
 
         目标：
         - LLM 未返回 `new_location` 时也能“实时更新位置”。
         - 优先匹配场景结构里已存在的区域名称，避免凭空造地点。
+        - 避免把“离开某地”误写成“仍然在某地”这类明显错误。
         """
         a = str(action or "").strip()
         if not a:
@@ -1088,20 +1291,56 @@ class ActionProcessor:
                     for x in arr:
                         if isinstance(x, str) and x.strip():
                             candidates.append(x.strip())
+                        elif isinstance(x, dict):
+                            for name_key in ("name", "title", "location"):
+                                raw_name = x.get(name_key)
+                                if isinstance(raw_name, str) and raw_name.strip():
+                                    candidates.append(raw_name.strip())
+                                    break
 
         sp = ss.get("special_areas")
         if isinstance(sp, list):
             for x in sp:
                 if isinstance(x, str) and x.strip():
                     candidates.append(x.strip())
+                elif isinstance(x, dict):
+                    for name_key in ("name", "title", "location"):
+                        raw_name = x.get(name_key)
+                        if isinstance(raw_name, str) and raw_name.strip():
+                            candidates.append(raw_name.strip())
+                            break
 
         # 去重并按长度降序（优先长匹配）
         uniq = sorted({c for c in candidates if c}, key=len, reverse=True)
 
-        # 1) 直接包含匹配
-        for c in uniq:
-            if c in a:
-                return c
+        def _find_in_text(text: str) -> str | None:
+            for candidate in uniq:
+                if candidate in text:
+                    return candidate
+            return None
+
+        current_location = str(current_location or "").strip()
+
+        # 1) 优先识别明确的目的地表达，避免把“离开 X”误识别为“到达 X”
+        destination_verbs = ["前往", "进入", "走向", "走到", "来到", "返回", "回到", "去", "到"]
+        for verb in destination_verbs:
+            idx = a.find(verb)
+            if idx < 0:
+                continue
+            destination = _find_in_text(a[idx + len(verb):])
+            if destination:
+                return destination
+
+        # 2) 单独出现“离开”通常只能确定离开了旧地点，不能可靠推出新地点
+        if "离开" in a:
+            return None
+
+        # 3) 再做整体包含匹配；若只匹配到当前位置，则不强行写回
+        direct_match = _find_in_text(a)
+        if direct_match:
+            if current_location and direct_match == current_location:
+                return None
+            return direct_match
 
         # 2) 常见位置兜底（仅当场景结构缺失时启用）
         if not uniq:
@@ -1276,7 +1515,8 @@ class ActionProcessor:
         player: Player,
         session: GameSession,
         violated_rule: str,
-        action: str
+        action: str,
+        group_id: str = "",
     ) -> None:
         """统一处理违规后果
 
@@ -1299,10 +1539,10 @@ class ActionProcessor:
             # 3. 根据类型调用不同处理
             if is_area_violation:
                 # 区域违规 - 使用 environment_evolution.py
-                await self._handle_area_violation(session, player, violation_context)
+                await self._handle_area_violation(session, player, violation_context, group_id)
             else:
                 # 一般违规 - 使用 immersive_feedback.py
-                await self._handle_general_violation(player, session, violation_context)
+                await self._handle_general_violation(player, session, violation_context, group_id)
 
             # 4. 更新NPC态度
             await self._update_npc_attitudes(player, session, violation_context)
@@ -1395,13 +1635,14 @@ class ActionProcessor:
         self,
         session: GameSession,
         player: Player,
-        violation_context: dict[str, Any]
+        violation_context: dict[str, Any],
+        group_id: str = "",
     ) -> None:
         """处理区域违规 - 调用 EnvironmentEvolutionSystem"""
         env_system = getattr(session, '_environment_system', None)
         if not env_system:
             logger.debug("环境系统未初始化，回退到一般违规处理")
-            await self._handle_general_violation(player, session, violation_context)
+            await self._handle_general_violation(player, session, violation_context, group_id)
             return
 
         try:
@@ -1434,7 +1675,8 @@ class ActionProcessor:
         self,
         player: Player,
         session: GameSession,
-        violation_context: dict[str, Any]
+        violation_context: dict[str, Any],
+        group_id: str = "",
     ) -> None:
         """处理一般违规 - 调用 ImmersiveFeedback"""
         try:
@@ -1470,19 +1712,13 @@ class ActionProcessor:
                 import asyncio
                 asyncio.create_task(
                     self._schedule_delayed_feedback(
-                        player, session, action, game_state, response.delay_seconds
+                        player, session, action, game_state, response.delay_seconds, group_id
                     )
                 )
 
             # 应用状态更新
             if response.should_update_state and response.state_updates:
-                updates = response.state_updates
-                sanity_delta = updates.get("sanity")
-                if sanity_delta is not None and isinstance(sanity_delta, int):
-                    player.sanity = max(0, min(100, player.sanity + sanity_delta))
-                health_delta = updates.get("health")
-                if health_delta is not None and isinstance(health_delta, int):
-                    player.health = max(0, min(100, player.health + health_delta))
+                self._apply_feedback_state_updates(player, response.state_updates)
 
             logger.info(f"一般违规反馈生成成功: {player.name}, 类型={response.feedback_type.value}")
 
@@ -1495,13 +1731,18 @@ class ActionProcessor:
         session: GameSession,
         action: dict[str, Any],
         game_state: dict[str, Any],
-        delay_seconds: int
+        delay_seconds: int,
+        group_id: str,
     ) -> None:
         """安排延迟反馈"""
         try:
             from ..services.immersive_feedback import ImmersiveFeedback
 
             await asyncio.sleep(delay_seconds)
+            if session.status != GameStatus.ACTIVE:
+                return
+            if player.player_id not in session.players:
+                return
 
             # 重新获取玩家当前状态
             current_state = {
@@ -1518,6 +1759,15 @@ class ActionProcessor:
             delayed_response = await feedback_system.generate_delayed_feedback(
                 action, current_state
             )
+
+            if delayed_response.should_update_state and delayed_response.state_updates:
+                self._apply_feedback_state_updates(player, delayed_response.state_updates)
+
+            if self._message_sender and delayed_response.content.strip():
+                await self._message_sender(f"**异样回响**\n\n{delayed_response.content.strip()}")
+
+            if self._session_saver and group_id:
+                await self._session_saver(group_id, session)
 
             logger.info(f"延迟反馈已生成: {player.name}")
 
@@ -1542,36 +1792,27 @@ class ActionProcessor:
             return
 
         try:
-            from ...systems.npc_system import NPCMemory
-
-            # 获取或创建NPC记忆存储（使用动态属性）
-            npc_memories: dict[str, Any] = getattr(session, '_npc_memories', {})
-            if not npc_memories:
-                npc_memories = {}
-                setattr(session, '_npc_memories', npc_memories)
-
-            # 更新相关NPC态度（恶化）
-            if related_npc_name not in npc_memories:
-                npc_memories[related_npc_name] = NPCMemory()
-
-            memory = npc_memories[related_npc_name]
+            npc_entry, memory = self._get_runtime_npc_memory(session, related_npc_name)
+            if npc_entry is None or memory is None:
+                return
             memory.update_attitude_vector(
                 player.player_id,
                 hostility_delta=20,
                 trust_delta=-15
             )
+            npc_entry["memory"] = memory.to_dict()
             logger.debug(f"NPC {related_npc_name} 对玩家 {player.name} 态度恶化")
 
             # 更新对抗NPC态度（变好）
-            if opposing_npc_name and opposing_npc_name not in npc_memories:
-                npc_memories[opposing_npc_name] = NPCMemory()
-
             if opposing_npc_name:
-                opp_memory = npc_memories[opposing_npc_name]
+                opp_entry, opp_memory = self._get_runtime_npc_memory(session, opposing_npc_name)
+                if opp_entry is None or opp_memory is None:
+                    return
                 opp_memory.update_attitude_vector(
                     player.player_id,
                     affection_delta=10
                 )
+                opp_entry["memory"] = opp_memory.to_dict()
                 logger.debug(f"NPC {opposing_npc_name} 对玩家 {player.name} 态度改善")
 
         except Exception as e:
@@ -1593,9 +1834,8 @@ class ActionProcessor:
             return
 
         # 检查NPC敌意度
-        npc_memories: dict[str, Any] = getattr(session, '_npc_memories', {})
-        memory = npc_memories.get(related_npc)
-        if not memory:
+        _npc_entry, memory = self._get_runtime_npc_memory(session, related_npc)
+        if memory is None:
             return
 
         attitude_vector = memory.get_attitude_vector(player.player_id)

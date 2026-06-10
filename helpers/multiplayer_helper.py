@@ -7,7 +7,7 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from ..common import JsonObject
+from ..common.models import JsonObject
 from ..common.constants import GameModes
 from ..common.utils import safe_get_dict_value
 
@@ -141,12 +141,27 @@ def assign_identity_to_player(
     player.identity_description = safe_get_dict_value(
         identity_info, "identity_description", None, str
     )
+    player.task_brief = safe_get_dict_value(identity_info, "task_brief", None, str)
+    player.duty_area = safe_get_dict_value(identity_info, "duty_area", None, str)
+
+    raw_observations = identity_info.get("initial_observations")
+    if isinstance(raw_observations, list):
+        player.initial_observations = [str(item).strip() for item in raw_observations if str(item).strip()]
+    else:
+        player.initial_observations = []
 
     unique_rules_raw = identity_info.get("unique_rules")
     player.unique_rules = unique_rules_raw if isinstance(unique_rules_raw, list) else []
 
     # 日志记录，便于调试
-    logger.debug(f"分配身份给玩家 {player.name}: identity={player.identity}, unique_rules_count={len(player.unique_rules)}")
+    logger.debug(
+        "分配身份给玩家 %s: identity=%s, task=%s, duty_area=%s, unique_rules_count=%s",
+        player.name,
+        player.identity,
+        player.task_brief,
+        player.duty_area,
+        len(player.unique_rules),
+    )
 
     player.exclusive_info = safe_get_dict_value(
         identity_info, "exclusive_info", None, str

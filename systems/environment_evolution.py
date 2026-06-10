@@ -9,7 +9,8 @@ from datetime import datetime
 from typing import TypeAlias
 
 from ..prompts.shared_prompts import RULE_DESIGN_PRINCIPLES
-from ..core.llm.client import LLMClient, get_default_max_tokens
+from ..core.llm.client import LLMClient
+from ..common.models import JsonObject
 
 logger = logging.getLogger(__name__)
 
@@ -1833,4 +1834,3 @@ NPC信息：
                     return None
         
         return None
-

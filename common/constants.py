@@ -23,6 +23,7 @@ class GameCommands(str, Enum):
     CLUES = "线索"
     HINT = "提示"
     REASON = "推理"
+    RECORD_RULE = "记录规则"
     ACTION = "行动"
     CONTINUE = "继续"
     END = "结束"

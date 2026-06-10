@@ -10,6 +10,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -72,8 +73,25 @@ class AsyncImageGenerator:
     def _save_cache_index(self) -> None:
         """保存缓存索引"""
         try:
-            with open(self.cache_index_file, 'w', encoding='utf-8') as f:
-                json.dump(self._cache_index, f, ensure_ascii=False, indent=2)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=".cache_index_",
+                suffix=".tmp",
+                dir=str(self.cache_dir),
+            )
+            temp_path = Path(temp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self._cache_index, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                temp_path.replace(self.cache_index_file)
+            except Exception:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
         except Exception as e:
             logger.error(f"保存缓存索引失败: {e}")
 
@@ -126,15 +144,23 @@ class AsyncImageGenerator:
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
             "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
             "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
             "/usr/share/fonts/truetype/arphic/ukai.ttc",
             "/usr/share/fonts/truetype/arphic/uming.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         ])
 
         # 6) 兜底：相对文件名（Windows 上通常可用；Linux 可能不可用但尝试无害）
         candidates.extend([
+            "NotoSansCJK-Regular.ttc",
+            "NotoSansCJKsc-Regular.otf",
+            "wqy-microhei.ttc",
+            "wqy-zenhei.ttc",
             "msyh.ttc",
             "simhei.ttf",
             "simsun.ttc",
@@ -204,7 +230,15 @@ class AsyncImageGenerator:
                 self._font_cache[key] = ImageFont.truetype(font_name, size)
             except Exception:
                 # 尝试备用字体
-                for fallback in ["simhei.ttf", "simsun.ttc", "arial.ttf"]:
+                for fallback in [
+                    "NotoSansCJK-Regular.ttc",
+                    "NotoSansCJKsc-Regular.otf",
+                    "wqy-microhei.ttc",
+                    "wqy-zenhei.ttc",
+                    "simhei.ttf",
+                    "simsun.ttc",
+                    "arial.ttf",
+                ]:
                     try:
                         self._font_cache[key] = ImageFont.truetype(fallback, size)
                         break
@@ -645,20 +679,26 @@ class AsyncImageGenerator:
             rule_lines.extend(wrapped_lines)
 
         # 计算通关条件需要的行数（使用动态宽度换行）
-        goal_prefix = "你的目标是：" if game_mode == "单人" else "你们的目标是："
-        # 将前缀和内容分开处理
-        goal_lines: list[str] = [goal_prefix]
-        # 对win_condition单独进行换行，与分割线等长
-        condition_lines = self._wrap_text_by_width(win_condition, font_subtitle, line_available_width)
-        goal_lines.extend(condition_lines)
+        show_goal = bool(str(win_condition or "").strip())
+        goal_lines: list[str] = []
+        if show_goal:
+            goal_prefix = "你的目标是：" if game_mode == "单人" else "你们的目标是："
+            goal_lines = [goal_prefix]
+            condition_lines = self._wrap_text_by_width(win_condition, font_subtitle, line_available_width)
+            goal_lines.extend(condition_lines)
         
         # 计算总高度
         if is_insane_mode:
-            total_height = margin * 2 + len(rule_lines) * (line_height + 5) + 50
+            visible_lines = rule_lines or goal_lines
+            total_height = margin * 2 + len(visible_lines) * (line_height + 5) + 50
         else:
-            total_height = (margin * 2 + title_height + section_height +
-                           len(rule_lines) * line_height + section_height +
-                           len(goal_lines) * line_height + 50)
+            total_height = margin * 2 + title_height + section_height + 50
+            if rule_lines:
+                total_height += len(rule_lines) * line_height
+            if show_goal:
+                if rule_lines:
+                    total_height += section_height
+                total_height += len(goal_lines) * line_height
         
         # 创建图片（纯黑背景）
         width = 900
@@ -668,8 +708,9 @@ class AsyncImageGenerator:
         current_y = margin
         
         if is_insane_mode:
-            # 理智崩坏模式：只显示规则内容
-            for line in rule_lines:
+            # 理智崩坏模式：优先显示规则；无规则时显示目标文本
+            visible_lines = rule_lines or goal_lines
+            for line in visible_lines:
                 # 移除序号前缀
                 display_line = line
                 for num in range(1, 11):
@@ -712,20 +753,22 @@ class AsyncImageGenerator:
                 current_y += line_height
             
             # 绘制通关条件
-            current_y += 30
-            draw.line([(margin, current_y), (width - margin, current_y)], fill='#8B0000', width=2)
-            current_y += section_height
-            
-            for line in goal_lines:
-                distorted_line = self._distort_text(line, sanity)
-                
-                if sanity < 30 and random.random() < 0.3:
-                    offset_x = random.randint(-3, 3)
-                    offset_y = random.randint(-2, 2)
-                    draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#DC143C', font=font_subtitle)
-                else:
-                    draw.text((margin, current_y), distorted_line, fill='#DC143C', font=font_subtitle)
-                current_y += line_height
+            if show_goal:
+                if rule_lines:
+                    current_y += 30
+                    draw.line([(margin, current_y), (width - margin, current_y)], fill='#8B0000', width=2)
+                    current_y += section_height
+
+                for line in goal_lines:
+                    distorted_line = self._distort_text(line, sanity)
+                    
+                    if sanity < 30 and random.random() < 0.3:
+                        offset_x = random.randint(-3, 3)
+                        offset_y = random.randint(-2, 2)
+                        draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#DC143C', font=font_subtitle)
+                    else:
+                        draw.text((margin, current_y), distorted_line, fill='#DC143C', font=font_subtitle)
+                    current_y += line_height
         
         # 应用理智崩坏的视觉扭曲效果
         if not is_insane_mode:
@@ -1468,32 +1511,22 @@ class AsyncImageGenerator:
         # 获取NPC引导信息
         guidance_method = str(npc_guidance.get("guidance_method", "natural_language") or "natural_language")
         npc_name = str(npc_guidance.get("npc_name", "NPC") or "NPC")
-        npc_attitude = str(npc_guidance.get("npc_attitude", "引导") or "引导")
+        npc_role = str(npc_guidance.get("npc_role", "") or "")
+        npc_attitude = str(npc_guidance.get("npc_attitude", "") or "")
         npc_behavior = str(npc_guidance.get("npc_behavior", "") or "")
         npc_dialogue = str(npc_guidance.get("npc_dialogue", "") or "")
+        rule_carrier_title = str(npc_guidance.get("rule_carrier_title", "") or "")
         rule_carrier_description = str(npc_guidance.get("rule_carrier_description", "") or "")
 
         # 根据guidance_method决定标题和内容
-        def _sanitize_attitude(att: str) -> str:
-            att = str(att or "").strip()
-            for sep in ["且", "并", "但是", "而且", "同时", "，", ",", "。", "；", ";", "、", "/"]:
-                if sep in att:
-                    att = att.split(sep, 1)[0].strip()
-            allow = {"警告", "提醒", "告诫", "忠告", "提示", "指示", "劝告", "引导"}
-            if att in allow:
-                return "提醒" if att == "引导" else att
-            if not att or len(att) > 6:
-                return "提醒"
-            # 像“疲惫/慌张/迟疑”这类更像状态描述的词，不适合作标题
-            bad = {"疲惫", "慌张", "迟疑", "冷漠", "沉默", "紧张"}
-            return "提醒" if att in bad else att
-
         if guidance_method == "natural_language":
-            # 标题：NPC的对话或行为（如："护士长的警告"）
-            title = f"{npc_name}的{_sanitize_attitude(npc_attitude)}"
+            # 避免“某某的警告/指示”这类系统感过强的标题，优先显示人物本身
+            title = npc_name or "来者"
+            if npc_role and npc_role not in title:
+                title = f"{title} · {npc_role}"
         else:
-            # rule_carrier方式
-            title = f"{npc_name}的指示"
+            # 规则载体方式优先使用载体本身名称，而不是“某某的指示”
+            title = rule_carrier_title or (f"{npc_name}留下的东西" if npc_name else "留下的东西")
 
         # 创建图片（纯黑背景）
         width = 900
@@ -1520,8 +1553,8 @@ class AsyncImageGenerator:
         
         # 第三部分：NPC对话或规则载体描述
         if guidance_method == "natural_language":
-            # NPC对话：不再按 200 字强行截断（避免出现“说有6条但图里只显示3条”的割裂感）
-            # 但仍做一个上限保护，防止极端情况下长到不可读
+            # 自然语言引导允许展示 NPC 原话，但这些内容只是剧情信息，
+            # 不应被系统自动视为“已确认规则”。
             if npc_dialogue:
                 max_dialogue_chars = 800
                 dialogue_text = str(npc_dialogue)
@@ -1533,6 +1566,9 @@ class AsyncImageGenerator:
         else:
             # 规则载体描述：同样避免过短截断导致信息缺失
             if rule_carrier_description:
+                if rule_carrier_title:
+                    content_lines.extend(self._wrap_text_by_width(rule_carrier_title, font_normal, line_available_width))
+                    content_lines.append("")
                 max_carrier_chars = 600
                 carrier_text = str(rule_carrier_description)
                 if len(carrier_text) > max_carrier_chars:

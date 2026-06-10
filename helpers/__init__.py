@@ -1,5 +1,5 @@
 """
-辅助模块 - 多人模式辅助和图片生成
+辅助模块 - 多人模式辅助
 """
 from .multiplayer_helper import (
     should_assign_identities,

@@ -15,6 +15,7 @@ from .horror_atmosphere import (
 )
 from .action_processor import ActionProcessor, ActionResult
 from .game_generator import GameGenerator
+from .npc_simulator import NPCSimulator
 from .ending_judge import EndingJudge, EndingResult, EndingType
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "ActionProcessor",
     "ActionResult",
     "GameGenerator",
+    "NPCSimulator",
     "EndingJudge",
     "EndingResult",
     "EndingType",

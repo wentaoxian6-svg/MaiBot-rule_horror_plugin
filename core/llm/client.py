@@ -4,17 +4,17 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from ...common.models import JsonObject
 
 import aiohttp
 import logging
 
-from ..config import get_config, load_config_from_file
-from pathlib import Path
+from ..config import get_config
 
 logger = logging.getLogger(__name__)
+_warned_missing_api_key: bool = False
 
 
 def _extract_message_content(message: object) -> str:
@@ -171,41 +171,47 @@ class LLMResponse:
         
         def fix_json_quotes(json_str: str) -> str:
             """修复JSON字符串值中的未转义引号
-            
+
             LLM有时会在JSON字符串值中包含未转义的双引号，这会导致解析失败。
             此函数尝试修复这类问题（仅处理字符串内部的引号）。
             """
             result = []
             in_string = False
             escape_next = False
-            
+
             for i, char in enumerate(json_str):
                 if escape_next:
                     result.append(char)
                     escape_next = False
                     continue
-                
+
                 if char == '\\':
                     result.append(char)
                     escape_next = True
                     continue
-                
+
                 if char == '"' and not escape_next:
                     # 检查这是否是JSON结构中的引号（键或值的开头/结尾）
-                    # 简单启发式：如果前面是 [, {, :, ,, 或空格，可能是结构引号
                     prev_char = json_str[i-1] if i > 0 else ''
                     next_char = json_str[i+1] if i < len(json_str) - 1 else ''
-                    
-                    # 如果是字符串内部的引号（前面不是结构字符），转义它
-                    if in_string and prev_char not in '[{:, \n\r\t':
-                        result.append('\\"')
+
+                    # 如果在字符串内部，这个引号需要转义
+                    if in_string:
+                        # 检查后面是否跟着结构字符（表示这是字符串结尾）
+                        if next_char in '},:]\n\r\t ':
+                            in_string = False
+                            result.append(char)
+                        else:
+                            # 字符串内部的引号，需要转义
+                            result.append('\\"')
                     else:
-                        in_string = not in_string
+                        # 字符串开始
+                        in_string = True
                         result.append(char)
                     continue
-                
+
                 result.append(char)
-            
+
             return ''.join(result)
         
         def try_parse_json(json_str: str) -> JsonObject | None:
@@ -331,10 +337,13 @@ class LLMResponse:
 
 
 
-def get_default_max_tokens() -> int:
-    """获取默认的 max_tokens 值（从配置中读取）"""
+def get_default_max_tokens(config_section: str = "llm") -> int:
+    """获取默认的 max_tokens 值（从配置中读取）。"""
     try:
         config = get_config()
+        section = getattr(config, config_section, None)
+        if section is not None:
+            return int(getattr(section, "max_tokens", 8000) or 8000)
         return getattr(config.llm, 'max_tokens', 8000)
     except Exception:
         return 8000
@@ -346,53 +355,111 @@ class LLMClient:
     def __init__(self):
         pass
 
-    def _ensure_config_loaded(self):
-        """确保配置已加载"""
-        config_obj = get_config()
-        if not config_obj.llm.api_key:
-            try:
-                base_dir = Path(__file__).parent.parent.parent
-                config_path = base_dir / "config.toml"
-                if config_path.exists():
-                    logger.info(f"[调试] 尝试从 {config_path} 加载配置")
-                    load_config_from_file(str(config_path))
-                else:
-                    logger.warning(f"[调试] 配置文件不存在: {config_path}")
-            except Exception as e:
-                logger.error(f"[调试] 加载配置失败: {e}")
+    @staticmethod
+    def _get_section_config(config_obj: Any, config_section: str) -> Any:
+        section = getattr(config_obj, config_section, None)
+        if section is not None:
+            return section
+        return getattr(config_obj, "llm")
 
-    async def call(
+    def _ensure_config_loaded(self, config_section: str = "llm"):
+        """确保配置已加载。"""
+        global _warned_missing_api_key
+        config_obj = get_config()
+        section = self._get_section_config(config_obj, config_section)
+        fallback_section = getattr(config_obj, "llm")
+        has_model_api_key = any(str(model.api_key or "").strip() for model in getattr(section, "models", []))
+        has_fallback_model_api_key = any(
+            str(model.api_key or "").strip() for model in getattr(fallback_section, "models", [])
+        )
+        has_api_key = str(getattr(section, "api_key", "") or "").strip()
+        fallback_api_key = str(getattr(fallback_section, "api_key", "") or "").strip()
+        if (not has_api_key) and (not has_model_api_key) and (not fallback_api_key) and (not has_fallback_model_api_key) and (not _warned_missing_api_key):
+            _warned_missing_api_key = True
+            logger.warning("[规则怪谈] %s API Key 未配置", config_section)
+
+    @staticmethod
+    def _merge_dict(base: JsonObject, override: JsonObject) -> JsonObject:
+        merged = dict(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = LLMClient._merge_dict(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _normalize_enabled_models(config: Any) -> list[JsonObject]:
+        models: list[JsonObject] = []
+
+        for item in getattr(config, "models", []) or []:
+            if hasattr(item, "model_dump"):
+                data = item.model_dump()
+            elif isinstance(item, dict):
+                data = dict(item)
+            else:
+                continue
+
+            if not bool(data.get("enabled", True)):
+                continue
+            name = str(data.get("name", "") or "").strip()
+            if not name:
+                continue
+            models.append(data)
+
+        if models:
+            return models
+
+        for name in list(getattr(config, "model_list", []) or []):
+            normalized_name = str(name or "").strip()
+            if not normalized_name:
+                continue
+            models.append(
+                {
+                    "name": normalized_name,
+                    "enabled": True,
+                    "api_url": str(getattr(config, "api_url", "") or ""),
+                    "api_key": str(getattr(config, "api_key", "") or ""),
+                    "temperature": getattr(config, "temperature", None),
+                    "max_tokens": getattr(config, "max_tokens", None),
+                    "timeout": getattr(config, "timeout", None),
+                    "headers": {},
+                    "extra_body": {},
+                }
+            )
+        return models
+
+    @staticmethod
+    def _resolve_runtime_config(config_obj: Any, config_section: str) -> tuple[Any, str]:
+        section = LLMClient._get_section_config(config_obj, config_section)
+        if config_section != "llm":
+            section_enabled = bool(getattr(section, "enabled", True))
+            section_has_models = bool(getattr(section, "models", []) or getattr(section, "model_list", []))
+            if (not section_enabled) or (not section_has_models):
+                return getattr(config_obj, "llm"), "llm"
+        return section, config_section
+
+    async def _call_internal(
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        config_section: str = "llm",
     ) -> LLMResponse:
-        """
-        调用 LLM API
-        """
-        # 确保配置已加载
-        self._ensure_config_loaded()
-        
-        config = get_config().llm
-        
-        api_url = config.api_url
-        api_key = config.api_key
-        model_list = config.model_list
-        current_model_index = config.current_model_index
+        """调用指定配置段对应的 LLM。"""
+        self._ensure_config_loaded(config_section)
+
+        config_obj = get_config()
+        config, resolved_section = self._resolve_runtime_config(config_obj, config_section)
         temp = temperature if temperature is not None else config.temperature
-        tokens = max_tokens if max_tokens is not None else get_default_max_tokens()
-        
-        if not model_list:
-            logger.error("[规则怪谈] 模型列表为空")
+        tokens = max_tokens if max_tokens is not None else get_default_max_tokens(resolved_section)
+
+        model_candidates = self._normalize_enabled_models(config)
+        if not model_candidates:
+            logger.error("[规则怪谈] %s 模型列表为空", resolved_section)
             raise LLMError("模型列表为空")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-        
-        # 默认 system prompt
+
         default_system_prompt = """你是一位精通规则怪谈创作的游戏设计师和叙事专家。你的任务是：
 1. 生成令人毛骨悚然、逻辑严密的规则怪谈场景
 2. 创造具有欺骗性和层次感的规则系统
@@ -411,97 +478,154 @@ class LLMClient:
 - 描述要具体、生动，避免笼统
 - 保持中文表达的自然流畅
 - 严禁使用emoji表情符号"""
-        
+
         final_system_prompt = system_prompt if system_prompt else default_system_prompt
-        
         last_error = None
-        
-        for i in range(len(model_list)):
-            model_index = (current_model_index + i) % len(model_list)
-            model = model_list[model_index]
-            
-            logger.info(f"[规则怪谈] 尝试使用模型 {model} (索引: {model_index})")
-            
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": final_system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": temp,
-                "max_tokens": tokens,
-                "stream": False
+
+        for model_config in model_candidates:
+            model = str(model_config.get("name", "") or "").strip()
+            api_url = str(model_config.get("api_url") or config.api_url or config_obj.llm.api_url or "").strip()
+            api_key = str(model_config.get("api_key") or config.api_key or config_obj.llm.api_key or "").strip()
+            headers = {
+                "Content-Type": "application/json",
+                **(config.default_headers if isinstance(config.default_headers, dict) else {}),
+                **(model_config.get("headers", {}) if isinstance(model_config.get("headers"), dict) else {}),
             }
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            payload = self._merge_dict(
+                config.default_body if isinstance(config.default_body, dict) else {},
+                model_config.get("extra_body", {}) if isinstance(model_config.get("extra_body"), dict) else {},
+            )
+            payload.update(
+                {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": final_system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": model_config.get("temperature", temp) if model_config.get("temperature") is not None else temp,
+                    "max_tokens": (
+                        model_config.get("max_tokens", tokens) if model_config.get("max_tokens") is not None else tokens
+                    ),
+                    "stream": False,
+                }
+            )
+
+            timeout_seconds = int(model_config.get("timeout") or config.timeout or 180)
+            logger.info("[规则怪谈] 尝试使用 %s 配置段模型 %s", resolved_section, model)
 
             try:
-                # 超时设置 180 秒
-                timeout = aiohttp.ClientTimeout(total=180)
+                timeout = aiohttp.ClientTimeout(total=timeout_seconds)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    logger.info(f"[规则怪谈] 调用 LLM API: {api_url}")
+                    logger.info("[规则怪谈] 调用 LLM API: %s", api_url)
                     async with session.post(api_url, headers=headers, json=payload) as response:
-                        logger.info(f"[规则怪谈] API 响应状态: {response.status}")
-                        
+                        logger.info("[规则怪谈] API 响应状态: %s", response.status)
+
                         if response.status == 200:
                             data = await response.json()
-                            
+
                             if isinstance(data, list):
-                                logger.warning(f"[规则怪谈] 模型 {model} API返回列表格式: {data}")
-                                last_error = f"API返回列表格式"
+                                logger.warning("[规则怪谈] 模型 %s API返回列表格式: %s", model, data)
+                                last_error = "API返回列表格式"
                                 continue
-                            
+
                             if not isinstance(data, dict):
-                                logger.warning(f"[规则怪谈] 模型 {model} API返回非字典格式: {type(data)}")
+                                logger.warning("[规则怪谈] 模型 %s API返回非字典格式: %s", model, type(data))
                                 last_error = f"API返回非字典格式: {type(data)}"
                                 continue
-                            
+
                             choices = data.get("choices", [])
                             if not choices or not isinstance(choices, list):
-                                logger.warning(f"[规则怪谈] 模型 {model} choices字段格式错误: {choices}")
-                                last_error = f"choices字段格式错误"
+                                logger.warning("[规则怪谈] 模型 %s choices字段格式错误: %s", model, choices)
+                                last_error = "choices字段格式错误"
                                 continue
-                            
+
                             first_choice = choices[0]
                             if not isinstance(first_choice, dict):
-                                logger.warning(f"[规则怪谈] 模型 {model} choices[0]格式错误: {first_choice}")
-                                last_error = f"choices[0]格式错误"
+                                logger.warning("[规则怪谈] 模型 %s choices[0]格式错误: %s", model, first_choice)
+                                last_error = "choices[0]格式错误"
                                 continue
-                            
+
                             message = first_choice.get("message", {})
                             if not isinstance(message, dict):
-                                logger.warning(f"[规则怪谈] 模型 {model} message字段格式错误: {message}")
-                                last_error = f"message字段格式错误"
+                                logger.warning("[规则怪谈] 模型 %s message字段格式错误: %s", model, message)
+                                last_error = "message字段格式错误"
                                 continue
-                            
+
                             content = _extract_message_content(message).strip()
                             if not content:
                                 raw_content = message.get("content") if isinstance(message, dict) else None
                                 logger.warning(
-                                    f"[规则怪谈] 模型 {model} content为空/不可用: type={type(raw_content)}, value={raw_content!r}"
+                                    "[规则怪谈] 模型 %s content为空/不可用: type=%s, value=%r",
+                                    model,
+                                    type(raw_content),
+                                    raw_content,
                                 )
                                 last_error = "content为空"
                                 continue
 
-                            
-                            logger.info(f"[规则怪谈] 模型 {model} 调用成功，生成 {len(content)} 字符")
-                            
+                            logger.info("[规则怪谈] 模型 %s 调用成功，生成 %s 字符", model, len(content))
                             usage = data.get("usage", {})
-                            
                             return LLMResponse(
                                 content=content,
                                 model=model,
-                                usage=usage,
+                                usage=usage if isinstance(usage, dict) else {},
                                 raw_response=data,
                             )
-                        else:
-                            error_text = await response.text()
-                            logger.error(f"[规则怪谈] 模型 {model} API请求失败: Status {response.status}, Body: {error_text}")
-                            last_error = f"Status {response.status}: {error_text}"
+
+                        error_text = await response.text()
+                        logger.error(
+                            "[规则怪谈] 模型 %s API请求失败: Status %s, Body: %s",
+                            model,
+                            response.status,
+                            error_text,
+                        )
+                        last_error = f"Status {response.status}: {error_text}"
             except Exception as e:
-                logger.error(f"[规则怪谈] 模型 {model} 调用时发生异常: {e}")
+                logger.error("[规则怪谈] 模型 %s 调用时发生异常: %s", model, e)
                 last_error = str(e)
-        
+
         logger.error(f"[规则怪谈] 所有模型都调用失败，最后错误: {last_error}")
         raise LLMError(f"所有模型都调用失败: {last_error}")
+
+    async def call(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        config_section: str = "llm",
+    ) -> LLMResponse:
+        """调用指定配置段的 LLM。"""
+        return await self._call_internal(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            config_section=config_section,
+        )
+
+    async def call_main(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        """使用主流程 llm 配置调用模型。"""
+        return await self.call(prompt, system_prompt, temperature, max_tokens, config_section="llm")
+
+    async def call_npc_sim(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        """使用 npc_sim 配置调用模型。"""
+        return await self.call(prompt, system_prompt, temperature, max_tokens, config_section="npc_sim")
 
     async def call_with_fallback(
         self,
@@ -509,9 +633,10 @@ class LLMClient:
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        config_section: str = "llm",
     ) -> LLMResponse:
         """调用 LLM，支持模型故障转移"""
-        return await self.call(prompt, system_prompt, temperature, max_tokens)
+        return await self.call(prompt, system_prompt, temperature, max_tokens, config_section=config_section)
 
     async def close(self) -> None:
         """关闭客户端（兼容性方法）"""

@@ -35,9 +35,11 @@ class Player:
     stress_level: int = 0
     anxiety_level: int = 0
     fear_level: int = 0
+    hint_count: int = 3
     location: str = "起始位置"
     inventory: list[JsonObject] = field(default_factory=list)
     reasoning_history: list[str] = field(default_factory=list)
+    recorded_rules: list[str] = field(default_factory=list)
     action_history: list[JsonObject] = field(default_factory=list)
     joined_at: datetime = field(default_factory=datetime.now)
     last_action_at: datetime | None = None
@@ -48,6 +50,9 @@ class Player:
     # 多人模式身份字段
     identity: str | None = None  # 玩家身份（多人模式）
     identity_description: str | None = None  # 身份描述
+    task_brief: str | None = None  # 当前任务摘要
+    duty_area: str | None = None  # 责任区域
+    initial_observations: list[str] = field(default_factory=list)  # 初始观察信息
     unique_rules: list[JsonObject] = field(default_factory=list)  # 该身份特有的规则
     exclusive_info: str | None = None  # 该身份独有的信息
 
@@ -63,9 +68,11 @@ class Player:
             "stress_level": self.stress_level,
             "anxiety_level": self.anxiety_level,
             "fear_level": self.fear_level,
+            "hint_count": self.hint_count,
             "location": self.location,
             "inventory": self.inventory,
             "reasoning_history": self.reasoning_history,
+            "recorded_rules": self.recorded_rules,
             "action_history": self.action_history,
             "joined_at": self.joined_at.isoformat(),
             "last_action_at": self.last_action_at.isoformat() if self.last_action_at else None,
@@ -74,6 +81,9 @@ class Player:
             "emotion": self.emotion,
             "identity": self.identity,
             "identity_description": self.identity_description,
+            "task_brief": self.task_brief,
+            "duty_area": self.duty_area,
+            "initial_observations": self.initial_observations,
             "unique_rules": self.unique_rules,
             "exclusive_info": self.exclusive_info,
         }
@@ -112,6 +122,7 @@ class Player:
         player.stress_level = _to_int(data.get("stress_level", 0), 0)
         player.anxiety_level = _to_int(data.get("anxiety_level", 0), 0)
         player.fear_level = _to_int(data.get("fear_level", 0), 0)
+        player.hint_count = _to_int(data.get("hint_count", 3), 3)
 
         loc = data.get("location", "起始位置")
         player.location = str(loc) if isinstance(loc, (str, int, float, bool)) else "起始位置"
@@ -121,6 +132,9 @@ class Player:
 
         rh = data.get("reasoning_history", [])
         player.reasoning_history = [str(x) for x in rh] if isinstance(rh, list) else []
+
+        rr = data.get("recorded_rules", [])
+        player.recorded_rules = [str(x).strip() for x in rr if str(x).strip()] if isinstance(rr, list) else []
 
         ah = data.get("action_history", [])
         player.action_history = [x for x in ah if isinstance(x, dict)] if isinstance(ah, list) else []
@@ -153,6 +167,15 @@ class Player:
 
         ident_desc = data.get("identity_description")
         player.identity_description = str(ident_desc) if isinstance(ident_desc, str) and ident_desc else None
+
+        task_brief = data.get("task_brief")
+        player.task_brief = str(task_brief) if isinstance(task_brief, str) and task_brief else None
+
+        duty_area = data.get("duty_area")
+        player.duty_area = str(duty_area) if isinstance(duty_area, str) and duty_area else None
+
+        observations = data.get("initial_observations", [])
+        player.initial_observations = [str(x).strip() for x in observations if str(x).strip()] if isinstance(observations, list) else []
 
         ur = data.get("unique_rules", [])
         player.unique_rules = [x for x in ur if isinstance(x, dict)] if isinstance(ur, list) else []
@@ -282,6 +305,9 @@ class GameSession:
 
     def to_dict(self) -> JsonObject:
         """转换为字典"""
+        session_hint_count = self.hint_count
+        if self.players:
+            session_hint_count = min(player.hint_count for player in self.players.values())
         return {
             "group_id": self.group_id,
             "scene_name": self.scene_name,
@@ -297,7 +323,7 @@ class GameSession:
             "core_symbols": self.core_symbols,
             "environment_state": self.environment_state,
             "time_manager": self.time_manager,
-            "hint_count": self.hint_count,
+            "hint_count": session_hint_count,
             "has_cleared": self.has_cleared,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -367,6 +393,10 @@ class GameSession:
                 for pid, p in players_raw.items()
                 if isinstance(p, dict)
             }
+            for pid, player in session.players.items():
+                player_data = players_raw.get(pid, {})
+                if isinstance(player_data, dict) and "hint_count" not in player_data:
+                    player.hint_count = session.hint_count
         else:
             session.players = {}
 
@@ -429,5 +459,39 @@ class GameSession:
         # 加载全局世界状态
         wf = data.get("world_flags", {})
         session.world_flags = wf if isinstance(wf, dict) else {}
+
+        # 兼容旧版全局已知规则字段：迁移到玩家个人规则笔记后清理旧键。
+        if session.players and isinstance(session.environment_state, dict):
+            known_indices = session.environment_state.get("known_rule_indices", [])
+            known_extra = session.environment_state.get("known_rule_texts_extra", [])
+            legacy_rules: list[str] = []
+
+            if isinstance(known_indices, list):
+                for idx in sorted({int(x) for x in known_indices if isinstance(x, int)}):
+                    if 0 <= idx < len(session.rules):
+                        text = str(session.rules[idx].get("text", "")).strip()
+                        if text:
+                            legacy_rules.append(text)
+
+            if isinstance(known_extra, list):
+                for raw_text in known_extra:
+                    text = str(raw_text).strip()
+                    if text:
+                        legacy_rules.append(text)
+
+            if legacy_rules:
+                for player in session.players.values():
+                    existing_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
+                    seen = {"".join(text.split()).lower() for text in existing_rules if text}
+                    for text in legacy_rules:
+                        key = "".join(text.split()).lower()
+                        if not key or key in seen:
+                            continue
+                        existing_rules.append(text)
+                        seen.add(key)
+                    player.recorded_rules = existing_rules
+
+            session.environment_state.pop("known_rule_indices", None)
+            session.environment_state.pop("known_rule_texts_extra", None)
 
         return session

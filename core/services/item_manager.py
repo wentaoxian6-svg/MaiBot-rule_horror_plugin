@@ -282,8 +282,9 @@ class ItemManager:
                 time_cost = 120
                 custom_time = True
         
-        # 获取当前疲劳等级
-        current_fatigue = self._get_fatigue_level(player.health)
+        # 获取当前疲劳值与疲劳等级
+        current_fatigue_value = max(0, min(100, int(getattr(player, "fatigue", 0))))
+        current_fatigue = self._get_fatigue_level(current_fatigue_value)
 
         # 根据休息时间计算体力恢复量
         # 基础恢复：10-20点（15分钟）
@@ -306,8 +307,14 @@ class ItemManager:
         player.anxiety_level = max(0, player.anxiety_level - mental_recovery)
         player.stress_level = max(0, player.stress_level - mental_recovery)
 
+        # 休息会直接降低疲劳值；恢复时长越久，恢复越明显
+        base_fatigue_recovery = random.randint(8, 12)
+        extra_fatigue_recovery = (time_cost // 15 - 1) * random.randint(5, 8) if time_cost > 15 else 0
+        fatigue_recovery = base_fatigue_recovery + extra_fatigue_recovery
+        player.fatigue = max(0, current_fatigue_value - fatigue_recovery)
+
         # 降低疲劳等级
-        new_fatigue = self._get_fatigue_level(player.health)
+        new_fatigue = self._get_fatigue_level(player.fatigue)
         fatigue_reduced = (current_fatigue != new_fatigue)
 
         # 构建效果文本
@@ -319,20 +326,22 @@ class ItemManager:
         if fatigue_reduced:
             rest_text += f" 疲劳等级从{current_fatigue}降低到了{new_fatigue}。"
 
-        logger.info(f"玩家 {player.name} 休息了 {time_cost} 分钟，恢复体力 {actual_health_recovery} 点，心理状态各降低 {mental_recovery} 点")
+        logger.info(
+            f"玩家 {player.name} 休息了 {time_cost} 分钟，恢复体力 {actual_health_recovery} 点，"
+            f"心理状态各降低 {mental_recovery} 点，疲劳值降低 {fatigue_recovery} 点"
+        )
         
         return True, f"**休息**\n\n{rest_text}\n\n休息花费了{time_cost}分钟。", time_cost
     
-    def _get_fatigue_level(self, health: int) -> str:
-        """根据体力值计算疲劳等级"""
-        # 使用 FATIGUE_LEVELS 类变量
-        if health >= 76:
+    def _get_fatigue_level(self, fatigue_value: int) -> str:
+        """根据疲劳值计算疲劳等级。"""
+        if fatigue_value < 20:
             return self.FATIGUE_LEVELS[0]  # 无
-        elif health >= 51:
+        elif fatigue_value < 40:
             return self.FATIGUE_LEVELS[1]  # 轻微
-        elif health >= 26:
+        elif fatigue_value < 60:
             return self.FATIGUE_LEVELS[2]  # 中度
-        elif health >= 1:
+        elif fatigue_value < 80:
             return self.FATIGUE_LEVELS[3]  # 严重
         else:
             return self.FATIGUE_LEVELS[4]  # 极度

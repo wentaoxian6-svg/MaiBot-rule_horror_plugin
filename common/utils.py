@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TypeVar, cast
 
 
@@ -26,11 +28,17 @@ def is_dir_writable(path: str) -> bool:
         是否可写
     """
     try:
-        os.makedirs(path, exist_ok=True)
-        test_file = os.path.join(path, ".write_test")
-        with open(test_file, "w", encoding="utf-8") as f:
-            f.write("ok")
-        os.remove(test_file)
+        path_obj = Path(path).expanduser()
+        path_obj.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path_obj,
+            prefix=".rule_horror_write_test_",
+            delete=True,
+        ) as test_file:
+            test_file.write("ok")
+            test_file.flush()
         return True
     except Exception:
         return False
@@ -49,19 +57,27 @@ def resolve_data_dir(plugin_dir: str, data_subdir: str = "data") -> str:
     Returns:
         可写的数据目录路径
     """
-    preferred = os.path.join(plugin_dir, data_subdir)
+    preferred = str(Path(plugin_dir).expanduser() / data_subdir)
     if is_dir_writable(preferred):
         return preferred
 
     xdg_home = os.getenv("XDG_DATA_HOME")
     if xdg_home:
-        base = os.path.join(xdg_home, "maibot")
+        base = Path(xdg_home).expanduser() / "maibot"
     else:
-        base = os.path.join(os.path.expanduser("~"), ".local", "share", "maibot")
+        home_dir = os.path.expanduser("~")
+        if home_dir and home_dir != "~":
+            base = Path(home_dir) / ".local" / "share" / "maibot"
+        else:
+            base = Path(tempfile.gettempdir()) / "maibot"
 
-    fallback = os.path.join(base, "rule_horror")
-    os.makedirs(fallback, exist_ok=True)
-    return fallback
+    fallback = base / "rule_horror"
+    if is_dir_writable(str(fallback)):
+        return str(fallback)
+
+    temp_fallback = Path(tempfile.gettempdir()) / "maibot" / "rule_horror"
+    temp_fallback.mkdir(parents=True, exist_ok=True)
+    return str(temp_fallback)
 
 
 def safe_get_dict_value(

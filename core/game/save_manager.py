@@ -6,7 +6,7 @@ import gzip
 import json
 import logging
 import os
-import shutil
+import tempfile
 import threading
 from collections import deque
 from datetime import datetime, timedelta
@@ -35,26 +35,32 @@ class SaveManager:
         return cls._instance
 
     def __init__(self, data_dir: str | None = None):
-        if hasattr(self, "_initialized"):
-            return
+        if not hasattr(self, "_initialized"):
+            self._initialized = True
+            self._pending_saves = {}
+            self._save_lock = asyncio.Lock()
+            self._batch_task = None
+            self._running = False
 
-        self._initialized: bool = True
+        self._config = get_config().save
 
         if data_dir is None:
-            # 默认数据目录
+            if hasattr(self, "data_dir"):
+                return
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             data_dir = os.path.join(base_dir, "data", "saves")
 
-        self.data_dir: Path = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.save_dir: Path = self.data_dir  # 别名，兼容旧代码
+        new_dir = Path(data_dir)
+        if hasattr(self, "data_dir"):
+            if new_dir != self.data_dir and not self._running:
+                self.data_dir = new_dir
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                self.save_dir = self.data_dir
+            return
 
-        self._config = get_config().save
-        # 改为使用deque存储多个版本，避免数据丢失
-        self._pending_saves: dict[str, deque[tuple[datetime, GameSession]]] = {}
-        self._save_lock: asyncio.Lock = asyncio.Lock()
-        self._batch_task: asyncio.Task[None] | None = None
-        self._running: bool = False
+        self.data_dir = new_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir = self.data_dir
 
     async def start(self) -> None:
         """启动批量保存任务"""
@@ -121,31 +127,23 @@ class SaveManager:
         """执行实际保存操作"""
         try:
             save_data = {
-                "version": "2.1.0",
+                "version": "2.2.0",
                 "saved_at": datetime.now().isoformat(),
                 "session": session.to_dict(),
             }
 
             # 构建文件路径
             save_path = self._get_save_path(group_id)
-            temp_path = save_path.with_suffix(".tmp")
 
             # 写入临时文件
             json_str = json.dumps(save_data, ensure_ascii=False, indent=2)
 
             if self._config.compress_saves:
-                # 压缩保存
-                with gzip.open(temp_path, "wt", encoding="utf-8") as f:
-                    f.write(json_str)
                 final_path = save_path.with_suffix(".json.gz")
+                self._write_compressed_atomically(final_path, json_str)
             else:
-                # 普通保存
-                with open(temp_path, "w", encoding="utf-8") as f:
-                    f.write(json_str)
                 final_path = save_path.with_suffix(".json")
-
-            # 原子替换
-            shutil.move(str(temp_path), str(final_path))
+                self._write_text_atomically(final_path, json_str)
 
             logger.debug(f"保存成功: {group_id} -> {final_path}")
             return True
@@ -176,6 +174,53 @@ class SaveManager:
         # 对 group_id 进行安全处理
         safe_id = "".join(c for c in group_id if c.isalnum() or c in "-_")
         return self.data_dir / f"save_{safe_id}"
+
+    def _atomic_replace(self, temp_path: Path, final_path: Path) -> None:
+        """在同目录内原子替换，兼容 Linux 跨文件系统问题。"""
+        temp_path.replace(final_path)
+
+    def _write_text_atomically(self, final_path: Path, text: str) -> None:
+        """以 UTF-8 文本形式原子写入文件。"""
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{final_path.stem}_",
+            suffix=".tmp",
+            dir=str(final_path.parent),
+        )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            self._atomic_replace(temp_path, final_path)
+        except Exception:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+    def _write_compressed_atomically(self, final_path: Path, text: str) -> None:
+        """以 gzip 形式原子写入文件。"""
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{final_path.stem}_",
+            suffix=".tmp",
+            dir=str(final_path.parent),
+        )
+        os.close(fd)
+        temp_path = Path(temp_name)
+        try:
+            with gzip.open(temp_path, "wt", encoding="utf-8") as f:
+                f.write(text)
+            self._atomic_replace(temp_path, final_path)
+        except Exception:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     async def load(self, group_id: str) -> GameSession | None:
         """
@@ -237,6 +282,87 @@ class SaveManager:
                     logger.error(f"删除存档失败 {group_id}: {e}")
 
         return deleted
+
+    async def mark_ended_and_cleanup(self, group_id: str) -> bool:
+        """标记存档为结束状态并清理相关图片
+
+        Args:
+            group_id: 群组ID
+
+        Returns:
+            是否成功处理
+        """
+        save_path = self._get_save_path(group_id)
+        processed = False
+
+        for ext in [".json.gz", ".json"]:
+            file_path = save_path.with_suffix(ext)
+            if file_path.exists():
+                try:
+                    # 读取存档
+                    if file_path.suffix == ".gz":
+                        with gzip.open(file_path, "rt", encoding="utf-8") as f:
+                            data = json.load(f)
+                    else:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+
+                    # 标记为结束状态
+                    if "session" in data:
+                        data["session"]["status"] = "ended"
+                        data["session"]["ended_at"] = datetime.now().isoformat()
+
+                        # 收集需要清理的图片路径
+                        images_to_cleanup: list[str] = []
+                        session = data.get("session", {})
+
+                        # 清理场景图片
+                        if session.get("scene_image"):
+                            images_to_cleanup.append(session["scene_image"])
+
+                        # 清理结局图片
+                        if session.get("ending_image"):
+                            images_to_cleanup.append(session["ending_image"])
+
+                        # 清理玩家相关图片
+                        for player_id, player_data in session.get("players", {}).items():
+                            if isinstance(player_data, dict):
+                                if player_data.get("status_image"):
+                                    images_to_cleanup.append(player_data["status_image"])
+
+                        # 清理环境图片
+                        env_state = session.get("environment_state", {})
+                        if isinstance(env_state, dict):
+                            for key, value in env_state.items():
+                                if isinstance(value, dict) and value.get("image"):
+                                    images_to_cleanup.append(value["image"])
+
+                    # 保存修改后的存档
+                    if file_path.suffix == ".gz":
+                        with gzip.open(file_path, "wt", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                    else:
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+
+                    logger.info(f"标记存档为结束: {group_id}")
+
+                    # 清理图片文件
+                    for image_path in images_to_cleanup:
+                        try:
+                            img_path = Path(image_path)
+                            if img_path.exists():
+                                img_path.unlink()
+                                logger.info(f"清理图片: {image_path}")
+                        except Exception as e:
+                            logger.warning(f"清理图片失败 {image_path}: {e}")
+
+                    processed = True
+
+                except Exception as e:
+                    logger.error(f"标记存档结束失败 {group_id}: {e}")
+
+        return processed
 
     async def list_saves(self) -> list[JsonObject]:
         """列出所有存档（包含默认存档与命名存档）
@@ -323,7 +449,7 @@ class SaveManager:
         """使用指定名称保存存档（用于手动存档）"""
         try:
             save_data = {
-                "version": "2.1.0",
+                "version": "2.2.0",
                 "saved_at": datetime.now().isoformat(),
                 "name": name,
                 "session": session.to_dict(),
@@ -333,9 +459,8 @@ class SaveManager:
             safe_id = "".join(c for c in group_id if c.isalnum() or c in "-_")
             safe_name = "".join(c for c in name if c.isalnum() or c in "-_")
             save_path = self.data_dir / f"named_{safe_id}_{safe_name}.json"
-
-            with open(save_path, "w", encoding="utf-8") as f:
-                json.dump(save_data, f, ensure_ascii=False, indent=2)
+            json_str = json.dumps(save_data, ensure_ascii=False, indent=2)
+            self._write_text_atomically(save_path, json_str)
 
             logger.info(f"手动存档成功: {group_id} -> {name}")
             return True

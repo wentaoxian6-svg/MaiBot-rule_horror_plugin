@@ -1,28 +1,40 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
+  "id": "wentaoxian6-svg.rule-horror-plugin",
+  "version": "2.3.0",
   "name": "规则怪谈插件",
-  "version": "2.2.0",
-  "description": "生成规则怪谈并进行互动游戏，支持LLM生成、提示、推理和多种结局判定",
+  "description": "生成规则怪谈并进行互动游戏，支持 LLM 生成、提示、推理和多种结局判定。",
   "author": {
     "name": "岚影鸿夜",
     "url": "https://github.com/wentaoxian6-svg"
   },
   "license": "MIT",
-  "homepage_url": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
-  "repository_url": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
-  "host_application": {
-    "min_version": "0.12.2"
+  "urls": {
+    "repository": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
+    "homepage": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin",
+    "documentation": "https://docs.mai-mai.org/develop/plugin-dev/",
+    "issues": "https://github.com/wentaoxian6-svg/MaiBot-rule_horror_plugin/issues"
   },
-  "keywords": [
-    "规则怪谈",
-    "游戏",
-    "LLM",
-    "互动",
-    "推理"
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.4.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "chat.get_stream_by_user_id",
+    "message.get_recent",
+    "config.get"
   ],
-  "categories": [
-    "Entertainment & Interaction",
-    "Content Generation"
-  ],
-  "id": "wentaoxian6-svg.MaiBot-rule_horror_plugin"
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
 }

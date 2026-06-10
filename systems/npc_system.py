@@ -19,6 +19,7 @@ from ..common.models import (
     InteractionRecordDict,
     LocationRecordDict,
     ActionRecordDict,
+    JsonObject,
 )
 
 
@@ -435,6 +436,14 @@ class NPC:
         self.personality: str = personality
         self.location: str = initial_location
         self.current_location: str = initial_location
+        self.home_area: str = initial_location
+        self.duty_areas: list[str] = [initial_location]
+        self.behavior_logic_summary: str = ""
+        self.current_goal: str = ""
+        self.last_action: str = ""
+        self.last_observed_players: list[str] = []
+        self.audible_signature: str = ""
+        self.movement_history: list[dict[str, object]] = []
         self.memory: NPCMemory = NPCMemory()
         self.behavior_tree: BehaviorNode | None = None
         self.patrol_route: list[str] = []
@@ -706,6 +715,14 @@ class NPC:
             "personality": self.personality,
             "location": self.location,
             "current_location": self.current_location,
+            "home_area": self.home_area,
+            "duty_areas": self.duty_areas,
+            "behavior_logic_summary": self.behavior_logic_summary,
+            "current_goal": self.current_goal,
+            "last_action": self.last_action,
+            "last_observed_players": self.last_observed_players,
+            "audible_signature": self.audible_signature,
+            "movement_history": self.movement_history,
             "memory": self.memory.to_dict(),
             "patrol_route": self.patrol_route,
             "patrol_index": self.patrol_index,
@@ -730,6 +747,17 @@ class NPC:
         )
         
         npc.current_location = data.get("current_location", data["location"])
+        npc.home_area = str(data.get("home_area", npc.current_location) or npc.current_location)
+        duty_areas = data.get("duty_areas", [npc.current_location])
+        npc.duty_areas = [str(item) for item in duty_areas if str(item).strip()] if isinstance(duty_areas, list) else [npc.current_location]
+        npc.behavior_logic_summary = str(data.get("behavior_logic_summary", "") or "")
+        npc.current_goal = str(data.get("current_goal", "") or "")
+        npc.last_action = str(data.get("last_action", "") or "")
+        last_observed_players = data.get("last_observed_players", [])
+        npc.last_observed_players = [str(item) for item in last_observed_players if str(item).strip()] if isinstance(last_observed_players, list) else []
+        npc.audible_signature = str(data.get("audible_signature", "") or "")
+        movement_history = data.get("movement_history", [])
+        npc.movement_history = [item for item in movement_history if isinstance(item, dict)] if isinstance(movement_history, list) else []
         npc.memory = NPCMemory.from_dict(data.get("memory", {}))
         npc.patrol_route = data.get("patrol_route", [])
         npc.patrol_index = data.get("patrol_index", 0)

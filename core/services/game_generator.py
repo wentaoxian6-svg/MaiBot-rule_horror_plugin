@@ -186,6 +186,192 @@ class GameGenerator:
         except Exception as e:
             logger.error(f"生成协作规则失败: {e}")
 
+    @staticmethod
+    def _extract_rule_text(rule: object) -> str:
+        """提取规则文本。"""
+        if isinstance(rule, dict):
+            return str(rule.get("text", rule.get("content", "")) or "").strip()
+        return str(rule or "").strip()
+
+    def _build_fallback_multiplayer_rule_carriers(
+        self,
+        session: GameSession,
+        assignments: list[AssignmentData],
+        common_rules: list[object],
+    ) -> list[JsonObject]:
+        """在模型未直接生成规则载体时，按身份与区域兜底构造。"""
+        rooms: list[str] = []
+        scene_structure = session.scene_structure if isinstance(session.scene_structure, dict) else {}
+        floors = scene_structure.get("floors", [])
+        if isinstance(floors, list):
+            for floor in floors:
+                if not isinstance(floor, dict):
+                    continue
+                raw_rooms = floor.get("areas", floor.get("rooms", []))
+                if isinstance(raw_rooms, list):
+                    for room in raw_rooms:
+                        room_name = str(room).strip()
+                        if room_name and room_name not in rooms:
+                            rooms.append(room_name)
+        special_areas = scene_structure.get("special_areas", [])
+        if isinstance(special_areas, list):
+            for room in special_areas:
+                room_name = str(room).strip()
+                if room_name and room_name not in rooms:
+                    rooms.append(room_name)
+        if not rooms:
+            rooms = [session.scene_name or "起始位置"]
+
+        carriers: list[JsonObject] = []
+        carrier_index = 0
+
+        def add_carrier(
+            title: str,
+            location: str,
+            revealed_rules: list[str],
+            visible_to: JsonObject,
+            *,
+            description: str = "",
+            initially_visible: bool = False,
+            requires_action: bool = True,
+        ) -> None:
+            nonlocal carrier_index
+            normalized_rules = [text for text in revealed_rules if text]
+            if not normalized_rules:
+                return
+            carriers.append(
+                {
+                    "carrier_id": f"carrier_{carrier_index}",
+                    "title": title,
+                    "location": location,
+                    "area_scope": location,
+                    "visible_to": visible_to,
+                    "revealed_rules": normalized_rules,
+                    "carrier_type": "规则载体",
+                    "description": description or f"你在{location}发现了一份可供核对的纸面记录。",
+                    "is_discovered": False,
+                    "discovered_by": [],
+                    "initially_visible": initially_visible,
+                    "requires_action": requires_action,
+                }
+            )
+            carrier_index += 1
+
+        for index, assignment in enumerate(assignments):
+            if not isinstance(assignment, dict):
+                continue
+            player_id = str(assignment.get("player_id", "") or "").strip()
+            if not player_id:
+                continue
+            duty_area = str(assignment.get("duty_area", "") or "").strip() or rooms[index % len(rooms)]
+            identity_name = str(assignment.get("identity_name", "岗位记录") or "岗位记录").strip()
+            unique_rules_raw = assignment.get("unique_rules", [])
+            unique_rule_texts = [
+                self._extract_rule_text(rule)
+                for rule in unique_rules_raw
+                if self._extract_rule_text(rule)
+            ] if isinstance(unique_rules_raw, list) else []
+            if unique_rule_texts:
+                add_carrier(
+                    title=f"{identity_name}相关记录",
+                    location=duty_area,
+                    revealed_rules=unique_rule_texts[:2],
+                    visible_to={"player_ids": [player_id]},
+                    description=f"这份记录更像是写给{identity_name}的岗位备忘。",
+                    initially_visible=False,
+                )
+
+        common_rule_texts = [
+            self._extract_rule_text(rule)
+            for rule in common_rules
+            if self._extract_rule_text(rule)
+        ]
+        for index, rule_text in enumerate(common_rule_texts):
+            add_carrier(
+                title="公共注意事项",
+                location=rooms[index % len(rooms)],
+                revealed_rules=[rule_text],
+                visible_to={"all_players": True},
+                description="这是一条被留在公共区域的注意事项。",
+                initially_visible=False,
+            )
+
+        return carriers
+
+    def _normalize_rule_carriers(
+        self,
+        raw_carriers: object,
+        session: GameSession,
+        assignments: list[AssignmentData],
+        common_rules: list[object],
+    ) -> list[JsonObject]:
+        """归一化模型生成的规则载体，必要时回退本地兜底。"""
+        if not isinstance(raw_carriers, list):
+            return self._build_fallback_multiplayer_rule_carriers(session, assignments, common_rules)
+
+        carriers: list[JsonObject] = []
+        for index, item in enumerate(raw_carriers):
+            if not isinstance(item, dict):
+                continue
+            carrier_id = str(item.get("carrier_id", f"carrier_{index}") or f"carrier_{index}").strip()
+            location = str(item.get("location", item.get("area_scope", "")) or "").strip()
+            title = str(item.get("title", "规则载体") or "规则载体").strip()
+            description = str(item.get("description", "") or "").strip()
+            carrier_type = str(item.get("carrier_type", "规则载体") or "规则载体").strip()
+            revealed_rules_raw = item.get("revealed_rules", [])
+            revealed_rules = [
+                self._extract_rule_text(rule)
+                for rule in revealed_rules_raw
+                if self._extract_rule_text(rule)
+            ] if isinstance(revealed_rules_raw, list) else []
+            visible_to = item.get("visible_to", {"all_players": True})
+            if not isinstance(visible_to, dict):
+                visible_to = {"all_players": True}
+
+            carriers.append(
+                {
+                    "carrier_id": carrier_id or f"carrier_{index}",
+                    "title": title,
+                    "location": location or session.scene_name or "起始位置",
+                    "area_scope": str(item.get("area_scope", location) or location or session.scene_name or "起始位置").strip(),
+                    "visible_to": visible_to,
+                    "revealed_rules": revealed_rules,
+                    "carrier_type": carrier_type,
+                    "description": description,
+                    "is_discovered": bool(item.get("is_discovered", False)),
+                    "discovered_by": [str(x).strip() for x in item.get("discovered_by", []) if str(x).strip()] if isinstance(item.get("discovered_by", []), list) else [],
+                    "initially_visible": bool(item.get("initially_visible", False)),
+                    "requires_action": bool(item.get("requires_action", True)),
+                }
+            )
+
+        return carriers or self._build_fallback_multiplayer_rule_carriers(session, assignments, common_rules)
+
+    @staticmethod
+    def _build_default_npc_roster(npc_guidance: GameData) -> list[JsonObject]:
+        """为 NPC 引导结果生成最小可用 roster。"""
+        npc_name = str(npc_guidance.get("npc_name", "引导者") or "引导者").strip()
+        npc_role = str(npc_guidance.get("npc_role", "引导 NPC") or "引导 NPC").strip()
+        npc_behavior = str(npc_guidance.get("npc_behavior", "") or "").strip()
+        npc_attitude = str(npc_guidance.get("npc_attitude", "") or "").strip()
+        return [
+            {
+                "npc_id": "guide_0",
+                "name": npc_name,
+                "role": npc_role,
+                "attitude": npc_attitude,
+                "home_area": "",
+                "duty_areas": [],
+                "current_location": "",
+                "behavior_logic_summary": npc_behavior or "负责接待新来者、分派任务，并在异常出现前维持现场秩序。",
+                "current_goal": "维持当前场域秩序并观察新来者",
+                "last_action": "刚结束一次例行巡视",
+                "audible_signature": "平稳的脚步声",
+                "danger_level": "低",
+                "can_speak": True,
+            }
+        ]
+
     async def _generate_multi_identity_system(
         self,
         session: GameSession,
@@ -230,9 +416,10 @@ class GameGenerator:
    - 例如公寓：新租户、物业管理员、老住户、维修工
 
 2. **规则差异**：每个身份有部分独特规则（2-3条）
-   - 有些规则是共同的（所有人都要遵守）
+   - 有些规则是共同的（所有人都要遵守），但不要默认开场直接告诉所有玩家
    - 有些规则是身份特定的
    - 有些规则可能对立（例如：护士被告知避开某个房间，但医生被要求去检查那个房间）
+   - 规则更适合作为后台真相、可发现载体、观察提示、NPC误导信息存在，而不是直接发给玩家
 
 3. **NPC态度**：NPC对不同身份的态度不同
    - 例如：护士长对新护士严厉，对医生恭敬，对病人冷淡
@@ -240,6 +427,22 @@ class GameGenerator:
 4. **信息不对称**：每个身份知道的信息不完全相同
    - 鼓励玩家之间交流信息
    - 拼凑完整真相需要多个身份的信息
+
+5. **任务与责任区域**：
+   - 每个身份都要有一个明确任务
+   - 每个身份都要有一个责任区域或重点活动区域
+   - 任务和责任区域应影响他更容易接触哪些规则载体和 NPC
+
+6. **初始信息**：
+   - 默认不要直接发完整规则正文
+   - 可以给初始观察、岗位提醒、模糊暗示、可见规则载体编号
+   - 只有在确实合理时才给少量开场可见规则载体
+
+7. **规则载体分布**：
+   - 尽量把规则放入场景中的规则载体，而不是直接塞给玩家
+   - 不同身份、不同任务区域、不同班次可看到不同载体
+   - 某些载体可多人共享，某些只能单人看见
+   - 开场可以没有任何直接规则
 
 **输出格式：**
 {{
@@ -249,9 +452,16 @@ class GameGenerator:
       "player_name": "玩家昵称",
       "identity_name": "身份名称",
       "identity_description": "身份描述（50字内）",
+      "task_brief": "该玩家当前必须完成或优先处理的任务",
+      "duty_area": "该玩家负责的区域或主要活动区域",
+      "initial_observations": [
+        "玩家开场能立刻观察到的现象1",
+        "玩家开场能立刻观察到的现象2"
+      ],
+      "initial_visible_carrier_ids": ["carrier_1"],
       "unique_rules": [
-        {{"text": "该身份特有的规则1", "is_true": true, "hidden_meaning": "隐藏含义"}},
-        {{"text": "该身份特有的规则2", "is_true": false, "hidden_meaning": "隐藏含义"}}
+        {{"text": "该身份特有的后台规则1", "is_true": true, "hidden_meaning": "隐藏含义"}},
+        {{"text": "该身份特有的后台规则2", "is_true": false, "hidden_meaning": "隐藏含义"}}
       ],
       "npc_attitudes": {{
         "NPC名称1": "对该身份的态度描述",
@@ -261,7 +471,33 @@ class GameGenerator:
     }}
   ],
   "common_rules": [
-    {{"text": "所有身份共同的规则1", "is_true": true, "hidden_meaning": "隐藏含义"}}
+    {{"text": "所有身份共同的后台规则1", "is_true": true, "hidden_meaning": "隐藏含义"}}
+  ],
+  "rule_carriers": [
+    {{
+      "carrier_id": "carrier_0",
+      "title": "值班备忘",
+      "location": "护士站",
+      "area_scope": "护士站",
+      "visible_to": {{"player_ids": ["玩家QQ号"]}},
+      "revealed_rules": ["玩家实际能从该载体读到的规则或注意事项"],
+      "carrier_type": "纸质记录/告示/物品标签/口头流言",
+      "description": "玩家看到这个载体时的描述",
+      "initially_visible": false,
+      "requires_action": true
+    }}
+  ],
+  "identity_groups": [
+    {{
+      "group_name": "同身份或同任务组名称",
+      "members": ["player_id_1", "player_id_2"]
+    }}
+  ],
+  "shared_visibility_groups": [
+    {{
+      "group_name": "共享载体视野组",
+      "members": ["player_id_1", "player_id_2"]
+    }}
   ]
 }}
 
@@ -270,8 +506,10 @@ class GameGenerator:
 - 严禁使用emoji表情符号
 - 本次玩家数量：{desired}
 - `assignments` 必须包含 {desired} 条
-- 每个玩家 2-3 条独特规则
-- 1-2 条共同规则
+- 每个玩家 2-3 条后台独特规则
+- 1-2 条后台共同规则
+- 每个玩家必须有 `task_brief`、`duty_area`、`initial_observations`
+- `rule_carriers` 应尽量覆盖单人可见、共享可见、公共可见三种情况中的至少两种
 - `player_id` 必须与输入完全一致"""
 
 
@@ -295,7 +533,7 @@ class GameGenerator:
 {names_text}
 {players_text}
 
-请为每位玩家分配一个不同的身份，并生成对应的个人规则与独有信息。"""
+请为每位玩家分配一个不同的身份，并生成对应的任务、责任区域、初始观察、后台规则与独有信息。"""
 
 
 
@@ -330,6 +568,10 @@ class GameGenerator:
                         "player_name": str(a.get("player_name", "") or "").strip(),
                         "identity_name": str(a.get("identity_name", "") or "").strip(),
                         "identity_description": str(a.get("identity_description", "") or "").strip(),
+                        "task_brief": str(a.get("task_brief", "") or "").strip(),
+                        "duty_area": str(a.get("duty_area", "") or "").strip(),
+                        "initial_observations": a.get("initial_observations", []),
+                        "initial_visible_carrier_ids": a.get("initial_visible_carrier_ids", []),
                         "unique_rules": a.get("unique_rules", []),
                         "npc_attitudes": a.get("npc_attitudes", {}),
                         "exclusive_info": str(a.get("exclusive_info", "") or "").strip(),
@@ -341,10 +583,19 @@ class GameGenerator:
             mi["assignments"] = normalized_assignments
             mi["identities"] = identities if isinstance(identities, list) else []
             mi["common_rules"] = common_rules if isinstance(common_rules, list) else []
-
-            # 多人模式规则展示/判定：优先使用共同规则作为“公用规则表”
-            if isinstance(common_rules, list) and common_rules:
-                session.rules = common_rules
+            mi["identity_groups"] = identity_data.get("identity_groups", []) if isinstance(identity_data.get("identity_groups", []), list) else []
+            mi["shared_visibility_groups"] = identity_data.get("shared_visibility_groups", []) if isinstance(identity_data.get("shared_visibility_groups", []), list) else []
+            mi["npc_attitudes"] = {
+                str(item.get("player_id", "") or "").strip(): item.get("npc_attitudes", {})
+                for item in normalized_assignments
+                if isinstance(item, dict) and str(item.get("player_id", "") or "").strip()
+            }
+            mi["rule_carriers"] = self._normalize_rule_carriers(
+                identity_data.get("rule_carriers", []),
+                session,
+                normalized_assignments,
+                common_rules if isinstance(common_rules, list) else [],
+            )
 
             count = len(normalized_assignments) if normalized_assignments else len(mi.get("identities", []) or [])
             logger.info(f"多身份系统生成成功: {count}个分配")
@@ -622,61 +873,116 @@ class GameGenerator:
         plot_data: GameData,
         rules_data: GameData
     ) -> GameData:
-        """Step 4: 生成NPC引导"""
-        system_prompt = """你是规则怪谈游戏的NPC引导生成器。请基于场景和规则，生成NPC引导系统。
+        """Step 4: 生成NPC引导和 NPC roster。"""
+        system_prompt = """你是规则怪谈游戏的开场遭遇生成器。请基于场景、隐藏真相和规则，为玩家生成一个更像真实剧情的 NPC 初次接触片段。
 
-**NPC引导要求：**
+你的目标不是“把规则宣布出来”，而是生成一个自然、沉浸、符合场景的开场遭遇：
 
-1. **引导方式**：选择一种引导方式
-   - natural_language：NPC通过自然对话告知规则/注意事项（更口语、更像真人）
-   - rule_carrier：NPC发放书面材料（工作守则、员工手册等）
+1. 开场不一定必须有 NPC。
+   - 可以有人接待、交接、分派任务
+   - 也可以完全没有 NPC，由玩家独自在空房间、值班室、病床、休息室、储物间等地点醒来或恢复意识，再自行探索
+2. 如果有 NPC，NPC 首要职责应是接待、分派任务、交接班、安排岗位、提醒异常、制造不安感，而不是像系统公告一样逐条宣读规则。
+3. 开场大多数情况下不要直接完整告诉玩家规则。
+4. 如果 NPC 开口提到注意事项，可以是零碎、口语化、带情绪或带个人立场的提醒，不要整理成清单。
+5. natural_language 模式下允许 NPC 说出一部分规则性内容，也允许夹杂无关提醒、误导、虚假规则或彼此矛盾的说法；这些内容只是剧情中的口述信息，不代表系统确认后的规则。
+6. natural_language 模式下，禁止 NPC 在开场直接完整宣读规则总表，也不要输出编号式、条文化、培训手册式的整段说明。
+7. 允许 NPC 什么都不明说，只给任务、态度、暗示、误导、回避或模棱两可的话。
+8. 如果使用 rule_carrier，也不要把载体内容完整展开；只描述 NPC 如何把某份纸面材料、便签、值班记录、工作守则留给玩家，真正内容留给后续探索。
+9. 如果没有 NPC，开场重点应放在：
+   - 玩家醒来时的身体感觉、环境异样、光线、声音、气味
+   - 房间里留下的痕迹、物件、纸张、广播、门外动静
+   - “为什么这里只有我”“刚刚这里发生了什么”的不安感
+10. 对话必须像场景中的人说出来的话，不能像旁白总结、系统提示、玩法教程或客服说明。
+11. 严禁出现以下表达：
+   - “接下来你要遵守以下规则”
+   - “这里有几条规则/一共X条规则”
+   - “系统会……”
+   - “请使用……命令”
+   - 任何编号、分点、清单式口吻
+12. natural_language 模式下，开场对话更适合：
+   - 简短交接
+   - 模糊警告
+   - 任务催促
+   - 不完整说明
+   - 带个人情绪的抱怨或回避
+13. natural_language 模式下，NPC 可以说“别去后面”“先干活”“十一点后别乱碰冷柜”“听见有人叫你也别急着回头”这类零散说法，但不要把它们包装成正式规则列表。
+14. 如果是多人开场，NPC 可以面对“一行人”统一说话，但不要在公开对话里直接暴露每个人的私密身份规则。
+15. 要保留危险感、含混感和世界内叙事感，让玩家觉得自己是在进入一个不对劲的地方，而不是在读玩法说明。
 
-2. **NPC设定**：
-   - NPC姓名：符合场景设定
-   - NPC角色：如护士长、物业管理员、前台接待等
-   - NPC态度：如警告、提醒、指示等
+字段要求：
 
-3. **行为描述**：用第二人称视角描述NPC的动作（50-90字）
-   - 例如："物业管理员走向你，递给你一串钥匙和一张纸。他的眼神闪烁不定，似乎有话要说。"
+1. guidance_method
+   - natural_language：NPC 用自然对话、交接、催促、盘问、命令、抱怨、含糊提醒等方式出场
+   - rule_carrier：NPC 主要通过交付某种纸面/物件/记录完成开场接触
+   - none：开场没有 NPC，玩家独自醒来或独自置身场景中
 
-4. **对话内容**（如果是natural_language）：用第一人称对话形式（120-220字）
-   - 例如："新来的住户？听着，这栋楼的规矩很多。晚上8点后千万别去9层，那里...不太对劲。"
-   - 对话要自然流畅，可以包含规则要点，但要用口语化方式表达
-   - **关键一致性约束**：
-     - 不要宣称具体数量（禁止出现“有X条规则/规矩/死规则”这种说法）
-     - 如果必须强调，使用“有几条规矩/几条注意事项”即可
+2. npc_behavior
+   - 50-110 字
+   - 第二人称视角
+   - 只写玩家眼前看到的动作、神态、环境细节，不要写 NPC 台词
+   - 如果 guidance_method 为 none，这里改为“玩家醒来或察觉环境异常时，眼前发生的事”
 
-5. **规则载体**（如果是rule_carrier）：
-   - 规则载体标题：如"夜班护士工作守则"
-   - 规则载体描述：描述NPC如何发放规则载体（50-100字）
+3. npc_dialogue
+   - 120-260 字
+   - 仅在 natural_language 下填写
+   - 必须是 NPC 直接说出口的话
+   - 允许停顿、岔开话题、欲言又止、重复强调某个异常点
+   - 更适合“交接班”“分派任务”“催促开工”“低声提醒”“不耐烦地纠正”
+   - 可以包含少量规则性提醒、误导、虚假说法、矛盾说法或无关紧要的规矩
+   - 禁止出现完整规则总表、编号式注意事项、培训手册式说明
 
-**输出格式：**
+4. rule_carrier_title / rule_carrier_description
+   - 仅在 rule_carrier 下填写
+   - title 是物件或文书本身的名称，如“夜班交接单”“四层保洁记录”“值班室抽屉里的便签”
+   - description 只描述它如何被递来、塞来、指给玩家、留在某处，不要把正文规则完整写出来
+
+5. npc_roster
+   - 如果 guidance_method 为 none，则允许为空列表
+   - 生成 1-3 个可进入运行时模拟的 NPC
+   - 至少包含一个负责开场接待或岗位分派的 NPC
+   - 其他 NPC 可以是巡逻者、同事、沉默观察者、其他岗位人员
+   - 每个 NPC 都要给出岗位区域、行为逻辑摘要、当前目标、开场前刚做过什么、可听特征
+   - current_goal 必须是世界内目标，例如“整理夜班登记簿”“巡视四层病房”“确认新来者是否按要求到岗”，不要写“完成开场引导”
+
+输出 JSON：
 {
-  "guidance_method": "natural_language 或 rule_carrier",
+  "guidance_method": "natural_language 或 rule_carrier 或 none",
   "npc_name": "NPC姓名",
   "npc_role": "NPC角色",
-  "npc_attitude": "NPC态度",
-  "npc_behavior": "NPC行为描述（50-90字，第二人称视角）",
-  "npc_dialogue": "NPC对话（如果是natural_language，120-220字，第一人称对话）",
-  "rule_carrier_title": "规则载体标题（如果是rule_carrier）",
-  "rule_carrier_description": "规则载体描述（如果是rule_carrier，50-100字）"
+  "npc_attitude": "NPC对玩家的态度或气质，如冷淡、疲惫、急躁、敷衍、和善、戒备",
+  "npc_behavior": "玩家眼前看到的开场动作与氛围",
+  "npc_dialogue": "NPC直接说出口的话",
+  "rule_carrier_title": "载体名称",
+  "rule_carrier_description": "NPC交付或指向载体的场景描述",
+  "npc_roster": [
+    {
+      "npc_id": "guide_0",
+      "name": "NPC姓名",
+      "role": "NPC角色",
+      "attitude": "总体态度",
+      "home_area": "常驻区域",
+      "duty_areas": ["主要活动区域1", "主要活动区域2"],
+      "behavior_logic_summary": "单体行动逻辑摘要",
+      "current_goal": "世界内当前目标",
+      "last_action": "开场前刚做过什么",
+      "audible_signature": "玩家可听到的典型动静",
+      "danger_level": "低/中/高",
+      "can_speak": true
+    }
+  ]
 }
 
-**重要：**
-- 仅返回JSON，不要包含其他文字
-- 严禁使用emoji表情符号
-- npc_behavior和npc_dialogue要严格区分
-- npc_behavior用第二人称视角（"他走向你"）
-- npc_dialogue用第一人称对话（"听着，..."）
-- 不要在npc_dialogue中混入第三人称描述"""
+仅返回 JSON，不要包含其他说明。"""
 
 
-        user_prompt = f"""请基于以下信息，生成NPC引导。
+        user_prompt = f"""请基于以下信息，生成一个自然、沉浸的 NPC 开场遭遇。
 
 场景：{plot_data.get('scene_name', '')}
 玩家身份：{plot_data.get('player_identity', '')}
+隐藏真相：{plot_data.get('hidden_truth', '')}
+完整规则：{rules_data.get('rules', [])}
 
-请生成NPC引导。"""
+如果适合，也可以完全不安排 NPC 出场，让玩家独自醒来并自行探索。"""
 
 
         try:
@@ -687,6 +993,22 @@ class GameGenerator:
             )
 
             data = response.parse_json()
+            guidance_method = str(data.get("guidance_method", "natural_language") or "natural_language").strip().lower()
+            if guidance_method == "none":
+                data["guidance_method"] = "none"
+                data["npc_name"] = ""
+                data["npc_role"] = ""
+                data["npc_attitude"] = ""
+                data["npc_dialogue"] = ""
+                data["rule_carrier_title"] = ""
+                data["rule_carrier_description"] = ""
+                data["npc_roster"] = []
+                logger.info("NPC引导生成成功: none")
+                return data
+
+            npc_roster = data.get("npc_roster", [])
+            if not isinstance(npc_roster, list) or not npc_roster:
+                data["npc_roster"] = self._build_default_npc_roster(data)
             logger.info(f"NPC引导生成成功: {data.get('guidance_method', 'unknown')}")
             return data
 
@@ -695,13 +1017,18 @@ class GameGenerator:
             # NPC引导失败不影响游戏，返回默认值
             return {
                 "guidance_method": "natural_language",
-                "npc_name": "引导者",
-                "npc_role": "神秘人",
-                "npc_attitude": "警告",
-                "npc_behavior": "一个神秘的身影出现在你面前。",
-                "npc_dialogue": "欢迎来到这里。记住，遵守规则，才能活下去。",
+                "npc_name": "值班人",
+                "npc_role": "夜班交接员",
+                "npc_attitude": "疲惫",
+                "npc_behavior": "值班桌后的那个人抬头看了你一眼，指尖还压着没整理完的登记表。他没有立刻招呼你，只是先确认门有没有关好，才朝你招了招手。",
+                "npc_dialogue": "新来的？先别站门口，把门带上。今晚人手不够，你先去熟悉自己该待的地方，没事别乱跑。要是听见哪间屋里有动静，又不确定是不是该你管的，就先回来找我，别自作主张。这里有人喜欢把话说一半，你最好学会自己分辨。",
+                "npc_roster": self._build_default_npc_roster(
+                    {
+                        "npc_name": "值班人",
+                        "npc_role": "夜班交接员",
+                        "npc_attitude": "疲惫",
+                        "npc_behavior": "值班桌后的那个人一边整理登记表，一边观察新来者的反应。",
+                    }
+                ),
             }
 
-    def _get_default_game(self) -> GameData:
-        """获取默认游戏（已废弃，不再使用）"""
-        raise NotImplementedError("默认场景已移除，请确保 LLM API 正常工作")
