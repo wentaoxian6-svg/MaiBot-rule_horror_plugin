@@ -200,6 +200,74 @@ class AsyncImageGenerator:
         cache_data = json.dumps(kwargs, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(cache_data.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _normalize_display_text(text: object) -> str:
+        """清理图片展示前的自由文本。"""
+        normalized = str(text or "").replace("\r\n", "\n").strip()
+        normalized = re.sub(r"(?m)^\s*(?:[-*•]+|\d+[\.、])\s*", "", normalized)
+        normalized = re.sub(r"[ \t]+", " ", normalized)
+        normalized = re.sub(r"\n{2,}", "\n", normalized)
+        return normalized.strip()
+
+    @classmethod
+    def _compress_display_text(
+        cls,
+        text: object,
+        *,
+        max_units: int,
+        max_chars: int,
+        clause_mode: bool = False,
+    ) -> str:
+        """把长图里的文本压成更接近片段式叙事的长度。"""
+        normalized = cls._normalize_display_text(text)
+        if not normalized:
+            return ""
+
+        splitter = r"[。！？!?；;\n]+" if not clause_mode else r"[。！？!?；;，,\n]+"
+        units = [item.strip(" \"'“”‘’") for item in re.split(splitter, normalized) if item.strip(" \"'“”‘’")]
+        if not units:
+            shortened = normalized[:max_chars].rstrip("，,；;、 ")
+            return f"{shortened}。"
+
+        selected: list[str] = []
+        total_chars = 0
+        for unit in units:
+            compact_unit = re.sub(r"\s+", "", unit)
+            if not compact_unit:
+                continue
+            projected = total_chars + len(compact_unit)
+            if selected and projected > max_chars:
+                break
+            selected.append(compact_unit)
+            total_chars = projected
+            if len(selected) >= max_units or total_chars >= max_chars:
+                break
+
+        if not selected:
+            selected = [units[0][:max_chars].strip()]
+
+        joiner = "，" if clause_mode else "。"
+        body = joiner.join(item.rstrip("，,；;、。") for item in selected if item.strip()).rstrip("，,；;、。")
+        return f"{body}。"
+
+    @classmethod
+    def _truncate_display_text(cls, text: object, *, max_chars: int) -> str:
+        """尽量保留原有句读与语气，只做温和截断。"""
+        normalized = cls._normalize_display_text(text)
+        if not normalized or len(normalized) <= max_chars:
+            return normalized
+
+        slice_text = normalized[:max_chars].rstrip()
+        cut_positions = [slice_text.rfind(mark) for mark in ("。", "！", "？", "……", "\n")]
+        best_cut = max(cut_positions)
+        if best_cut >= max(18, max_chars // 3):
+            return slice_text[: best_cut + 1].strip()
+
+        stripped = slice_text.rstrip("，,；;、 ")
+        if not stripped.endswith(("。", "！", "？")):
+            stripped += "……"
+        return stripped
+
     def _get_cached_image(self, cache_key: str) -> str | None:
         """获取缓存的图片路径"""
         if cache_key in self._cache_index:
@@ -444,7 +512,7 @@ class AsyncImageGenerator:
         core_symbols: Sequence[CoreSymbol] | None = None,
         output_path: str | None = None,
     ) -> str:
-        """同步方法：生成剧情导入长图（纯黑背景+鲜红字体）"""
+        """同步方法：生成剧情导入长图（统一叙事正文）"""
         _ = core_symbols  # 不显示核心象征符号
         
         if output_path is None:
@@ -453,65 +521,36 @@ class AsyncImageGenerator:
 
         # 加载字体
         font_title = self._get_font(self._font_path, 36)
-        font_subtitle = self._get_font(self._font_path, 28)
         font_normal = self._get_font(self._font_path, 20)
 
-        # 预估图片高度
         margin = 60
         title_height = 80
-        section_height = 50
-        line_height = 30
-        char_per_line = 38
-        
-        # 计算背景故事需要的行数
-        bg_lines: list[str] = []
-        for i in range(0, len(background), char_per_line):
-            bg_lines.append(background[i:i+char_per_line])
-        
-        # 计算玩家身份需要的行数
-        identity_lines: list[str] = []
-        for i in range(0, len(arrival_reason), char_per_line):
-            identity_lines.append(arrival_reason[i:i+char_per_line])
-        
-        # 计算总高度
-        total_height = (margin * 2 + title_height + section_height + 
-                       len(bg_lines) * line_height + section_height + 
-                       len(identity_lines) * line_height + 50)
+        line_height = 34
+        width = 900
+        line_available_width = width - margin * 2
+
+        body_parts = [str(background or "").strip(), str(arrival_reason or "").strip()]
+        narrative_text = self._truncate_display_text("\n".join(part for part in body_parts if part), max_chars=360)
+        content_lines = self._wrap_text_by_width(narrative_text, font_normal, line_available_width)
+        total_height = margin * 2 + title_height + len(content_lines) * line_height + 70
         
         # 创建图片（纯黑背景）
-        width = 900
         img = Image.new('RGB', (width, total_height), color='#000000')
         draw = ImageDraw.Draw(img)
         
         # 绘制标题（动态居中）
-        title_text = "规则怪谈"
+        title_text = str(scene_name or "").strip() or "故事开始"
         title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
         title_width = title_bbox[2] - title_bbox[0]
         title_x = (width - title_width) // 2
         draw.text((title_x, margin), title_text, fill='#8B0000', font=font_title)
         
-        # 绘制场景名称（动态居中）
-        scene_bbox = draw.textbbox((0, 0), scene_name, font=font_subtitle)
-        scene_width = scene_bbox[2] - scene_bbox[0]
-        scene_x = (width - scene_width) // 2
-        draw.text((scene_x, margin + 50), scene_name, fill='#DC143C', font=font_subtitle)
-        
         # 绘制分隔线
-        draw.line([(margin, margin + 100), (width - margin, margin + 100)], fill='#8B0000', width=2)
+        draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#8B0000', width=2)
         
-        # 绘制背景故事
-        current_y = margin + 130
-        draw.text((margin, current_y), "剧情导入", fill='#DC143C', font=font_subtitle)
-        current_y += section_height
-        for line in bg_lines:
-            draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
-            current_y += line_height
-        
-        # 绘制玩家身份
-        current_y += 20
-        draw.text((margin, current_y), "你的身份", fill='#DC143C', font=font_subtitle)
-        current_y += section_height
-        for line in identity_lines:
+        current_y = margin + 110
+
+        for line in content_lines:
             draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
             current_y += line_height
         
@@ -534,6 +573,7 @@ class AsyncImageGenerator:
         # 生成缓存键
         cache_key = self._get_cache_key(
             type="scene",
+            render_version="scene_narrative_v3",
             scene_name=scene_name,
             background=background,
             arrival_reason=arrival_reason,
@@ -574,20 +614,18 @@ class AsyncImageGenerator:
         output_path: str | None = None,
         sanity: int = 100,
     ) -> str:
-        """同步方法：生成规则长图（纯黑背景+鲜红字体）"""
+        """同步方法：生成规则长图（怪谈纸面式文本）"""
         if output_path is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = str(self.output_dir / f"rules_{timestamp}.png")
 
         # 加载字体
         font_title = self._get_font(self._font_path, 36)
-        font_subtitle = self._get_font(self._font_path, 28)
         font_normal = self._get_font(self._font_path, 20)
 
         margin = 60
         title_height = 80
-        section_height = 50
-        line_height = 30
+        line_height = 34
         width = 900
         
         # 计算分割线之间的可用宽度（与分割线等长）
@@ -669,35 +707,39 @@ class AsyncImageGenerator:
 
         rules = dedup_rules
 
-        # 计算规则需要的行数（使用动态宽度换行）
         rule_lines: list[str] = []
-        for i, rule in enumerate(rules, 1):
-            rule_text = str(rule.get("text", rule.get("content", str(rule))) or "")
-            rule_line = f"{i}. {rule_text}"
-            # 使用动态宽度换行，与分割线等长
-            wrapped_lines = self._wrap_text_by_width(rule_line, font_normal, line_available_width)
+        for rule in rules:
+            rule_text = str(rule.get("text", rule.get("content", str(rule))) or "").strip()
+            if not rule_text:
+                continue
+            wrapped_lines = self._wrap_text_by_width(f"“{rule_text}”", font_normal, line_available_width)
             rule_lines.extend(wrapped_lines)
+            rule_lines.append("")
 
-        # 计算通关条件需要的行数（使用动态宽度换行）
+        if rule_lines and rule_lines[-1] == "":
+            rule_lines.pop()
+
         show_goal = bool(str(win_condition or "").strip())
-        goal_lines: list[str] = []
+        goal_line_text = ""
         if show_goal:
-            goal_prefix = "你的目标是：" if game_mode == "单人" else "你们的目标是："
-            goal_lines = [goal_prefix]
-            condition_lines = self._wrap_text_by_width(win_condition, font_subtitle, line_available_width)
-            goal_lines.extend(condition_lines)
+            goal_text = str(win_condition or "").strip()
+            if rule_lines:
+                goal_line_text = f"最后别忘了，{goal_text}"
+            else:
+                goal_line_text = goal_text
+        goal_lines = self._wrap_text_by_width(goal_line_text, font_normal, line_available_width) if goal_line_text else []
         
         # 计算总高度
         if is_insane_mode:
             visible_lines = rule_lines or goal_lines
             total_height = margin * 2 + len(visible_lines) * (line_height + 5) + 50
         else:
-            total_height = margin * 2 + title_height + section_height + 50
+            total_height = margin * 2 + title_height + 50
             if rule_lines:
                 total_height += len(rule_lines) * line_height
             if show_goal:
                 if rule_lines:
-                    total_height += section_height
+                    total_height += 24
                 total_height += len(goal_lines) * line_height
         
         # 创建图片（纯黑背景）
@@ -711,16 +753,10 @@ class AsyncImageGenerator:
             # 理智崩坏模式：优先显示规则；无规则时显示目标文本
             visible_lines = rule_lines or goal_lines
             for line in visible_lines:
-                # 移除序号前缀
-                display_line = line
-                for num in range(1, 11):
-                    if line.startswith(f"{num}. "):
-                        display_line = line.split(". ", 1)[1] if ". " in line else line
-                        break
-                draw.text((margin, current_y), display_line, fill='#8B0000', font=font_subtitle)
+                display_line = line.strip("“”") if line else line
+                draw.text((margin, current_y), display_line, fill='#8B0000', font=font_normal)
                 current_y += line_height + 5
         else:
-            # 正常模式
             # 绘制标题（动态居中）
             title_bbox = draw.textbbox((0, 0), rules_title, font=font_title)
             title_width = title_bbox[2] - title_bbox[0]
@@ -738,10 +774,12 @@ class AsyncImageGenerator:
             # 绘制分隔线
             draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#8B0000', width=2)
             
-            current_y = margin + 110 + 15
+            current_y = margin + 110
             
-            # 绘制规则列表
             for line in rule_lines:
+                if line == "":
+                    current_y += line_height // 2
+                    continue
                 distorted_line = self._distort_text(line, sanity)
                 
                 if sanity < 30 and random.random() < 0.3:
@@ -752,12 +790,11 @@ class AsyncImageGenerator:
                     draw.text((margin, current_y), distorted_line, fill='#FF0000', font=font_normal)
                 current_y += line_height
             
-            # 绘制通关条件
             if show_goal:
                 if rule_lines:
-                    current_y += 30
+                    current_y += 20
                     draw.line([(margin, current_y), (width - margin, current_y)], fill='#8B0000', width=2)
-                    current_y += section_height
+                    current_y += 28
 
                 for line in goal_lines:
                     distorted_line = self._distort_text(line, sanity)
@@ -765,9 +802,9 @@ class AsyncImageGenerator:
                     if sanity < 30 and random.random() < 0.3:
                         offset_x = random.randint(-3, 3)
                         offset_y = random.randint(-2, 2)
-                        draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#DC143C', font=font_subtitle)
+                        draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#DC143C', font=font_normal)
                     else:
-                        draw.text((margin, current_y), distorted_line, fill='#DC143C', font=font_subtitle)
+                        draw.text((margin, current_y), distorted_line, fill='#DC143C', font=font_normal)
                     current_y += line_height
         
         # 应用理智崩坏的视觉扭曲效果
@@ -797,7 +834,7 @@ class AsyncImageGenerator:
             cache_key = self._get_cache_key(
                 type="rules",
                 # 变更渲染算法时用于自动失效旧缓存
-                render_version="rules_wrap_v3",
+                render_version="rules_note_v5",
                 rules_title=rules_title,
                 rules=[str(r.get("text", str(r))) if isinstance(r, Mapping) else str(r) for r in rules],
                 win_condition=win_condition,
@@ -853,24 +890,20 @@ class AsyncImageGenerator:
         random_event: str | None,
         output_path: str | None = None,
     ) -> str:
-        """同步方法：生成行动结果长图（纯黑背景+鲜红字体）"""
+        """同步方法：生成行动结果长图（统一叙事正文）"""
         if output_path is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = str(self.output_dir / f"action_{timestamp}_{random.randint(1000, 9999)}.png")
 
         # 加载字体
-        font_title = self._get_font(self._font_path, 36)
         font_subtitle = self._get_font(self._font_path, 24)
         font_normal = self._get_font(self._font_path, 18)
 
         margin = 50
-        title_height = 80
         line_height = 34  # 增大行高，避免长文 + 扰动时出现视觉重叠
 
         width = 900
         line_available_width = width - margin * 2
-
-        _ = font_title
 
         # 理智崩坏模式（sanity=0）：只显示“对话/感受”，隐藏所有状态栏
         # TECHNICAL.md 设计：理智=0 时会出现“直接对话、否认死亡、诱导打破规则”的叙述风格。
@@ -908,78 +941,36 @@ class AsyncImageGenerator:
         def _wrap(text: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> list[str]:
             return self._wrap_text_by_width(str(text or ""), font, line_available_width)
 
-        content_lines: list[str] = []
-
-        if is_dead and not is_insane_mode:
-            content_lines.append(f"行动结果 - {user_name}")
-            content_lines.append("你已死亡！")
-
-            if scene_description:
-                content_lines.append("")
-                content_lines.append("场景描述：")
-                content_lines.extend(_wrap(scene_description, font_normal))
-
-            if action_feedback:
-                content_lines.append("")
-                content_lines.append("行动反馈：")
-                content_lines.extend(_wrap(action_feedback, font_normal))
-
-            content_lines.append("")
-            content_lines.append("你变成了怪谈的一部分。")
-
-        elif is_insane_mode:
-            # 理智崩坏模式：只显示场景描述和行动反馈（无标签/无状态栏/弱化死亡呈现）
-            if scene_description:
-                content_lines.extend(_wrap(scene_description, font_subtitle))
-                content_lines.append("")
-
-            if action_feedback:
-                content_lines.extend(_wrap(action_feedback, font_subtitle))
-                content_lines.append("")
-
-            if not content_lines:
-                content_lines.append("……")
-
+        if is_insane_mode:
+            narrative_parts = [
+                self._truncate_display_text(scene_description, max_chars=280),
+                self._truncate_display_text(action_feedback, max_chars=180),
+            ]
+            narrative_text = "\n".join(part for part in narrative_parts if part)
+            content_lines = _wrap(narrative_text or "……", font_subtitle)
         else:
-            content_lines.append(f"行动结果 - {user_name}")
-            content_lines.append("")
-            content_lines.append("场景描述：")
-            content_lines.extend(_wrap(scene_description, font_normal))
+            extra_parts: list[str] = []
+            if found_items:
+                extra_parts.append("你顺手带走了" + "、".join(str(item).strip() for item in found_items if str(item).strip()) + "。")
+            if found_clues:
+                extra_parts.append("你记下了" + "、".join(str(item).strip() for item in found_clues if str(item).strip()) + "。")
+            if new_location:
+                extra_parts.append(f"等你停下来时，人已经到了{new_location}。")
+            if random_event:
+                extra_parts.append(str(random_event).strip())
+            if is_dead:
+                extra_parts.append("你没能从这一回合里全身而退，怪谈已经把你吞了进去。")
 
-            if action_feedback:
-                content_lines.append("")
-                content_lines.append("行动反馈：")
-                content_lines.extend(_wrap(action_feedback, font_normal))
-
-            if not is_dead:
-                if found_items:
-                    content_lines.append("")
-                    content_lines.append("获得物品：")
-                    content_lines.extend(_wrap(', '.join(found_items), font_normal))
-
-                if found_clues:
-                    content_lines.append("")
-                    content_lines.append("获得线索：")
-                    content_lines.extend(_wrap(', '.join(found_clues), font_normal))
-
-                if new_location:
-                    content_lines.append("")
-                    content_lines.append("当前位置：")
-                    content_lines.extend(_wrap(new_location, font_normal))
-
-                if random_event:
-                    content_lines.append("")
-                    content_lines.append("环境事件：")
-                    content_lines.extend(_wrap(random_event, font_normal))
-
-                content_lines.append("")
-                content_lines.append("你存活了下来！继续探索吧。")
-            else:
-                content_lines.append("")
-                content_lines.append("你变成了怪谈的一部分。")
+            narrative_parts = [
+                self._truncate_display_text(scene_description, max_chars=320),
+                self._truncate_display_text(action_feedback, max_chars=180),
+                self._truncate_display_text(" ".join(part for part in extra_parts if part), max_chars=180),
+            ]
+            narrative_text = "\n".join(part for part in narrative_parts if part)
+            content_lines = _wrap(narrative_text or "四周暂时安静下来，但事情还没有结束。", font_normal)
 
         # 按实际绘制逻辑计算高度：空行只算半行，避免过高；也避免“预估不足导致挤压”
-        total_height = margin * 2 + title_height + 50
+        total_height = margin * 2 + 50
         for line in content_lines:
             total_height += (line_height // 2) if line == "" else line_height
 
@@ -1004,16 +995,6 @@ class AsyncImageGenerator:
 
             if is_insane_mode:
                 draw.text((base_x, base_y), distorted_line, fill='#8B0000', font=font_subtitle)
-            elif line.startswith("行动："):
-                draw.text((base_x, base_y), distorted_line, fill='#DC143C', font=font_subtitle)
-            elif line.startswith("你已死亡！"):
-                draw.text((base_x, base_y), distorted_line, fill='#FF0000', font=font_subtitle)
-            elif line.startswith(("场景描述：",)):
-                draw.text((base_x, base_y), distorted_line, fill='#DC143C', font=font_subtitle)
-            elif line.startswith(("行动反馈：", "获得物品：", "获得线索：", "当前位置：", "环境事件：")):
-                draw.text((base_x, base_y), distorted_line, fill='#DC143C', font=font_normal)
-            elif line.startswith("你存活了下来！"):
-                draw.text((base_x, base_y), distorted_line, fill='#DC143C', font=font_normal)
             else:
                 draw.text((base_x, base_y), distorted_line, fill='#FF0000', font=font_normal)
 
@@ -1278,207 +1259,7 @@ class AsyncImageGenerator:
         
         return result_path
 
-    # ==================== 场景结构文字长图（保持白底黑字）====================
-    
-    def _generate_scene_structure_text_image_sync(
-        self,
-        building_type: str,
-        overall_layout: str,
-        floors: Sequence[Mapping[str, JsonValue]],
-        connections: Sequence[str],
-        special_areas: Sequence[str],
-        output_path: str | None = None,
-    ) -> str:
-        """同步方法：生成场景结构文字长图（白底黑字，保持原样）"""
-        if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"scene_structure_text_{timestamp}.png")
-        
-        # 加载字体
-        font_title = self._get_font(self._font_path, 32)
-        font_subtitle = self._get_font(self._font_path, 24)
-        font_normal = self._get_font(self._font_path, 18)
-        
-        # 预估图片高度
-        margin = 30
-        title_height = 70
-        _ = title_height
-        section_height = 45
-        line_height = 28
-        line_length = 900 - 2 * margin
-        
-        # 统一复用引擎的按宽度换行（避免重复逻辑）
-        # 计算总体布局需要的行数
-        layout_lines = self._wrap_text_by_width(overall_layout, font_normal, line_length)
-
-        # 计算楼层布局需要的行数
-        floor_lines: list[str] = []
-        for floor in floors:
-            # 兼容两种字段名: floor/name 和 areas/rooms
-            floor_name_raw = floor.get("floor") or floor.get("name", "")
-            floor_name = str(floor_name_raw or "")
-
-            areas_raw = floor.get("areas") or floor.get("rooms") or []
-            areas_list: list[str] = []
-            if isinstance(areas_raw, list):
-                areas_list = [str(x) for x in areas_raw]
-            elif isinstance(areas_raw, str):
-                areas_list = [areas_raw]
-            elif areas_raw:
-                areas_list = [str(areas_raw)]
-
-            floor_text = f"  - {floor_name}: {', '.join(areas_list)}"
-            floor_lines.extend(self._wrap_text_by_width(floor_text, font_normal, line_length))
-
-        # 计算连接通道需要的行数
-        conn_text = f"连接通道：{', '.join(connections)}"
-        conn_lines = self._wrap_text_by_width(conn_text, font_normal, line_length)
-
-        # 计算特殊区域需要的行数
-        special_text = f"特殊区域：{', '.join(special_areas)}"
-        special_lines = self._wrap_text_by_width(special_text, font_normal, line_length)
-
-        # 计算建筑类型需要的行数（修复：添加换行处理）
-        building_type_text = f"建筑类型：{building_type}"
-        building_type_lines = self._wrap_text_by_width(building_type_text, font_subtitle, line_length)
-
-        # 计算总高度：按"实际绘制时的 y 递增逻辑"推导，避免漏算段落间距导致贴底
-        bottom_padding = 60
-        y = margin + 100  # 与绘制一致：分隔线之后开始
-
-        # 建筑类型（根据实际行数计算高度）
-        y += section_height
-        y += (len(building_type_lines) - 1) * line_height
-
-        # 总体布局：标题一行 + 标题后间距（合计一个 section_height 推进到内容起始）
-        y += section_height
-        y += len(layout_lines) * line_height
-
-        # 楼层布局
-        y += 20
-        y += section_height
-        y += len(floor_lines) * line_height
-
-        # 连接通道
-        y += 20
-        y += section_height
-        y += len(conn_lines) * line_height
-
-        # 特殊区域
-        y += 20
-        y += section_height
-        y += len(special_lines) * line_height
-
-        total_height = y + bottom_padding
-        
-        # 创建图片（白底黑字）
-        width = 900
-        img = Image.new('RGB', (width, total_height), color='#FFFFFF')
-        draw = ImageDraw.Draw(img)
-        
-        # 绘制标题（居中）
-        title_text = "场景结构"
-        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
-        title_width = title_bbox[2] - title_bbox[0]
-        title_x = (width - title_width) // 2
-        draw.text((title_x, margin), title_text, fill='#000000', font=font_title)
-        
-        # 绘制分隔线
-        draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#000000', width=2)
-        
-        # 绘制建筑类型（修复：支持多行显示）
-        current_y = margin + 100
-        for i, line in enumerate(building_type_lines):
-            draw.text((margin, current_y), line, fill='#000000', font=font_subtitle)
-            current_y += line_height if i < len(building_type_lines) - 1 else 0
-
-        # 绘制总体布局
-        current_y += section_height
-        draw.text((margin, current_y), "总体布局", fill='#000000', font=font_subtitle)
-        current_y += section_height
-        for line in layout_lines:
-            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
-            current_y += line_height
-        
-        # 绘制楼层布局
-        current_y += 20
-        draw.text((margin, current_y), "楼层布局", fill='#000000', font=font_subtitle)
-        current_y += section_height
-        for line in floor_lines:
-            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
-            current_y += line_height
-        
-        # 绘制连接通道
-        current_y += 20
-        draw.text((margin, current_y), "连接通道", fill='#000000', font=font_subtitle)
-        current_y += section_height
-        for line in conn_lines:
-            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
-            current_y += line_height
-        
-        # 绘制特殊区域
-        current_y += 20
-        draw.text((margin, current_y), "特殊区域", fill='#000000', font=font_subtitle)
-        current_y += section_height
-        for line in special_lines:
-            draw.text((margin, current_y), line, fill='#000000', font=font_normal)
-            current_y += line_height
-        
-        # 保存图片
-        img.save(output_path, 'PNG')
-        logger.info(f"场景结构文字长图已生成：{output_path}")
-        
-        return output_path
-
-    async def generate_scene_structure_text_image(
-        self,
-        building_type: str,
-        overall_layout: str,
-        floors: Sequence[Mapping[str, JsonValue]],
-        connections: Sequence[str],
-        special_areas: Sequence[str],
-        output_path: str | None = None,
-        use_cache: bool = True,
-    ) -> str:
-        """异步生成场景结构文字长图（支持缓存）"""
-        # 生成缓存键
-        cache_key = self._get_cache_key(
-            type="scene_structure",
-            # 变更高度/排版计算时用于自动失效旧缓存
-            render_version="scene_structure_v2",
-            building_type=building_type,
-            overall_layout=overall_layout,
-            floors=floors,
-            connections=connections,
-            special_areas=special_areas,
-        )
-        
-        # 检查缓存
-        if use_cache:
-            cached_path = self._get_cached_image(cache_key)
-            if cached_path:
-                return cached_path
-        
-        # 生成新图片
-        loop = asyncio.get_event_loop()
-        func = functools.partial(
-            self._generate_scene_structure_text_image_sync,
-            building_type=building_type,
-            overall_layout=overall_layout,
-            floors=floors,
-            connections=connections,
-            special_areas=special_areas,
-            output_path=output_path,
-        )
-        result_path = await loop.run_in_executor(self._executor, func)
-        
-        # 缓存图片
-        if use_cache:
-            self._cache_image(cache_key, result_path)
-        
-        return result_path
-
-    # ==================== 入场长图（入场描述 + NPC引导）====================
+    # ==================== 入场长图 ====================
     
     def _generate_entrance_long_image_sync(
         self,
@@ -1487,46 +1268,20 @@ class AsyncImageGenerator:
         npc_guidance: Mapping[str, JsonValue],
         output_path: str | None = None,
     ) -> str:
-        """同步方法：生成入场长图（入场描述 + NPC引导，合二为一）"""
-        _ = scene_name
+        """同步方法：生成入场长图（只展示统一开场正文）"""
         if output_path is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = str(self.output_dir / f"entrance_{timestamp}.png")
 
         # 加载字体
         font_title = self._get_font(self._font_path, 36)
-        font_subtitle = self._get_font(self._font_path, 28)
         font_normal = self._get_font(self._font_path, 20)
 
         margin = 60
         title_height = 80
-        section_height = 50
         line_height = 35  # 增加行高，避免字体重叠
-        char_per_line = 36  # 减少每行字符数，避免过于拥挤
 
-        _ = font_subtitle
-        _ = section_height
-        _ = char_per_line
-
-        # 获取NPC引导信息
-        guidance_method = str(npc_guidance.get("guidance_method", "natural_language") or "natural_language")
-        npc_name = str(npc_guidance.get("npc_name", "NPC") or "NPC")
-        npc_role = str(npc_guidance.get("npc_role", "") or "")
-        npc_attitude = str(npc_guidance.get("npc_attitude", "") or "")
-        npc_behavior = str(npc_guidance.get("npc_behavior", "") or "")
-        npc_dialogue = str(npc_guidance.get("npc_dialogue", "") or "")
-        rule_carrier_title = str(npc_guidance.get("rule_carrier_title", "") or "")
-        rule_carrier_description = str(npc_guidance.get("rule_carrier_description", "") or "")
-
-        # 根据guidance_method决定标题和内容
-        if guidance_method == "natural_language":
-            # 避免“某某的警告/指示”这类系统感过强的标题，优先显示人物本身
-            title = npc_name or "来者"
-            if npc_role and npc_role not in title:
-                title = f"{title} · {npc_role}"
-        else:
-            # 规则载体方式优先使用载体本身名称，而不是“某某的指示”
-            title = rule_carrier_title or (f"{npc_name}留下的东西" if npc_name else "留下的东西")
+        title = str(scene_name or "").strip() or "开场"
 
         # 创建图片（纯黑背景）
         width = 900
@@ -1536,46 +1291,10 @@ class AsyncImageGenerator:
         # 计算分割线之间的可用宽度（与分割线等长）
         line_available_width = width - margin * 2
         
-        # 构建内容
-        content_lines: list[str] = []
-
-        # 第一部分：入场描述（使用动态宽度换行）
-        entrance_lines = self._wrap_text_by_width(entrance_description, font_normal, line_available_width)
-        content_lines.extend(entrance_lines)
-        
-        content_lines.append("")  # 空行分隔
-        
-        # 第二部分：NPC行为描述（使用动态宽度换行）
-        if npc_behavior:
-            behavior_lines = self._wrap_text_by_width(npc_behavior, font_normal, line_available_width)
-            content_lines.extend(behavior_lines)
-            content_lines.append("")  # 空行分隔
-        
-        # 第三部分：NPC对话或规则载体描述
-        if guidance_method == "natural_language":
-            # 自然语言引导允许展示 NPC 原话，但这些内容只是剧情信息，
-            # 不应被系统自动视为“已确认规则”。
-            if npc_dialogue:
-                max_dialogue_chars = 800
-                dialogue_text = str(npc_dialogue)
-                if len(dialogue_text) > max_dialogue_chars:
-                    dialogue_text = dialogue_text[:max_dialogue_chars].rstrip() + "…"
-
-                dialogue_lines = self._wrap_text_by_width(dialogue_text, font_normal, line_available_width)
-                content_lines.extend(dialogue_lines)
-        else:
-            # 规则载体描述：同样避免过短截断导致信息缺失
-            if rule_carrier_description:
-                if rule_carrier_title:
-                    content_lines.extend(self._wrap_text_by_width(rule_carrier_title, font_normal, line_available_width))
-                    content_lines.append("")
-                max_carrier_chars = 600
-                carrier_text = str(rule_carrier_description)
-                if len(carrier_text) > max_carrier_chars:
-                    carrier_text = carrier_text[:max_carrier_chars].rstrip() + "…"
-
-                carrier_lines = self._wrap_text_by_width(carrier_text, font_normal, line_available_width)
-                content_lines.extend(carrier_lines)
+        # 只使用统一开场正文，不再拼接行为/台词/载体描述。
+        opening_text_source = entrance_description
+        entrance_text = self._truncate_display_text(opening_text_source, max_chars=360)
+        content_lines = self._wrap_text_by_width(entrance_text, font_normal, line_available_width)
 
         # 计算总高度
         total_height = margin * 2 + title_height + len(content_lines) * line_height + 50
@@ -1617,7 +1336,7 @@ class AsyncImageGenerator:
         output_path: str | None = None,
         use_cache: bool = True,
     ) -> str:
-        """异步生成入场长图（入场描述 + NPC引导，支持缓存）
+        """异步生成入场长图（统一开场正文，支持缓存）
         
         Args:
             scene_name: 场景名称
@@ -1632,8 +1351,8 @@ class AsyncImageGenerator:
         # 生成缓存键
         cache_key = self._get_cache_key(
             type="entrance_long",
-            # 变更排版/截断策略时用于自动失效旧缓存
-            render_version="entrance_long_v3",
+            # 变更展示策略时用于自动失效旧缓存
+            render_version="entrance_long_v6",
             scene_name=scene_name,
             entrance_description=entrance_description,
             npc_guidance=npc_guidance,
@@ -1657,6 +1376,90 @@ class AsyncImageGenerator:
         result_path = await loop.run_in_executor(self._executor, func)
 
         # 缓存图片
+        if use_cache:
+            self._cache_image(cache_key, result_path)
+
+        return result_path
+
+    # ==================== 场景概览长图 ====================
+
+    def _generate_scene_overview_image_sync(
+        self,
+        overview_title: str,
+        overview_text: str,
+        output_path: str | None = None,
+    ) -> str:
+        """同步方法：生成场景概览长图。"""
+        if output_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = str(self.output_dir / f"scene_overview_{timestamp}.png")
+
+        font_title = self._get_font(self._font_path, 32)
+        font_normal = self._get_font(self._font_path, 20)
+
+        margin = 60
+        title_height = 80
+        line_height = 35
+        width = 900
+        line_available_width = width - margin * 2
+
+        title = str(overview_title or "").strip() or "此刻你能确认的情况"
+        content_text = self._truncate_display_text(overview_text, max_chars=520)
+        content_lines = self._wrap_text_by_width(content_text, font_normal, line_available_width)
+
+        total_height = margin * 2 + title_height + len(content_lines) * line_height + 50
+
+        img = Image.new("RGB", (width, total_height), color="#000000")
+        draw = ImageDraw.Draw(img)
+
+        title_bbox = draw.textbbox((0, 0), title, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, margin), title, fill="#8B0000", font=font_title)
+
+        draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill="#8B0000", width=2)
+
+        current_y = margin + 110
+        for line in content_lines:
+            if line == "":
+                current_y += line_height // 2
+                continue
+            draw.text((margin, current_y), line, fill="#FF0000", font=font_normal)
+            current_y += line_height
+
+        img.save(output_path, "PNG")
+        logger.info(f"场景概览长图已生成：{output_path}")
+        return output_path
+
+    async def generate_scene_overview_image(
+        self,
+        overview_title: str,
+        overview_text: str,
+        output_path: str | None = None,
+        use_cache: bool = True,
+    ) -> str:
+        """异步生成场景概览长图（支持缓存）。"""
+        cache_key = self._get_cache_key(
+            type="scene_overview",
+            render_version="scene_overview_v1",
+            overview_title=overview_title,
+            overview_text=overview_text,
+        )
+
+        if use_cache:
+            cached_path = self._get_cached_image(cache_key)
+            if cached_path:
+                return cached_path
+
+        loop = asyncio.get_event_loop()
+        func = functools.partial(
+            self._generate_scene_overview_image_sync,
+            overview_title=overview_title,
+            overview_text=overview_text,
+            output_path=output_path,
+        )
+        result_path = await loop.run_in_executor(self._executor, func)
+
         if use_cache:
             self._cache_image(cache_key, result_path)
 

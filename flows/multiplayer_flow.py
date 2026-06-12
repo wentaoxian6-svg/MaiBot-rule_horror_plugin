@@ -422,32 +422,23 @@ class MultiplayerFlow:
             await self.command._send_image_path(entrance_long_image)
             await asyncio.sleep(1.0)
 
+        scene_overview = self.command._build_scene_overview_text(session, plural=True)
+        if scene_overview:
+            scene_overview_image = await image_generator.generate_scene_overview_image(
+                overview_title="此刻你们能确认的情况",
+                overview_text=scene_overview,
+                use_cache=use_cache,
+            )
+            await self.command._send_image_path(scene_overview_image)
+            await asyncio.sleep(1.0)
+
         await self.command._send_initial_rule_exposure(session, GameModes.MULTI.value, lobby_players)
         await asyncio.sleep(1.0)
 
-        scene_structure = getattr(session, "scene_structure", {}) or {}
-        if scene_structure:
-            scene_structure_image = await image_generator.generate_scene_structure_text_image(
-                building_type=scene_structure.get("building_type", "未知建筑"),
-                overall_layout=scene_structure.get("overall_layout", "未知布局"),
-                floors=scene_structure.get("floors", []),
-                connections=scene_structure.get("connections", []),
-                special_areas=scene_structure.get("special_areas", []),
-                use_cache=use_cache,
-            )
-            await self.command._send_image_path(scene_structure_image)
-            await asyncio.sleep(0.5)
-
         players_disp = "、".join([p.name for p in session.players.values()]) if session.players else "（无）"
         await self.command.send_text(
-            f"**游戏已开始！**\n\n"
-            f"模式：{GameModes.MULTI.value}\n"
-            f"场景：{session.scene_name}\n"
-            f"玩家：{players_disp}\n\n"
-            f"`/rg 行动 <描述>` - 进行行动\n"
-            f"`/rg 推理 <内容>` - 记录推理\n"
-            f"`/rg 记录规则 <内容>` - 记录规则笔记\n"
-            f"`/rg 状态` - 查看状态"
+            f"{players_disp} 都已经被卷进了《{session.scene_name}》。\n\n"
+            "接下来直接用 `/rg 行动 <描述>` 推进；如果想重新确认局势，可以随时看 `/rg 状态`、`/rg 规则`、`/rg 场景`。"
         )
 
     def _create_lobby(

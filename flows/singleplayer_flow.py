@@ -184,28 +184,22 @@ class SingleplayerFlow:
             await self.command._send_image_path(entrance_long_image)
             await asyncio.sleep(1.0)
 
+        player = session.players.get(user_id)
+        current_location = str(getattr(player, "location", "") or "").strip() if player else ""
+        scene_overview = self.command._build_scene_overview_text(session, current_location=current_location)
+        if scene_overview:
+            scene_overview_image = await image_generator.generate_scene_overview_image(
+                overview_title="此刻你能确认的情况",
+                overview_text=scene_overview,
+                use_cache=use_cache,
+            )
+            await self.command._send_image_path(scene_overview_image)
+            await asyncio.sleep(1.0)
+
         await self.command._send_initial_rule_exposure(session, GameModes.SINGLE.value, [])
         await asyncio.sleep(1.0)
 
-        scene_structure = getattr(session, "scene_structure", {}) or {}
-        if scene_structure:
-            scene_structure_image = await image_generator.generate_scene_structure_text_image(
-                building_type=scene_structure.get("building_type", "未知建筑"),
-                overall_layout=scene_structure.get("overall_layout", "未知布局"),
-                floors=scene_structure.get("floors", []),
-                connections=scene_structure.get("connections", []),
-                special_areas=scene_structure.get("special_areas", []),
-                use_cache=use_cache,
-            )
-            await self.command._send_image_path(scene_structure_image)
-            await asyncio.sleep(0.5)
-
         await self.command.send_text(
-            f"**游戏已开始！**\n\n"
-            f"模式：{GameModes.SINGLE.value}\n"
-            f"场景：{session.scene_name}\n\n"
-            f"`/rg 行动 <描述>` - 进行行动\n"
-            f"`/rg 推理 <内容>` - 记录推理\n"
-            f"`/rg 记录规则 <内容>` - 记录规则笔记\n"
-            f"`/rg 状态` - 查看状态"
+            "故事已经开始。\n\n"
+            "接下来直接用 `/rg 行动 <描述>` 往前走就行；如果想重新整理手头信息，可以用 `/rg 状态`、`/rg 规则`、`/rg 场景`。"
         )
