@@ -13,18 +13,107 @@ logger = logging.getLogger(__name__)
 class RuntimeSupportMixin:
     """运行时辅助与规则载体/NPC 相关工具。"""
 
-    def _has_opening_guidance(self, session: GameSession) -> bool:
-        """判断当前开场是否需要展示 NPC/载体引导段落。"""
-        npc_guidance = getattr(session, "npc_guidance", {}) or {}
-        if not isinstance(npc_guidance, Mapping) or not npc_guidance:
-            return False
-        guidance_method = str(npc_guidance.get("guidance_method", "") or "").strip().lower()
-        if guidance_method == "none":
-            return False
-        return any(
-            str(npc_guidance.get(key, "") or "").strip()
-            for key in ("npc_behavior", "npc_dialogue", "rule_carrier_title", "rule_carrier_description")
+    @staticmethod
+    def _join_cn_items(items: list[str], limit: int = 4) -> str:
+        """将若干短语拼接成更自然的中文列举。"""
+        cleaned = [str(item).strip() for item in items if str(item).strip()]
+        if not cleaned:
+            return ""
+        visible = cleaned[:limit]
+        if len(visible) == 1:
+            return visible[0]
+        if len(visible) == 2:
+            return f"{visible[0]}和{visible[1]}"
+        return "、".join(visible[:-1]) + f"和{visible[-1]}"
+
+    def _collect_scene_area_names(self, session: GameSession) -> list[str]:
+        """从场景结构里收集可供叙事使用的区域名。"""
+        scene_structure = getattr(session, "scene_structure", {}) or {}
+        if not isinstance(scene_structure, Mapping):
+            return []
+
+        names: list[str] = []
+        floors = scene_structure.get("floors", [])
+        if isinstance(floors, list):
+            for floor in floors:
+                if not isinstance(floor, Mapping):
+                    continue
+                areas = floor.get("areas") or floor.get("rooms") or []
+                if isinstance(areas, list):
+                    names.extend(str(area).strip() for area in areas if str(area).strip())
+
+        special_areas = scene_structure.get("special_areas", [])
+        if isinstance(special_areas, list):
+            names.extend(str(area).strip() for area in special_areas if str(area).strip())
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            key = re.sub(r"\s+", "", name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(name)
+        return deduped
+
+    def _build_scene_overview_text(
+        self,
+        session: GameSession,
+        *,
+        current_location: str = "",
+        plural: bool = False,
+    ) -> str:
+        """将内部结构化场景转换成更自然的玩家可见文本。"""
+        scene_structure = getattr(session, "scene_structure", {}) or {}
+        if not isinstance(scene_structure, Mapping):
+            scene_structure = {}
+
+        viewpoint = "你们" if plural else "你"
+        scene_name = str(getattr(session, "scene_name", "") or "这里").strip() or "这里"
+        building_type = str(scene_structure.get("building_type", "") or "").strip()
+        overall_layout = str(scene_structure.get("overall_layout", "") or "").strip()
+        scene_impression = str(scene_structure.get("scene_impression", "") or "").strip()
+        exploration_hint = str(scene_structure.get("exploration_hint", "") or "").strip()
+        area_names = self._collect_scene_area_names(session)
+        area_text = self._join_cn_items(area_names, limit=5)
+        special_areas = scene_structure.get("special_areas", [])
+        special_text = self._join_cn_items(
+            [str(area).strip() for area in special_areas if str(area).strip()] if isinstance(special_areas, list) else [],
+            limit=3,
         )
+
+        paragraphs: list[str] = []
+        if scene_impression:
+            paragraphs.append(scene_impression)
+        else:
+            intro_parts = [f"{scene_name}"]
+            if building_type:
+                intro_parts.append(f"更像一处{building_type}")
+            if overall_layout:
+                intro_parts.append(f"整体呈{overall_layout}")
+            intro = "，".join(intro_parts)
+            paragraphs.append(f"{viewpoint}重新打量四周时，最先感受到的是{intro}带来的压迫感。")
+
+        if current_location:
+            paragraphs.append(f"此刻{viewpoint}大概正停在{current_location}附近，能活动的范围还没有完全摸清。")
+        elif area_text:
+            paragraphs.append(f"从眼下能确认的范围来看，这地方至少牵扯到{area_text}这些区域。")
+
+        if special_text:
+            paragraphs.append(f"真正让人不太放心的，往往是{special_text}这些位置，它们像被刻意从正常秩序里剥离了出去。")
+
+        if exploration_hint:
+            paragraphs.append(exploration_hint)
+
+        return "\n\n".join(part for part in paragraphs if part.strip())
+
+    def _has_opening_guidance(self, session: GameSession) -> bool:
+        """判断当前是否有可展示的统一开场正文。"""
+        env_state = getattr(session, "environment_state", {}) or {}
+        if not isinstance(env_state, Mapping):
+            return False
+        entrance_description = str(env_state.get("entrance_description", "")).strip()
+        return bool(entrance_description)
 
     def _get_game_generator(self) -> GameGenerator:
         """获取或创建 GameGenerator（延迟初始化）"""
@@ -555,6 +644,27 @@ class RuntimeSupportMixin:
             npc.danger_level = str(raw_npc.get("danger_level", "低") or "低").strip()
             npc.can_speak = bool(raw_npc.get("can_speak", True))
 
+            def _clamp_ratio(value: object, default: float) -> float:
+                if isinstance(value, bool):
+                    return 1.0 if value else 0.0
+                if isinstance(value, (int, float)):
+                    return max(0.0, min(1.0, float(value)))
+                if isinstance(value, str):
+                    try:
+                        return max(0.0, min(1.0, float(value.strip())))
+                    except Exception:
+                        return default
+                return default
+
+            npc.knowledge_reliability = _clamp_ratio(raw_npc.get("knowledge_reliability", 0.75), 0.75)
+            npc.deception_tendency = _clamp_ratio(raw_npc.get("deception_tendency", 0.1), 0.1)
+            npc.corruption_level = _clamp_ratio(raw_npc.get("corruption_level", 0.0), 0.0)
+            npc.current_state = str(raw_npc.get("current_state", "稳定") or "稳定").strip()
+            bias_tags = raw_npc.get("bias_tags", [])
+            npc.bias_tags = [str(item).strip() for item in bias_tags if str(item).strip()] if isinstance(bias_tags, list) else []
+            known_rule_ids = raw_npc.get("known_rule_ids", [])
+            npc.known_rule_ids = [str(item).strip() for item in known_rule_ids if str(item).strip()] if isinstance(known_rule_ids, list) else []
+
             memory = NPCMemory()
             if game_mode == GameModes.SINGLE.value and initial_player_id:
                 memory.initialize_attitude_vector(initial_player_id)
@@ -728,9 +838,14 @@ class RuntimeSupportMixin:
             location = str(carrier.get("location", "") or "").strip()
             description = str(carrier.get("description", "") or "").strip()
             rules = carrier.get("revealed_rules", [])
-            rule_lines = [f"- {str(item).strip()}" for item in rules if str(item).strip()] if isinstance(rules, list) else []
+            rule_lines = [f"“{str(item).strip()}”" for item in rules if str(item).strip()] if isinstance(rules, list) else []
             header = f"你在{location}发现了《{title}》。" if location else f"你发现了《{title}》。"
-            body = "\n".join([description] + rule_lines).strip()
+            body_parts: list[str] = []
+            if description:
+                body_parts.append(description)
+            if rule_lines:
+                body_parts.append("你从上面记下来的几句要紧内容是：" + "；".join(rule_lines))
+            body = "\n".join(body_parts).strip()
             sections.append(f"{header}\n{body}".strip())
         return "\n\n".join(section for section in sections if section.strip())
 
@@ -740,7 +855,7 @@ class RuntimeSupportMixin:
         game_mode: str,
         lobby_players: list[tuple[str, str]],
     ) -> None:
-        """按玩法发送初始规则载体，并在最后发送目标图。"""
+        """按玩法发送初始规则载体，并在最后发送目标长图。"""
         image_generator = self.get_image_generator()
 
         npc_guidance = getattr(session, "npc_guidance", {}) or {}
@@ -801,13 +916,14 @@ class RuntimeSupportMixin:
                             )
                             await self._send_image_path(rules_image)
 
-        goal_image = await image_generator.generate_rules_image(
-            rules_title="目标",
-            rules=[],
-            win_condition=session.win_condition,
-            game_mode=game_mode,
-        )
-        await self._send_image_path(goal_image)
+        if str(session.win_condition or "").strip():
+            goal_image = await image_generator.generate_rules_image(
+                rules_title="你该记住的事",
+                rules=[],
+                win_condition=session.win_condition,
+                game_mode=game_mode,
+            )
+            await self._send_image_path(goal_image)
 
     async def _send_image_path(self, image_path: str) -> None:
         """读取图片文件并发送（base64）。"""
@@ -829,19 +945,31 @@ class RuntimeSupportMixin:
         self,
         session: GameSession
     ) -> str:
-        """生成入场描述
+        """生成统一的开场正文。
         
         Args:
             session: 游戏会话
         
         Returns:
-            入场描述文本
+            开场正文
         """
         llm_client = LLMClient()
-        guidance_method = ""
         npc_guidance = getattr(session, "npc_guidance", {}) or {}
+        guidance_method = ""
+        npc_name = ""
+        npc_role = ""
+        npc_behavior = ""
+        npc_dialogue = ""
+        rule_carrier_title = ""
+        rule_carrier_description = ""
         if isinstance(npc_guidance, Mapping):
             guidance_method = str(npc_guidance.get("guidance_method", "") or "").strip().lower()
+            npc_name = str(npc_guidance.get("npc_name", "") or "").strip()
+            npc_role = str(npc_guidance.get("npc_role", "") or "").strip()
+            npc_behavior = str(npc_guidance.get("npc_behavior", "") or "").strip()
+            npc_dialogue = str(npc_guidance.get("npc_dialogue", "") or "").strip()
+            rule_carrier_title = str(npc_guidance.get("rule_carrier_title", "") or "").strip()
+            rule_carrier_description = str(npc_guidance.get("rule_carrier_description", "") or "").strip()
 
         plural_hint = ""
         default_entrance = f"你来到了{session.scene_name}。这里的气氛让你感到不安。"
@@ -854,18 +982,22 @@ class RuntimeSupportMixin:
             else:
                 default_entrance = f"你在{session.scene_name}里醒来，四周空无一人。短暂的恍惚过去后，你才意识到这里安静得有些不正常。"
 
-        system_prompt = f"""你是规则怪谈游戏的入场描述生成器。你需要生成玩家进入场景时的描述。
+        system_prompt = f"""你是规则怪谈游戏的开场正文生成器。你需要把玩家刚进入场景时发生的事写成一段完整、自然、统一的正文。
 
-入场描述要求：
-1. 描述玩家如何到达这个场景
-2. 描述玩家进入场景时的第一印象
-3. 描述玩家进入时的感受
-4. 描述环境的初始状态
-5. 使用感官细节（视觉、听觉、嗅觉、触觉）
-6. 营造紧张和不安的氛围
-7. 长度：150-200字{plural_hint}
-8. 如果当前开场没有 NPC 出场，应把重点放在“玩家在空无一人的地方醒来或恢复意识后，独自观察环境并意识到异常”上
-9. 不要写成系统提示、玩法说明或任务清单
+要求：
+1. 只能输出一整段连续正文，不要分段标题，不要把“环境”“动作”“台词”拆成几段。
+2. 这段正文应该像小说开场片段，而不是说明书、交接稿、玩法提示或剪贴拼接。
+3. 如果有 NPC 或纸面载体参与开场，也要自然融进同一段正文里，不要像“先写行为，再写台词，再写说明”那样机械组合。
+4. NPC 说话必须像真人在当下情境里会说的话，允许含糊、跳跃、急躁、敷衍、停顿，但不要长篇大论。
+5. 不要列事项，不要编号，不要总结，不要出现“接下来”“以下规则”“记住了”这类教程口吻。
+6. 要写出现场的气味、光线、声音、人的动作和玩家当下的感受。
+7. 长度：160-240字{plural_hint}
+8. 如果当前开场没有 NPC，就写“玩家独自或一行人醒来/进入后感到异常”的场景，不要硬造说话的人。
+9. 如果当前开场有 NPC，重点是“这一刻发生了什么”，不是“把所有该说的话一次说完”。
+10. 最终读起来必须像同一时刻发生的一件事，而不是几个字段拼起来的组合文本。
+11. 必须使用正常、自然的中文标点，不要把整段写成一长串逗号连接的信息块。
+12. 至少要明确三件事：玩家此刻身在何处、眼前的人或物正在做什么、此刻最先感到的不对劲是什么。
+13. 如果出现提醒或规矩，只能自然带过一件最要紧的，不要一下塞进很多条。
 
 返回纯文本，不要JSON格式。"""
 
@@ -878,7 +1010,15 @@ class RuntimeSupportMixin:
 
 开场类型：{"无NPC开场，玩家独自或一行人醒来后自行探索" if guidance_method == "none" else "存在NPC或载体参与的开场"}
 
-请生成入场描述。"""
+NPC/载体参考信息（仅作素材，不要逐项照抄，不要拼贴）：
+- NPC姓名：{npc_name}
+- NPC角色：{npc_role}
+- 眼前动作：{npc_behavior}
+- NPC原话：{npc_dialogue}
+- 载体名称：{rule_carrier_title}
+- 载体出现方式：{rule_carrier_description}
+
+请生成统一的开场正文。"""
 
         try:
             response = await llm_client.call(

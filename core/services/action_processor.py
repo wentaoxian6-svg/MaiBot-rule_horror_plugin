@@ -14,7 +14,7 @@ from ...systems.room_topology import build_room_graph, can_hear_between_rooms, g
 from ..config import get_config
 from ..llm.client import LLMClient, get_default_max_tokens
 
-from ..game.models import GameSession, GameStatus, Player, PlayerStatus
+from ..game.models import GameSession, GameStatus, Player, PlayerStatus, Rule
 from .item_manager import ItemManager
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,32 @@ class ActionProcessor:
     @staticmethod
     def _normalize_rule_text_for_dedup(text: str) -> str:
         return re.sub(r"\s+", "", str(text or "").strip()).lower()
+
+    @staticmethod
+    def _clamp_ratio(value: object, default: float) -> float:
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return max(0.0, min(1.0, float(value)))
+        if isinstance(value, str):
+            try:
+                return max(0.0, min(1.0, float(value.strip())))
+            except Exception:
+                return default
+        return default
+
+    def _get_session_rule_objects(self, session: GameSession) -> list[Rule]:
+        return [Rule.from_dict(rule, index) for index, rule in enumerate(session.rules or [])]
+
+    def _get_runtime_npc_profile(self, npc: JsonObject) -> JsonObject:
+        return {
+            "knowledge_reliability": self._clamp_ratio(npc.get("knowledge_reliability"), 0.75),
+            "deception_tendency": self._clamp_ratio(npc.get("deception_tendency"), 0.1),
+            "corruption_level": self._clamp_ratio(npc.get("corruption_level"), 0.0),
+            "current_state": str(npc.get("current_state", "稳定") or "稳定").strip(),
+            "bias_tags": [str(item).strip() for item in npc.get("bias_tags", []) if str(item).strip()] if isinstance(npc.get("bias_tags", []), list) else [],
+            "known_rule_ids": [str(item).strip() for item in npc.get("known_rule_ids", []) if str(item).strip()] if isinstance(npc.get("known_rule_ids", []), list) else [],
+        }
 
     def _record_rule_texts(self, player: Player, rule_texts: list[str]) -> int:
         merged_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
@@ -424,6 +450,7 @@ class ActionProcessor:
 
         # 载入/初始化记忆
         mem = NPCMemory.from_dict(target.get("memory", {}) if isinstance(target.get("memory"), dict) else {})
+        npc_profile = self._get_runtime_npc_profile(target)
         pid = str(player.player_id)
         mem.initialize_attitude_vector(pid)
 
@@ -483,32 +510,41 @@ class ActionProcessor:
 
         if not asking_rules:
             # 普通搭话：依据态度给一句“像人”的回应（不强行输出规则）
+            state_note = ""
+            if float(npc_profile.get("corruption_level", 0.0) or 0.0) >= 0.6:
+                state_note = "他的瞳孔像是短暂失了焦，语尾也有些飘。"
+            elif str(npc_profile.get("current_state", "")) in {"紧张", "戒备"}:
+                state_note = "他像一直在留意四周的动静，说话前先停顿了一下。"
             if help_level == 0:
                 if attitude == NPCAttitude.HOSTILE:
-                    text = f"你试着向{loc}的{name}搭话。他抬眼看了你一下，目光像钉子：『别挡路。』"
+                    text = f"你试着向{loc}的{name}搭话。{state_note}他抬眼看了你一下，目光像钉子：『别挡路。』"
                 elif attitude == NPCAttitude.SUSPICIOUS:
-                    text = f"你试着向{loc}的{name}搭话。他没有立刻回答，只反问：『你问这个干什么？』"
+                    text = f"你试着向{loc}的{name}搭话。{state_note}他没有立刻回答，只反问：『你问这个干什么？』"
                 else:
-                    text = f"你试着向{loc}的{name}搭话。他像是在听远处的动静，只敷衍地嗯了一声。"
+                    text = f"你试着向{loc}的{name}搭话。{state_note}他像是在听远处的动静，只敷衍地嗯了一声。"
             else:
                 npc_dialogue = str((session.npc_guidance or {}).get("npc_dialogue") or "").strip()
                 if npc_dialogue:
-                    text = f"你试着向{loc}的{name}搭话。{name}低声道：『{npc_dialogue}』"
+                    text = f"你试着向{loc}的{name}搭话。{state_note}{name}低声道：『{npc_dialogue}』"
                 else:
-                    text = f"你试着向{loc}的{name}搭话。他压低嗓音：『别大声。这里不喜欢热闹。』"
+                    text = f"你试着向{loc}的{name}搭话。{state_note}他压低嗓音：『别大声。这里不喜欢热闹。』"
             return ActionResult(description=text)
 
-        # 询问规则：根据态度决定是否补充新的玩家规则笔记
+        # 询问规则：把“愿不愿意说”和“说得靠不靠谱”分开处理
         recorded_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
         recorded_rule_keys = {self._normalize_rule_text_for_dedup(rule) for rule in recorded_rules if rule}
-        all_rules: list[str] = [r.get("text", str(r)) for r in (session.rules or [])]
-        unknown = [
-            i
-            for i, rule_text in enumerate(all_rules)
-            if self._normalize_rule_text_for_dedup(rule_text) not in recorded_rule_keys
+        unknown_rules = [
+            rule
+            for rule in self._get_session_rule_objects(session)
+            if self._normalize_rule_text_for_dedup(rule.surface_text) not in recorded_rule_keys
         ]
+        known_rule_ids = {str(rule_id).strip() for rule_id in npc_profile.get("known_rule_ids", []) if str(rule_id).strip()}
+        if known_rule_ids:
+            prioritized = [rule for rule in unknown_rules if rule.rule_id in known_rule_ids]
+            remaining = [rule for rule in unknown_rules if rule.rule_id not in known_rule_ids]
+            unknown_rules = prioritized + remaining
 
-        if help_level == 0 or not unknown:
+        if help_level == 0 or not unknown_rules:
             if attitude == NPCAttitude.HOSTILE:
                 text = f"你压低声音向{loc}的{name}问起规矩。他的手指停在台面上，冷冷地敲了两下：『我没义务教你。』"
             elif attitude == NPCAttitude.SUSPICIOUS:
@@ -517,29 +553,65 @@ class ActionProcessor:
                 text = f"你压低声音向{loc}的{name}问起规矩。他摇了摇头：『现在不方便。』"
             return ActionResult(description=text)
 
-        reveal_count = min(help_level, len(unknown))
-        newly = unknown[:reveal_count]
-        new_rule_texts = [all_rules[idx].strip() for idx in newly if all_rules[idx].strip()]
-        self._record_rule_texts(player, new_rule_texts)
+        reliability = float(npc_profile.get("knowledge_reliability", 0.75) or 0.75)
+        deception = float(npc_profile.get("deception_tendency", 0.1) or 0.1)
+        corruption = float(npc_profile.get("corruption_level", 0.0) or 0.0)
+        truthfulness = max(0.0, min(1.0, reliability * (1.0 - deception * 0.7) * (1.0 - corruption * 0.8)))
+
+        false_rules = [rule for rule in unknown_rules if rule.truth_status == "false" or rule.is_authentic is False]
+        true_rules = [rule for rule in unknown_rules if rule not in false_rules]
+        if not true_rules:
+            true_rules = unknown_rules
+
+        reveal_count = min(help_level, len(true_rules))
+        recordable_rule_texts: list[str] = []
+        spoken_parts: list[str] = []
+        source_hint = ""
+        bias_tags = npc_profile.get("bias_tags", [])
+        if isinstance(bias_tags, list) and bias_tags:
+            source_hint = f"带着明显的{'、'.join(str(tag) for tag in bias_tags[:2])}口吻，"
 
         def cn_num(n: int) -> str:
             table = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
             return table[n - 1] if 1 <= n <= len(table) else str(n)
 
-        parts: list[str] = []
-        for j, rule_text in enumerate(new_rule_texts, 1):
-            if rule_text:
-                parts.append(f"第{cn_num(j)}，{rule_text}")
+        if truthfulness >= 0.72:
+            for j, rule in enumerate(true_rules[:reveal_count], 1):
+                if rule.surface_text:
+                    spoken_parts.append(f"第{cn_num(j)}，{rule.surface_text}")
+                    recordable_rule_texts.append(rule.surface_text)
+        elif truthfulness >= 0.45:
+            if true_rules:
+                rule = true_rules[0]
+                spoken_parts.append(f"我记得比较像是“{rule.surface_text}”，但你最好再找纸面记录核对一遍")
+            if false_rules and (deception >= 0.35 or corruption >= 0.35):
+                spoken_parts.append(f"也有人说过“{false_rules[0].surface_text}”，不过我不保证")
+        else:
+            rumor_pool = false_rules or unknown_rules
+            if rumor_pool:
+                rumor_rule = rumor_pool[0]
+                spoken_parts.append(f"他压低声音，{source_hint}只丢给你一句：『{rumor_rule.surface_text}』")
+
+        if not spoken_parts:
+            text = f"你压低声音向{loc}的{name}问起规矩。他皱了皱眉：『我现在也说不准，你最好自己去核对留下来的记录。』"
+            return ActionResult(description=text)
+
+        if recordable_rule_texts:
+            self._record_rule_texts(player, recordable_rule_texts)
 
         prefix = "你压低声音向{loc}的{name}问起剩下的规矩。".format(loc=loc, name=name)
-        if help_level >= 3:
+        if recordable_rule_texts and help_level >= 3:
             mid = "他像是权衡了几秒，终于把话说得更明白："
-        elif help_level == 2:
+        elif recordable_rule_texts and help_level == 2:
             mid = "他不耐烦地叹了口气，还是补了两句："
+        elif truthfulness >= 0.45:
+            mid = "他迟疑了很久，说出来的话像是在回忆，也像是在自我纠正："
         else:
-            mid = "他犹豫了一下，只补了一条："
+            mid = "他神色古怪地看了你一眼，只吐出一句听上去并不那么可靠的话："
 
-        text = f"{prefix}{mid}『{'；'.join(parts)}』"
+        text = f"{prefix}{mid}『{'；'.join(spoken_parts)}』"
+        if not recordable_rule_texts:
+            text += " 这更像一条口头情报，你觉得还需要再找别的来源确认。"
         return ActionResult(description=text)
 
     def _update_environment_memory(self, action: str, player: Player, session: GameSession) -> None:

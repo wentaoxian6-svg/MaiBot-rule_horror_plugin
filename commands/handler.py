@@ -44,7 +44,7 @@ class RuleHorrorCommand(SessionRuntimeMixin, RuntimeSupportMixin, SharedCommandH
         "/rg 状态 - 查看游戏状态\n"
         "/rg 剧情 - 查看剧情导入\n"
         "/rg 规则 - 查看你记录下来的规则\n"
-        "/rg 场景 - 查看场景结构\n"
+        "/rg 场景 - 回看你对场景的整体印象\n"
         "/rg 道具 [道具名称] - 查看道具列表或详情\n"
         "/rg 提示 <规则/线索> - 获取提示\n"
         "/rg 推理 <推理内容> - 记录推理\n"

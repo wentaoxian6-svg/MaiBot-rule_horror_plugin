@@ -452,6 +452,12 @@ class NPC:
         self.can_move: bool = True
         self.can_speak: bool = True
         self.danger_level: str = "低"
+        self.knowledge_reliability: float = 0.75
+        self.deception_tendency: float = 0.1
+        self.corruption_level: float = 0.0
+        self.current_state: str = "稳定"
+        self.bias_tags: list[str] = []
+        self.known_rule_ids: list[str] = []
         self.dialogue_history: list[dict[str, object]] = []
         self.max_dialogue_history: int = 50  # 最大对话历史记录数
         self.target_location: str | None = None
@@ -730,6 +736,12 @@ class NPC:
             "can_move": self.can_move,
             "can_speak": self.can_speak,
             "danger_level": self.danger_level,
+            "knowledge_reliability": self.knowledge_reliability,
+            "deception_tendency": self.deception_tendency,
+            "corruption_level": self.corruption_level,
+            "current_state": self.current_state,
+            "bias_tags": self.bias_tags,
+            "known_rule_ids": self.known_rule_ids,
             "dialogue_history": self.dialogue_history,
             "target_location": self.target_location,
             "current_behavior": self.current_behavior.value if self.current_behavior else None
@@ -738,6 +750,18 @@ class NPC:
     @classmethod
     def from_dict(cls, data: JsonObject) -> "NPC":
         """从字典反序列化"""
+        def _clamp_ratio(value: object, default: float) -> float:
+            if isinstance(value, bool):
+                return 1.0 if value else 0.0
+            if isinstance(value, (int, float)):
+                return max(0.0, min(1.0, float(value)))
+            if isinstance(value, str):
+                try:
+                    return max(0.0, min(1.0, float(value.strip())))
+                except Exception:
+                    return default
+            return default
+
         npc = cls(
             data["npc_id"],
             data["name"],
@@ -765,6 +789,14 @@ class NPC:
         npc.can_move = data.get("can_move", True)
         npc.can_speak = data.get("can_speak", True)
         npc.danger_level = data.get("danger_level", "低")
+        npc.knowledge_reliability = _clamp_ratio(data.get("knowledge_reliability"), 0.75)
+        npc.deception_tendency = _clamp_ratio(data.get("deception_tendency"), 0.1)
+        npc.corruption_level = _clamp_ratio(data.get("corruption_level"), 0.0)
+        npc.current_state = str(data.get("current_state", "稳定") or "稳定")
+        bias_tags = data.get("bias_tags", [])
+        npc.bias_tags = [str(item).strip() for item in bias_tags if str(item).strip()] if isinstance(bias_tags, list) else []
+        known_rule_ids = data.get("known_rule_ids", [])
+        npc.known_rule_ids = [str(item).strip() for item in known_rule_ids if str(item).strip()] if isinstance(known_rule_ids, list) else []
         npc.dialogue_history = data.get("dialogue_history", [])
         npc.target_location = data.get("target_location")
         

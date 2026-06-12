@@ -108,37 +108,48 @@ class SharedCommandHandlersMixin:
         try:
             session = state.session
             title = session.scene_name or ("多人大厅" if session.game_mode == GameModes.MULTI.value and session.status == GameStatus.WAITING else "未生成")
-            lines = [
-                f"**游戏状态：{title}**",
-                f"模式：{session.game_mode}",
-                f"状态：{session.status.value}",
-            ]
-
             env_state = session.environment_state if isinstance(getattr(session, "environment_state", None), dict) else {}
             if session.status == GameStatus.WAITING and isinstance(env_state.get("lobby"), dict):
                 lobby = env_state["lobby"]
                 host_name = str(lobby.get("host_name", "房主") or "房主")
                 target_players = lobby.get("target_players")
                 target_text = f"{target_players}人" if isinstance(target_players, int) and target_players > 0 else "未指定"
-                lines.extend(
-                    [
-                        f"房主：{host_name}",
-                        f"目标人数：{target_text}",
-                    ]
+                player_count = len(session.players)
+                await self.send_text(
+                    f"这里还是多人大厅，场景还没真正展开。\n\n"
+                    f"目前由 {host_name} 在组织这局，已经到场 {player_count} 人，目标人数是 {target_text}。"
+                )
+                return True, "状态已显示", 2
+
+            player = session.players.get(user_id)
+            if not player:
+                await self.send_text(f"《{title}》仍在继续，但你当前不在这局游戏里。")
+                return False, "不在游戏中", 2
+
+            location = str(getattr(player, "location", "") or "未知位置").strip()
+            fatigue = self._get_player_fatigue_level(player)
+            rule_count = len(self._get_player_recorded_rules(player))
+            self_status = "还活着" if player.status == PlayerStatus.ALIVE else "已经死亡"
+            parts = [
+                f"你现在仍在《{title}》里，位置大概在{location}。",
+                f"你的状态还算明确：体力 {player.health}/100，理智 {player.sanity}/100，疲劳感是“{fatigue}”，目前{self_status}。",
+                f"手里已经记下了 {rule_count} 条规则笔记。"
+            ]
+
+            other_lines: list[str] = []
+            for pid, other in session.players.items():
+                if pid == user_id:
+                    continue
+                other_status = "还活着" if other.status == PlayerStatus.ALIVE else "已经死亡"
+                other_loc = str(getattr(other, "location", "") or "未知位置").strip()
+                other_lines.append(
+                    f"{other.name}在{other_loc}附近，体力 {other.health}/100，理智 {other.sanity}/100，{other_status}。"
                 )
 
-            lines.extend(["", "**玩家列表**"])
-            for pid, player in session.players.items():
-                status_text = "存活" if player.status == PlayerStatus.ALIVE else "死亡"
-                location = str(getattr(player, "location", "") or "未知位置").strip()
-                fatigue = self._get_player_fatigue_level(player)
-                rule_count = len(self._get_player_recorded_rules(player))
-                prefix = "-> " if pid == user_id else "- "
-                lines.append(
-                    f"{prefix}{player.name} | {status_text} | 理智:{player.sanity}/100 | 体力:{player.health}/100 | 疲劳:{fatigue} | 位置:{location} | 规则笔记:{rule_count}条"
-                )
+            if other_lines:
+                parts.append("你还能确认到其他人的情况：\n" + "\n".join(other_lines))
 
-            await self.send_text("\n".join(lines))
+            await self.send_text("\n\n".join(parts))
             return True, "状态已显示", 2
         finally:
             state.release()
@@ -175,17 +186,16 @@ class SharedCommandHandlersMixin:
 
             if not display_rules:
                 await self.send_text(
-                    f"**{session.scene_name} - 规则笔记**\n\n"
-                    "你目前还没有记录下任何明确规则。\n"
-                    "建议先探索场景、观察 NPC、检查规则载体，或使用 `/rg 推理` 和 `/rg 记录规则` 逐步整理。\n\n"
-                    f"**通关条件**：{session.win_condition}"
+                    "你翻了翻手头能留下的东西，暂时还没有整理出真正能确认的规则。\n\n"
+                    "先继续探索、观察 NPC、检查纸面载体，或者用 `/rg 推理` 和 `/rg 记录规则` 慢慢把线索收拢起来。"
                 )
                 return True, "规则已显示", 2
 
-            lines = [f"**{session.scene_name} - 规则笔记**", ""]
+            lines = ["你把自己一路记下的内容重新理了理，目前能确认的几条是：", ""]
             for index, text in enumerate(display_rules, start=1):
                 lines.append(f"{index}. {text}")
-            lines.extend(["", f"**通关条件**：{session.win_condition}"])
+            if session.win_condition:
+                lines.extend(["", f"至于最后该怎么脱身，你现在更接近的答案是：{session.win_condition}"])
 
             await self.send_text("\n".join(lines))
             return True, "规则已显示", 2
@@ -231,28 +241,27 @@ class SharedCommandHandlersMixin:
                     await self.send_text(f"未找到线索：{query}")
                     return False, "未找到线索", 2
 
-                lines = ["**线索详情**", ""]
+                lines = ["你把这条线索单独拎出来又看了一遍：", ""]
                 for item in matches:
-                    lines.append(f"- 名称：{item.get('name', '未知线索')}")
+                    lines.append(f"{item.get('name', '未知线索')}")
                     description = str(item.get("description", "") or "").strip()
                     if description:
-                        lines.append(f"  描述：{description}")
+                        lines.append(description)
                     observation_hint = str(item.get("observation_hint", "") or "").strip()
                     if observation_hint:
-                        lines.append(f"  观察提示：{observation_hint}")
+                        lines.append(f"你越看越觉得：{observation_hint}")
                     lines.append("")
                 await self.send_text("\n".join(lines).strip())
                 return True, "线索已显示", 2
 
             if not clue_items:
                 await self.send_text(
-                    "**线索列表**\n\n"
-                    "你当前还没有整理出明确线索。\n"
-                    "可以通过 `/rg 行动` 探索、检查道具或观察 NPC 来获得更多信息。"
+                    "你手头暂时还没有能单独拎出来的线索。\n\n"
+                    "继续用 `/rg 行动` 去探索，或者翻看道具、观察 NPC，也许会有东西慢慢浮出来。"
                 )
                 return True, "线索已显示", 2
 
-            lines = ["**线索列表**", ""]
+            lines = ["你把目前捞到的线索排了一遍，最值得记住的有：", ""]
             for index, item in enumerate(clue_items, start=1):
                 name = str(item.get("name", "未知线索") or "未知线索").strip()
                 description = str(item.get("description", "") or "").strip()
@@ -525,10 +534,8 @@ class SharedCommandHandlersMixin:
             await SaveManager().schedule_save(group_id, state.session)
             rule_count = len(self._get_player_recorded_rules(player))
             await self.send_text(
-                f"**规则笔记已更新**\n\n"
-                f"{user_name} 记录了 1 条规则。\n"
-                f"当前共记录：{rule_count} 条\n\n"
-                "使用 `/rg 规则` 查看你的规则笔记。"
+                f"{user_name} 又记下了一条新的规则。\n\n"
+                f"现在你的规则笔记里一共有 {rule_count} 条内容了。"
             )
             return True, "规则已记录", 2
         finally:
@@ -617,15 +624,13 @@ class SharedCommandHandlersMixin:
             fear_level = int(getattr(player, "fear_level", 0) or 0)
             anxiety_level = int(getattr(player, "anxiety_level", 0) or 0)
             stress_level = int(getattr(player, "stress_level", 0) or 0)
-            found_items = [*list(result.discovered_clues), *list(result.found_items)]
-
             image_generator = self.get_image_generator()
             action_image = await image_generator.generate_action_result_image(
                 user_name=user_name,
                 action=action_text,
                 is_dead=(player.status != PlayerStatus.ALIVE),
                 scene_description=result.description,
-                action_feedback="",
+                action_feedback=result.triggered_event or "",
                 health=player.health,
                 injury=injury,
                 fatigue=fatigue,
@@ -635,9 +640,10 @@ class SharedCommandHandlersMixin:
                 fear_level=fear_level,
                 anxiety_level=anxiety_level,
                 stress_level=stress_level,
-                found_items=found_items,
+                found_items=list(result.found_items),
+                found_clues=list(result.discovered_clues),
                 new_location=player.location,
-                random_event=result.triggered_event,
+                random_event=None,
             )
             await self._send_image_path(action_image)
 
@@ -688,21 +694,19 @@ class SharedCommandHandlersMixin:
 
             if session.has_cleared:
                 await self.send_text(
-                    "**恭喜，你已达成通关条件！**\n\n"
-                    "你可以选择：\n"
-                    "- `/rg 继续` - 继续探索，寻找更多信息\n"
-                    "- `/rg 结束` - 结束游戏，查看结局"
+                    "你已经碰到了离开的条件。\n\n"
+                    "如果还想继续深挖，就用 `/rg 继续`；如果准备收束这一局，就用 `/rg 结束`。"
                 )
 
             if result.is_fatal or player.status != PlayerStatus.ALIVE:
                 if player.sanity == 0:
-                    await self.send_text("**……**\n\n你感到某种‘秩序’正在接纳你。")
+                    await self.send_text("……\n\n你感到某种‘秩序’正在接纳你。")
                 else:
                     violated = result.violated_rule or "未知"
                     await self.send_text(
-                        "**你已死亡！**\n\n"
-                        f"违反的规则：{violated}\n\n"
-                        "游戏结束。使用 `/rg 结束` 查看结局。"
+                        f"你已经死了。\n\n"
+                        f"真正把你推到这一步的，是那条被你碰开的规则：{violated}\n\n"
+                        "现在可以用 `/rg 结束` 看这一局最终落到了什么结局。"
                     )
 
             await SaveManager().schedule_save(group_id, session)
@@ -815,7 +819,7 @@ class SharedCommandHandlersMixin:
             "- `/rg 剧情` - 重发剧情导入\n"
             "- `/rg 规则` - 查看你的规则笔记\n"
             "- `/rg 记录规则 <内容>` - 手动记录规则笔记\n"
-            "- `/rg 场景` - 查看场景结构\n"
+            "- `/rg 场景` - 回看你对场景的整体印象\n"
             "- `/rg 道具 [名称]` - 查看道具列表或详情\n"
             "- `/rg 线索 [名称]` - 查看已整理出的线索\n"
             "- `/rg 提示 <规则/线索>` - 获取非剧透提示\n"
@@ -962,42 +966,12 @@ class SharedCommandHandlersMixin:
             session = state.session
             scene_structure = getattr(session, "scene_structure", {}) or {}
             if not scene_structure:
-                await self.send_text("场景结构尚未生成。")
+                await self.send_text("这里的整体样子暂时还理不清，只能继续边走边看。")
                 return False, "无场景结构", 2
 
-            lines = [f"**{session.scene_name} - 场景结构**", ""]
-            lines.append(f"**建筑类型**：{scene_structure.get('building_type', '未知建筑')}")
-            lines.append(f"**总体布局**：{scene_structure.get('overall_layout', '未知布局')}")
-
-            floors = scene_structure.get("floors", [])
-            if isinstance(floors, list) and floors:
-                lines.append("")
-                lines.append("**楼层布局**")
-                for floor in floors:
-                    if not isinstance(floor, dict):
-                        continue
-                    floor_name = floor.get("floor") or floor.get("name") or "未知楼层"
-                    rooms = floor.get("areas") or floor.get("rooms") or []
-                    lines.append(f"{floor_name}:")
-                    if isinstance(rooms, list):
-                        for room in rooms:
-                            lines.append(f"- {room}")
-
-            connections = scene_structure.get("connections", [])
-            if isinstance(connections, list) and connections:
-                lines.append("")
-                lines.append("**连接通道**")
-                for connection in connections:
-                    lines.append(f"- {connection}")
-
-            special_areas = scene_structure.get("special_areas", [])
-            if isinstance(special_areas, list) and special_areas:
-                lines.append("")
-                lines.append("**特殊区域**")
-                for area in special_areas:
-                    lines.append(f"- {area}")
-
-            await self.send_text("\n".join(lines))
+            player = session.players.get(user_id)
+            current_location = str(getattr(player, "location", "") or "").strip() if player else ""
+            await self.send_text(self._build_scene_overview_text(session, current_location=current_location, plural=False))
             return True, "场景已显示", 2
         finally:
             state.release()
@@ -1026,7 +1000,7 @@ class SharedCommandHandlersMixin:
 
             inventory = getattr(player, "inventory", []) or []
             if not inventory:
-                await self.send_text("**物品栏**\n\n你的背包是空的。")
+                await self.send_text("你摸了摸身上，暂时没有什么能拿得出手的东西。")
                 return True, "物品栏已显示", 2
 
             query = (rest_input or "").strip()
@@ -1043,19 +1017,19 @@ class SharedCommandHandlersMixin:
                     await self.send_text(f"匹配到多个道具（{len(matches)}个），请提供更精确的名称。")
                     return False, "匹配过多", 2
 
-                lines = ["**道具详情**", ""]
+                lines = ["你把东西拿到眼前仔细看了看：", ""]
                 for item in matches:
                     name = item.get("name", "未知")
                     item_type = item.get("type", "物品")
                     description = item.get("description", "")
                     observation_hint = item.get("observation_hint", "")
                     is_key = bool(item.get("is_key_item", False))
-                    lines.append(f"- 名称：{name}{'（关键物品）' if is_key else ''}")
-                    lines.append(f"  类型：{item_type}")
+                    lines.append(f"{name}{'（关键物品）' if is_key else ''}")
+                    lines.append(f"大致算是：{item_type}")
                     if description:
-                        lines.append(f"  描述：{description}")
+                        lines.append(description)
                     if observation_hint:
-                        lines.append(f"  观察提示：{observation_hint}")
+                        lines.append(f"细看之下，你会注意到：{observation_hint}")
                     lines.append("")
 
                 await self.send_text("\n".join(lines).strip())
@@ -1071,19 +1045,19 @@ class SharedCommandHandlersMixin:
             except Exception as exc:
                 logger.debug("生成或发送道具图片失败，回退为文本: %s", exc)
 
-            lines = [f"**{user_name} 的物品栏**", ""]
+            lines = [f"你现在随身带着这些东西：", ""]
             for index, item in enumerate(inventory, start=1):
                 if isinstance(item, dict):
                     name = item.get("name", "未知物品")
                     description = item.get("description", "")
-                    key_marker = " 🔑" if bool(item.get("is_key_item", False)) else ""
+                    key_marker = "（关键）" if bool(item.get("is_key_item", False)) else ""
                     lines.append(f"{index}. {name}{key_marker}")
                     if description:
                         lines.append(f"   {description}")
                 else:
                     lines.append(f"{index}. {item}")
             lines.append("")
-            lines.append("使用 `/rg 道具 <名称>` 查看详情。")
+            lines.append("如果想把某件东西单独拿出来看清楚，可以用 `/rg 道具 <名称>`。")
             await self.send_text("\n".join(lines))
             return True, "物品栏已显示", 2
         finally:
@@ -1124,9 +1098,8 @@ class SharedCommandHandlersMixin:
                 return False, "未通关", 2
 
             await self.send_text(
-                "**继续探索**\n\n"
-                "你已达成通关条件，但仍可以继续探索，寻找更多真相或更好的结局。\n"
-                "继续使用 `/rg 行动 <行动描述>` 推进。"
+                "你已经摸到了离开的路，但故事还没有被你看完。\n\n"
+                "如果你还想继续追下去，就继续用 `/rg 行动 <行动描述>` 往前走。"
             )
             return True, "继续探索", 2
         finally:
@@ -1162,11 +1135,8 @@ class SharedCommandHandlersMixin:
                 state.release()
 
             await self.send_text(
-                f"**存档已恢复**\n\n"
-                f"场景：{session.scene_name}\n"
-                f"模式：{session.game_mode}\n"
-                f"玩家数：{len(session.players)}\n\n"
-                "使用 `/rg 状态` 查看详细信息。"
+                f"你重新接上了《{session.scene_name}》这局游戏里的进度。\n\n"
+                f"当前是{session.game_mode}模式，一共有 {len(session.players)} 名玩家还在局内。"
             )
             return True, "存档已恢复", 2
         except Exception as exc:
@@ -1201,7 +1171,7 @@ class SharedCommandHandlersMixin:
                 await self.send_text("存档保存失败，请稍后重试。")
                 return False, "保存失败", 2
 
-            await self.send_text(f"**存档已保存**\n\n存档名称：{save_name}")
+            await self.send_text(f"已经替你把当前进度收好了，存档名是“{save_name}”。")
             return True, "存档已保存", 2
         except Exception as exc:
             logger.error("保存存档失败: %s", exc, exc_info=True)

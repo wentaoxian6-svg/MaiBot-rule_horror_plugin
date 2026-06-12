@@ -530,8 +530,8 @@ class EnvironmentEvolutionSystem:
     "attitude": "对玩家的态度（如：严厉、温和、神秘、不耐烦等）"
   }},
   "guidance_method": "引导方式（natural_language或rule_carrier）",
-  "npc_behavior": "NPC的行为描述（如：NPC走近玩家，递给玩家一张皱巴巴的纸条，用警惕的眼神四处张望）",
-  "npc_dialogue": "NPC的对话内容（如：'新来的？拿着这个，仔细看。这里不是普通的地方，有些规矩你必须遵守...'）",
+  "npc_behavior": "NPC的行为描述（如：NPC走近玩家，把一张皱巴巴的纸条塞到你手里，又下意识回头看了一眼走廊）",
+  "npc_dialogue": "NPC的对话内容（如：'拿着，别在走廊上看。今晚先别去尽头那间。'）",
   "rule_carrier": {{
     "type": "规则载体类型（如：工作守则、员工手册、注意事项、告示牌等）",
     "title": "规则载体标题（如：夜班护士工作守则）",

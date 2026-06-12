@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TypeAlias
 
 from ..llm.client import LLMClient
-from ..game.models import GameSession
+from ..game.models import GameSession, Rule
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,163 @@ class GameGenerator:
 
     def __init__(self, llm_client: LLMClient | None = None):
         self.llm_client: LLMClient = llm_client or LLMClient()
+
+    @staticmethod
+    def _normalize_free_text(text: object) -> str:
+        """清理自由文本里的列表感和多余空白。"""
+        normalized = str(text or "").replace("\r\n", "\n").strip()
+        normalized = re.sub(r"(?m)^\s*(?:[-*•]+|\d+[\.、])\s*", "", normalized)
+        normalized = re.sub(r"[ \t]+", " ", normalized)
+        normalized = re.sub(r"\n{2,}", "\n", normalized)
+        return normalized.strip()
+
+    @classmethod
+    def _compress_narrative_text(
+        cls,
+        text: object,
+        *,
+        max_units: int,
+        max_chars: int,
+        clause_mode: bool = False,
+    ) -> str:
+        """把生成文本压成更接近现场片段的短叙事。"""
+        normalized = cls._normalize_free_text(text)
+        if not normalized:
+            return ""
+
+        splitter = r"[。！？!?；;\n]+" if not clause_mode else r"[。！？!?；;，,\n]+"
+        units = [item.strip(" \"'“”‘’") for item in re.split(splitter, normalized) if item.strip(" \"'“”‘’")]
+        if not units:
+            return normalized[:max_chars].rstrip("，,；;、 ") + "。"
+
+        selected: list[str] = []
+        total_chars = 0
+        for unit in units:
+            compact_unit = re.sub(r"\s+", "", unit)
+            if not compact_unit:
+                continue
+            if clause_mode and len(compact_unit) > 26:
+                short_clauses = [frag.strip() for frag in re.split(r"[，,]", compact_unit) if frag.strip()]
+                if short_clauses:
+                    compact_unit = short_clauses[0]
+            projected = total_chars + len(compact_unit)
+            if selected and projected > max_chars:
+                break
+            selected.append(compact_unit)
+            total_chars = projected
+            if len(selected) >= max_units or total_chars >= max_chars:
+                break
+
+        if not selected:
+            selected = [units[0][:max_chars].strip()]
+
+        sentence_end = "。" if not clause_mode else "，"
+        text_body = sentence_end.join(item.rstrip("，,；;、。") for item in selected if item.strip())
+        text_body = text_body.rstrip("，,；;、。")
+        return f"{text_body}{'。' if text_body else ''}"
+
+    @classmethod
+    def _sanitize_npc_guidance_texts(cls, data: GameData) -> GameData:
+        """收紧 NPC 开场文本，避免长图和对话变成培训手册。"""
+        sanitized = dict(data)
+        sanitized["npc_behavior"] = cls._compress_narrative_text(
+            sanitized.get("npc_behavior", ""),
+            max_units=2,
+            max_chars=72,
+            clause_mode=False,
+        )
+        sanitized["npc_dialogue"] = cls._compress_narrative_text(
+            sanitized.get("npc_dialogue", ""),
+            max_units=4,
+            max_chars=88,
+            clause_mode=True,
+        )
+        sanitized["rule_carrier_description"] = cls._compress_narrative_text(
+            sanitized.get("rule_carrier_description", ""),
+            max_units=3,
+            max_chars=96,
+            clause_mode=False,
+        )
+        return sanitized
+
+    def _normalize_rules(
+        self,
+        rules: object,
+        *,
+        default_source: str,
+        source_type: str,
+    ) -> list[JsonObject]:
+        """把旧版规则字典统一归一到新版结构。"""
+        if not isinstance(rules, list):
+            return []
+
+        normalized: list[JsonObject] = []
+        for index, raw_rule in enumerate(rules):
+            rule = Rule.from_dict(raw_rule, index)
+            if not rule.source:
+                rule.source = default_source
+            if not rule.source_type:
+                rule.source_type = source_type
+            if not rule.constraint:
+                rule.constraint = rule.surface_text
+            normalized.append(rule.to_dict())
+        return normalized
+
+    @staticmethod
+    def _clamp_ratio(value: object, default: float) -> float:
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return max(0.0, min(1.0, float(value)))
+        if isinstance(value, str):
+            try:
+                return max(0.0, min(1.0, float(value.strip())))
+            except Exception:
+                return default
+        return default
+
+    def _normalize_npc_roster(
+        self,
+        roster: object,
+        npc_guidance: GameData,
+    ) -> list[JsonObject]:
+        """为运行时 NPC 补齐信息偏差相关字段。"""
+        raw_roster = roster if isinstance(roster, list) else []
+        if not raw_roster:
+            raw_roster = self._build_default_npc_roster(npc_guidance)
+
+        normalized: list[JsonObject] = []
+        default_attitude = str(npc_guidance.get("npc_attitude", "") or "").strip()
+        for index, raw_npc in enumerate(raw_roster):
+            if not isinstance(raw_npc, dict):
+                continue
+
+            attitude_text = str(raw_npc.get("attitude", default_attitude) or default_attitude).strip()
+            info_reliability = self._clamp_ratio(raw_npc.get("knowledge_reliability"), 0.75)
+            deception_tendency = self._clamp_ratio(raw_npc.get("deception_tendency"), 0.15)
+            corruption_level = self._clamp_ratio(raw_npc.get("corruption_level"), 0.0)
+            if any(keyword in attitude_text for keyword in ["友好", "温和", "热情"]):
+                deception_tendency = min(deception_tendency, 0.2)
+            elif any(keyword in attitude_text for keyword in ["警告", "严厉", "冷淡", "不耐烦"]):
+                info_reliability = min(info_reliability, 0.7)
+            elif any(keyword in attitude_text for keyword in ["敌对", "威胁"]):
+                deception_tendency = max(deception_tendency, 0.45)
+
+            bias_tags = raw_npc.get("bias_tags", [])
+            normalized.append(
+                {
+                    **raw_npc,
+                    "npc_id": str(raw_npc.get("npc_id", f"guide_{index}") or f"guide_{index}").strip(),
+                    "attitude": attitude_text,
+                    "knowledge_reliability": info_reliability,
+                    "deception_tendency": deception_tendency,
+                    "corruption_level": corruption_level,
+                    "current_state": str(raw_npc.get("current_state", "稳定") or "稳定").strip(),
+                    "bias_tags": [str(item).strip() for item in bias_tags if str(item).strip()] if isinstance(bias_tags, list) else [],
+                    "known_rule_ids": [str(item).strip() for item in raw_npc.get("known_rule_ids", []) if str(item).strip()] if isinstance(raw_npc.get("known_rule_ids", []), list) else [],
+                }
+            )
+        return normalized
 
     async def generate_game(
         self,
@@ -369,6 +527,12 @@ class GameGenerator:
                 "audible_signature": "平稳的脚步声",
                 "danger_level": "低",
                 "can_speak": True,
+                "knowledge_reliability": 0.75,
+                "deception_tendency": 0.1,
+                "corruption_level": 0.0,
+                "current_state": "稳定",
+                "bias_tags": ["维持秩序"],
+                "known_rule_ids": [],
             }
         ]
 
@@ -572,17 +736,35 @@ class GameGenerator:
                         "duty_area": str(a.get("duty_area", "") or "").strip(),
                         "initial_observations": a.get("initial_observations", []),
                         "initial_visible_carrier_ids": a.get("initial_visible_carrier_ids", []),
-                        "unique_rules": a.get("unique_rules", []),
+                        "unique_rules": self._normalize_rules(
+                            a.get("unique_rules", []),
+                            default_source=f"{str(a.get('identity_name', '') or '身份简报').strip()}",
+                            source_type="identity_brief",
+                        ),
                         "npc_attitudes": a.get("npc_attitudes", {}),
                         "exclusive_info": str(a.get("exclusive_info", "") or "").strip(),
                     }
                     for a in normalized_assignments
                 ]
 
+            for assignment in normalized_assignments:
+                if not isinstance(assignment, dict):
+                    continue
+                identity_name = str(assignment.get("identity_name", "") or "身份简报").strip()
+                assignment["unique_rules"] = self._normalize_rules(
+                    assignment.get("unique_rules", []),
+                    default_source=identity_name,
+                    source_type="identity_brief",
+                )
+
             mi = session.rule_network["multi_identity"]
             mi["assignments"] = normalized_assignments
             mi["identities"] = identities if isinstance(identities, list) else []
-            mi["common_rules"] = common_rules if isinstance(common_rules, list) else []
+            mi["common_rules"] = self._normalize_rules(
+                common_rules if isinstance(common_rules, list) else [],
+                default_source="多人共同背景",
+                source_type="shared_brief",
+            )
             mi["identity_groups"] = identity_data.get("identity_groups", []) if isinstance(identity_data.get("identity_groups", []), list) else []
             mi["shared_visibility_groups"] = identity_data.get("shared_visibility_groups", []) if isinstance(identity_data.get("shared_visibility_groups", []), list) else []
             mi["npc_attitudes"] = {
@@ -619,10 +801,16 @@ class GameGenerator:
         # Step 3: 生成规则系统
         logger.info("Step 3: 生成规则系统")
         step3_data = await self._generate_rules_system(step1_data, step2_data, game_mode)
+        step3_data["rules"] = self._normalize_rules(
+            step3_data.get("rules", []),
+            default_source="场景正式规则",
+            source_type="system",
+        )
         
         # Step 4: 生成NPC引导
         logger.info("Step 4: 生成NPC引导")
         npc_guidance = await self._generate_npc_guidance(step1_data, step3_data)
+        npc_guidance["npc_roster"] = self._normalize_npc_roster(npc_guidance.get("npc_roster", []), npc_guidance)
         
         # 合并所有数据
         game_data = {
@@ -738,6 +926,7 @@ class GameGenerator:
 4. 列出通道、楼梯、电梯等连接方式
 5. 列出特殊区域（如：地下室、天台、禁闭室等）
 6. 场景结构应该与剧情导入的背景和氛围相符
+7. 除了内部结构，还要额外给出面向玩家的自然语言场景印象，不要写成清单、导览词或系统说明
 
 **输出格式：**
 {
@@ -750,12 +939,16 @@ class GameGenerator:
     ],
     "connections": ["连接通道1", "连接通道2"],
     "special_areas": ["特殊区域1", "特殊区域2"]
-  }
+  },
+  "scene_impression": "150字左右的纯文本，从玩家视角描述这个地方带来的第一空间印象，不要分点",
+  "exploration_hint": "1-2句自然的探索提醒，暗示哪些位置值得留意，不要写成任务列表"
 }
 
 **重要：**
 - 仅返回JSON，不要包含其他文字
-- 严禁使用emoji表情符号"""
+- 严禁使用emoji表情符号
+- `scene_impression` 必须是完整段落，不要出现 1. 2. 3. 或项目符号
+- `exploration_hint` 必须像叙事中的提醒，不要写“建议你去……”这种教程口吻"""
 
         user_prompt = f"""请基于以下剧情导入，生成场景结构。
 
@@ -773,6 +966,14 @@ class GameGenerator:
             )
 
             data = response.parse_json()
+            scene_structure = data.get("scene_structure", {})
+            if isinstance(scene_structure, dict):
+                scene_impression = str(data.get("scene_impression", "") or "").strip()
+                exploration_hint = str(data.get("exploration_hint", "") or "").strip()
+                if scene_impression:
+                    scene_structure["scene_impression"] = scene_impression
+                if exploration_hint:
+                    scene_structure["exploration_hint"] = exploration_hint
             logger.info(f"场景结构生成成功")
             return data
 
@@ -815,6 +1016,12 @@ class GameGenerator:
    - 通关条件应该与规则和真相有逻辑关联
 
 6. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
+7. **显式语义字段**（重要）：
+   - 用 `condition` 表示触发前提
+   - 用 `constraint` 表示玩家需要遵守的行为约束
+   - 用 `consequence` 表示违反后的后果
+   - 用 `source` 表示规则来源
+   - 用 `reliability` 表示这条规则作为玩家可接触信息时的可靠度，范围 0.0~1.0
 
 **输出格式：**
 {
@@ -823,6 +1030,11 @@ class GameGenerator:
       "text": "规则1",
       "is_true": true,
       "hidden_meaning": "隐藏含义",
+      "condition": "触发条件",
+      "constraint": "行为约束",
+      "consequence": "违反后果",
+      "source": "规则来源，如值班守则/NPC口述/广播",
+      "reliability": 0.92,
       "rule_type": "fatal/harmful/double_edged/null",
       "related_npc": "NPC名称或null",
       "opposing_npc": "对抗NPC名称或null"
@@ -836,7 +1048,8 @@ class GameGenerator:
 - 仅返回JSON，不要包含其他文字
 - 严禁使用emoji表情符号
 - rule_type字段必须填写，即使是null
-- related_npc和opposing_npc如果没有就填null"""
+- related_npc和opposing_npc如果没有就填null
+- condition、constraint、consequence、source、reliability 必须填写"""
 
         user_prompt = f"""请基于以下信息，生成规则系统。
 
@@ -908,6 +1121,8 @@ class GameGenerator:
 13. natural_language 模式下，NPC 可以说“别去后面”“先干活”“十一点后别乱碰冷柜”“听见有人叫你也别急着回头”这类零散说法，但不要把它们包装成正式规则列表。
 14. 如果是多人开场，NPC 可以面对“一行人”统一说话，但不要在公开对话里直接暴露每个人的私密身份规则。
 15. 要保留危险感、含混感和世界内叙事感，让玩家觉得自己是在进入一个不对劲的地方，而不是在读玩法说明。
+16. 所有可见文本都应该像“现场片段”，不是“完整交接稿”。
+17. 如果 NPC 很赶时间，他只会留下零碎几句，不会站在原地讲长篇大论。
 
 字段要求：
 
@@ -917,24 +1132,28 @@ class GameGenerator:
    - none：开场没有 NPC，玩家独自醒来或独自置身场景中
 
 2. npc_behavior
-   - 50-110 字
+   - 35-80 字
    - 第二人称视角
    - 只写玩家眼前看到的动作、神态、环境细节，不要写 NPC 台词
+   - 最多 2 句，不要写成长段旁白
    - 如果 guidance_method 为 none，这里改为“玩家醒来或察觉环境异常时，眼前发生的事”
 
 3. npc_dialogue
-   - 120-260 字
+   - 40-110 字
    - 仅在 natural_language 下填写
    - 必须是 NPC 直接说出口的话
    - 允许停顿、岔开话题、欲言又止、重复强调某个异常点
+   - 最多 4 个短句，像真人匆忙交代，不要连续讲一大段
    - 更适合“交接班”“分派任务”“催促开工”“低声提醒”“不耐烦地纠正”
    - 可以包含少量规则性提醒、误导、虚假说法、矛盾说法或无关紧要的规矩
    - 禁止出现完整规则总表、编号式注意事项、培训手册式说明
+   - 禁止一口气连续交代 5 件以上事情，也不要出现“记住了”“我再说一遍”这类总结口吻
 
 4. rule_carrier_title / rule_carrier_description
    - 仅在 rule_carrier 下填写
    - title 是物件或文书本身的名称，如“夜班交接单”“四层保洁记录”“值班室抽屉里的便签”
    - description 只描述它如何被递来、塞来、指给玩家、留在某处，不要把正文规则完整写出来
+   - 40-100 字，1-2 句即可
 
 5. npc_roster
    - 如果 guidance_method 为 none，则允许为空列表
@@ -943,6 +1162,11 @@ class GameGenerator:
    - 其他 NPC 可以是巡逻者、同事、沉默观察者、其他岗位人员
    - 每个 NPC 都要给出岗位区域、行为逻辑摘要、当前目标、开场前刚做过什么、可听特征
    - current_goal 必须是世界内目标，例如“整理夜班登记簿”“巡视四层病房”“确认新来者是否按要求到岗”，不要写“完成开场引导”
+   - knowledge_reliability 表示这名 NPC 掌握信息的可靠度，0.0~1.0
+   - deception_tendency 表示这名 NPC 故意误导玩家的倾向，0.0~1.0
+   - corruption_level 表示这名 NPC 受到异常污染的程度，0.0~1.0
+   - bias_tags 表示这名 NPC 的认知偏差，例如“迷信”“服从权威”“排外”“护短”
+   - known_rule_ids 可以填写该 NPC 更清楚的规则 ID，不知道就留空
 
 输出 JSON：
 {
@@ -967,7 +1191,13 @@ class GameGenerator:
       "last_action": "开场前刚做过什么",
       "audible_signature": "玩家可听到的典型动静",
       "danger_level": "低/中/高",
-      "can_speak": true
+      "can_speak": true,
+      "knowledge_reliability": 0.7,
+      "deception_tendency": 0.2,
+      "corruption_level": 0.1,
+      "current_state": "稳定/紧张/被污染/戒备",
+      "bias_tags": ["该NPC的认知偏差标签"],
+      "known_rule_ids": ["rule_0"]
     }
   ]
 }
@@ -993,6 +1223,7 @@ class GameGenerator:
             )
 
             data = response.parse_json()
+            data = self._sanitize_npc_guidance_texts(data)
             guidance_method = str(data.get("guidance_method", "natural_language") or "natural_language").strip().lower()
             if guidance_method == "none":
                 data["guidance_method"] = "none"
@@ -1015,13 +1246,13 @@ class GameGenerator:
         except Exception as e:
             logger.error(f"生成NPC引导失败: {e}")
             # NPC引导失败不影响游戏，返回默认值
-            return {
+            fallback = {
                 "guidance_method": "natural_language",
                 "npc_name": "值班人",
                 "npc_role": "夜班交接员",
                 "npc_attitude": "疲惫",
                 "npc_behavior": "值班桌后的那个人抬头看了你一眼，指尖还压着没整理完的登记表。他没有立刻招呼你，只是先确认门有没有关好，才朝你招了招手。",
-                "npc_dialogue": "新来的？先别站门口，把门带上。今晚人手不够，你先去熟悉自己该待的地方，没事别乱跑。要是听见哪间屋里有动静，又不确定是不是该你管的，就先回来找我，别自作主张。这里有人喜欢把话说一半，你最好学会自己分辨。",
+                "npc_dialogue": "新来的？先把门带上。今晚先待在自己该待的地方，拿不准的事就回来问我。",
                 "npc_roster": self._build_default_npc_roster(
                     {
                         "npc_name": "值班人",
@@ -1031,4 +1262,5 @@ class GameGenerator:
                     }
                 ),
             }
+            return self._sanitize_npc_guidance_texts(fallback)
 

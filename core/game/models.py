@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 from ...common.models import JsonObject
 
@@ -21,6 +22,156 @@ class PlayerStatus(Enum):
     ALIVE = "alive"
     DEAD = "dead"
     SPECTATING = "spectating"
+
+
+@dataclass
+class Rule:
+    """规则数据模型。
+
+    兼容旧版仅有 ``text`` / ``hidden_meaning`` / ``is_true`` 的结构，
+    同时补充来源、真假、可靠度和变异链等显式信息，便于后续推理。
+    """
+
+    rule_id: str
+    surface_text: str
+    deep_meaning: str = ""
+    condition: str = ""
+    constraint: str = ""
+    consequence: str = ""
+    source: str = ""
+    source_type: str = "system"
+    source_id: str | None = None
+    is_authentic: bool | None = None
+    reliability: float = 1.0
+    evolves_into: str | None = None
+    rule_type: str | None = None
+    related_npc: str | None = None
+    opposing_npc: str | None = None
+    truth_status: str = "unknown"
+    confidence: float = 1.0
+
+    @staticmethod
+    def _as_str(value: object, default: str = "") -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value).strip()
+        return default
+
+    @staticmethod
+    def _as_float(value: object, default: float) -> float:
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except Exception:
+                return default
+        return default
+
+    @classmethod
+    def _normalize_truth_status(cls, value: object, is_authentic: bool | None) -> str:
+        raw = cls._as_str(value).lower()
+        mapping = {
+            "true": "true",
+            "authentic": "true",
+            "real": "true",
+            "false": "false",
+            "fake": "false",
+            "unknown": "unknown",
+            "mutated": "mutated",
+            "mixed": "mixed",
+        }
+        if raw in mapping:
+            return mapping[raw]
+        if is_authentic is True:
+            return "true"
+        if is_authentic is False:
+            return "false"
+        return "unknown"
+
+    def to_dict(self) -> JsonObject:
+        """转换为兼容旧逻辑的字典。"""
+        truth_status = self._normalize_truth_status(self.truth_status, self.is_authentic)
+        is_true = self.is_authentic if isinstance(self.is_authentic, bool) else truth_status == "true"
+        return {
+            "rule_id": self.rule_id,
+            "surface_text": self.surface_text,
+            "text": self.surface_text,
+            "deep_meaning": self.deep_meaning,
+            "hidden_meaning": self.deep_meaning,
+            "condition": self.condition,
+            "constraint": self.constraint or self.surface_text,
+            "consequence": self.consequence,
+            "source": self.source,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
+            "is_authentic": self.is_authentic,
+            "is_true": is_true,
+            "reliability": max(0.0, min(1.0, self.reliability)),
+            "evolves_into": self.evolves_into,
+            "rule_type": self.rule_type,
+            "related_npc": self.related_npc,
+            "opposing_npc": self.opposing_npc,
+            "truth_status": truth_status,
+            "confidence": max(0.0, min(1.0, self.confidence)),
+        }
+
+    @classmethod
+    def from_dict(cls, data: object, fallback_index: int = 0) -> "Rule":
+        """从旧版或新版规则字典创建规则对象。"""
+        if isinstance(data, cls):
+            return data
+
+        if not isinstance(data, dict):
+            text = cls._as_str(data)
+            return cls(
+                rule_id=f"rule_{fallback_index}",
+                surface_text=text,
+                constraint=text,
+            )
+
+        surface_text = cls._as_str(data.get("surface_text")) or cls._as_str(data.get("text")) or cls._as_str(data.get("content"))
+        deep_meaning = cls._as_str(data.get("deep_meaning")) or cls._as_str(data.get("hidden_meaning"))
+        condition = cls._as_str(data.get("condition")) or cls._as_str(data.get("trigger_condition"))
+        consequence = cls._as_str(data.get("consequence"))
+        constraint = cls._as_str(data.get("constraint")) or surface_text
+        source = cls._as_str(data.get("source"))
+        source_type = cls._as_str(data.get("source_type"), "system") or "system"
+        source_id = cls._as_str(data.get("source_id")) or None
+
+        is_authentic_raw = data.get("is_authentic")
+        if isinstance(is_authentic_raw, bool):
+            is_authentic: bool | None = is_authentic_raw
+        else:
+            legacy_is_true = data.get("is_true")
+            is_authentic = legacy_is_true if isinstance(legacy_is_true, bool) else None
+
+        reliability = cls._as_float(data.get("reliability"), 1.0 if is_authentic is not False else 0.35)
+        confidence = cls._as_float(data.get("confidence"), reliability)
+        rule_id = cls._as_str(data.get("rule_id")) or f"rule_{fallback_index}"
+
+        return cls(
+            rule_id=rule_id,
+            surface_text=surface_text,
+            deep_meaning=deep_meaning,
+            condition=condition,
+            constraint=constraint,
+            consequence=consequence,
+            source=source,
+            source_type=source_type,
+            source_id=source_id,
+            is_authentic=is_authentic,
+            reliability=max(0.0, min(1.0, reliability)),
+            evolves_into=cls._as_str(data.get("evolves_into")) or None,
+            rule_type=cls._as_str(data.get("rule_type")) or None,
+            related_npc=cls._as_str(data.get("related_npc")) or None,
+            opposing_npc=cls._as_str(data.get("opposing_npc")) or None,
+            truth_status=cls._normalize_truth_status(data.get("truth_status"), is_authentic),
+            confidence=max(0.0, min(1.0, confidence)),
+        )
 
 
 @dataclass
@@ -224,6 +375,14 @@ class GameSession:
     # 全局世界状态：记录公共环境状态（关键道具位置、所有玩家状态等）
     world_flags: JsonObject = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """统一规则结构，避免旧存档和新生成数据混用时分叉。"""
+        self.rules = [Rule.from_dict(rule, index).to_dict() for index, rule in enumerate(self.rules)]
+
+    def get_rule_objects(self) -> list[Rule]:
+        """获取规则对象列表。"""
+        return [Rule.from_dict(rule, index) for index, rule in enumerate(self.rules)]
+
     def add_player(self, player: Player) -> bool:
         """添加玩家"""
         if len(self.players) >= 5 and self.game_mode == "多人":
@@ -317,7 +476,7 @@ class GameSession:
             "game_mode": self.game_mode,
             "status": self.status.value,
             "players": {pid: p.to_dict() for pid, p in self.players.items()},
-            "rules": self.rules,
+            "rules": [rule.to_dict() for rule in self.get_rule_objects()],
             "win_condition": self.win_condition,
             "clues": self.clues,
             "core_symbols": self.core_symbols,
@@ -401,7 +560,7 @@ class GameSession:
             session.players = {}
 
         rules_raw = data.get("rules", [])
-        session.rules = [x for x in rules_raw if isinstance(x, dict)] if isinstance(rules_raw, list) else []
+        session.rules = [Rule.from_dict(x, index).to_dict() for index, x in enumerate(rules_raw)] if isinstance(rules_raw, list) else []
 
         session.win_condition = str(data.get("win_condition", "") or "")
 
@@ -469,7 +628,7 @@ class GameSession:
             if isinstance(known_indices, list):
                 for idx in sorted({int(x) for x in known_indices if isinstance(x, int)}):
                     if 0 <= idx < len(session.rules):
-                        text = str(session.rules[idx].get("text", "")).strip()
+                        text = Rule.from_dict(session.rules[idx], idx).surface_text.strip()
                         if text:
                             legacy_rules.append(text)
 
