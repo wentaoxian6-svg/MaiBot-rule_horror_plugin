@@ -5,6 +5,7 @@ import logging
 import re
 from typing import TypeAlias
 
+from ...common.models import JsonObject
 from ..llm.client import LLMClient
 from ..game.models import GameSession, Rule
 

@@ -1,6 +1,6 @@
 """Plugin System 类型存根文件"""
 from __future__ import annotations
-from typing import Any, Callable, Optional, TypeVar, Generic, Type
+from typing import Any, Optional, Type, TypeVar
 
 T = TypeVar('T')
 

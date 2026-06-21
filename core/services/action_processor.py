@@ -106,6 +106,25 @@ class ActionProcessor:
         player.recorded_rules = merged_rules
         return added_count
 
+    @staticmethod
+    def _normalize_item_name(text: object) -> str:
+        return re.sub(r"\s+", "", str(text or "").strip()).lower()
+
+    def _add_inventory_item_once(self, player: Player, item: JsonObject) -> bool:
+        """按名称去重添加背包物品，避免同一线索/道具反复刷屏。"""
+        item_name = self._normalize_item_name(item.get("name", ""))
+        if not item_name:
+            return False
+
+        for existing in player.inventory:
+            if not isinstance(existing, dict):
+                continue
+            if self._normalize_item_name(existing.get("name", "")) == item_name:
+                return False
+
+        player.inventory.append(item)
+        return True
+
     def _apply_feedback_state_updates(self, player: Player, updates: Mapping[str, Any]) -> None:
         """应用沉浸式反馈带来的额外状态变化。"""
         sanity_delta = updates.get("sanity")
@@ -189,7 +208,7 @@ class ActionProcessor:
         # 首先检查是否是使用物品的行动
         item_used, item_effect_text = self.item_manager.check_and_use_item(action, player, session)
         if item_used:
-            logger.info(f"玩家使用了物品，跳过LLM判定")
+            logger.info("玩家使用了物品，跳过LLM判定")
             # 创建结果对象
             result = ActionResult(
                 description=item_effect_text or "你使用了物品。",
@@ -285,7 +304,7 @@ class ActionProcessor:
             if is_key_item == "是":
                 key_item_found = True
                 # 添加关键物品到背包
-                player.inventory.append({
+                self._add_inventory_item_once(player, {
                     "name": item_details.get("item_name", found_items[0]),
                     "type": item_details.get("item_type", "线索"),
                     "description": item_details.get("item_description", ""),
@@ -295,7 +314,7 @@ class ActionProcessor:
             else:
                 # 添加普通物品到背包
                 for item in found_items:
-                    player.inventory.append({
+                    self._add_inventory_item_once(player, {
                         "name": item,
                         "type": "物品",
                         "description": "",
@@ -304,7 +323,7 @@ class ActionProcessor:
         elif found_items:
             # 添加普通物品到背包
             for item in found_items:
-                player.inventory.append({
+                self._add_inventory_item_once(player, {
                     "name": item,
                     "type": "物品",
                     "description": "",
@@ -753,7 +772,7 @@ class ActionProcessor:
         # 构建条件提示文本
         conditions_text = ""
         if satisfied_conditions:
-            conditions_text = f"\n**已满足的条件**（这些条件表明可能需要规则变异）：\n" + "\n".join(f"- {c}" for c in satisfied_conditions)
+            conditions_text = "\n**已满足的条件**（这些条件表明可能需要规则变异）：\n" + "\n".join(f"- {c}" for c in satisfied_conditions)
         
         # 第一步：评估是否需要规则变异
         evaluation_prompt = f"""
@@ -1317,7 +1336,7 @@ class ActionProcessor:
         
         # 添加发现的线索到背包
         for clue in result.discovered_clues:
-            player.inventory.append({
+            self._add_inventory_item_once(player, {
                 "type": "clue",
                 "name": clue,
                 "description": "一条重要的线索",
@@ -1956,7 +1975,7 @@ class ActionProcessor:
                 max_tokens=get_default_max_tokens(),
             )
 
-            result = response.parse_json()
+            response.parse_json()
             logger.info(f"追杀事件已生成: {player.name} 被 {npc_name} 追杀")
 
             # 这里可以添加发送给玩家的逻辑

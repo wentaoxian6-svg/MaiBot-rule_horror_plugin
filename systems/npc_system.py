@@ -295,9 +295,7 @@ class NPCMemory:
         """更新对玩家的态度"""
         if player_id not in self.player_attitudes:
             self.player_attitudes[player_id] = NPCAttitude.NEUTRAL
-        
-        current_attitude = self.player_attitudes[player_id]
-        
+
         if delta_attitude > 0.3:
             new_attitude = NPCAttitude.FRIENDLY
         elif delta_attitude > 0.1:
@@ -678,9 +676,7 @@ class NPC:
     def generate_dialogue(self, player_id: str, context: str) -> str:
         """生成对话内容"""
         attitude = self.memory.get_attitude(player_id)
-        trust_level = self.memory.get_trust_level(player_id)
-        suspicion_level = self.memory.get_suspicion_level(player_id)
-        
+
         dialogue_prompts = {
             NPCAttitude.FRIENDLY: [
                 f"【{self.name}露出微笑，向你走近一步】你好，{context}。",

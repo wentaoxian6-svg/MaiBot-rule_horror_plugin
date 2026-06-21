@@ -6,8 +6,8 @@ import re
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from ..core import AsyncImageGenerator, GameSession, GameStateManager, GameStatus, Player, SaveManager
 from ..common import GameModes, JsonObject
+from ..core import GameSession, GameStateManager, GameStatus, Player, SaveManager
 from ..helpers import assign_multiplayer_identities
 from ..systems import DoorState, EnvironmentState, LightState
 
@@ -141,6 +141,14 @@ class MultiplayerFlow:
                 await self.command.send_text("多人模式至少需要 2 名玩家。请先让其他玩家使用 `/rg 加入`。")
                 return False, "人数不足", 2
 
+            target_players = lobby_meta.get("target_players")
+            if isinstance(target_players, int) and target_players > 0 and len(lobby.players) < target_players:
+                await self.command.send_text(
+                    f"这个大厅的目标人数是 {target_players} 人，目前只有 {len(lobby.players)} 人。\n"
+                    "请等人数到齐后再发送 `/rg 开始 多人 开始`。"
+                )
+                return False, "人数未到齐", 2
+
             lobby_order = list(order)
             lobby_players = [(pid, lobby.players[pid].name) for pid in lobby_order if pid in lobby.players]
             known_pids = {pid for pid, _ in lobby_players}
@@ -192,7 +200,7 @@ class MultiplayerFlow:
                 if m2:
                     try:
                         n = int(m2.group(1))
-                        if 2 <= n <= 4:
+                        if 2 <= n <= 5:
                             multi_target = n
                     except Exception:
                         pass

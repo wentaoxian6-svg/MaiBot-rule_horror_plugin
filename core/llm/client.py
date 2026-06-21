@@ -192,7 +192,6 @@ class LLMResponse:
 
                 if char == '"' and not escape_next:
                     # 检查这是否是JSON结构中的引号（键或值的开头/结尾）
-                    prev_char = json_str[i-1] if i > 0 else ''
                     next_char = json_str[i+1] if i < len(json_str) - 1 else ''
 
                     # 如果在字符串内部，这个引号需要转义

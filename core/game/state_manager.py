@@ -161,6 +161,9 @@ class GameStateManager:
 
                 if state:
                     await state.acquire()
+                    if state.session is None:
+                        state.release()
+                        return None
                     return state
                 return None
         except asyncio.TimeoutError:
