@@ -612,9 +612,16 @@ class SharedCommandHandlersMixin:
                 except Exception as exc:
                     logger.warning("NPC 模拟执行失败: %s", exc)
 
+            near_win = False
             if not session.has_cleared:
-                has_cleared = await self._ending_judge.check_win_condition(session=session, player=player)
-                if has_cleared:
+                win_progress = await self._ending_judge.check_win_condition(session=session, player=player)
+                if isinstance(win_progress, dict):
+                    if win_progress.get("achieved"):
+                        session.has_cleared = True
+                    elif win_progress.get("near"):
+                        near_win = True
+                elif win_progress:
+                    # 兼容旧的布尔返回
                     session.has_cleared = True
 
             injury = str(getattr(player, "injury", "无伤") or "无伤")
@@ -694,9 +701,20 @@ class SharedCommandHandlersMixin:
 
             if session.has_cleared:
                 await self.send_text(
-                    "你已经碰到了离开的条件。\n\n"
-                    "如果还想继续深挖，就用 `/rg 继续`；如果准备收束这一局，就用 `/rg 结束`。"
+                    "目标已经达成，这一局随时可以收束。\n\n"
+                    "- `/rg 结束`：直接以当前状态通关结算\n"
+                    "- `/rg 继续`：留下来继续探索，弄清怪谈的根源，冲击完美结局"
                 )
+            elif near_win:
+                env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
+                if not env_state.get("near_win_notified"):
+                    env_state["near_win_notified"] = True
+                    await self.send_text(
+                        "你距离目标只差最后一步了。\n\n"
+                        "现在你可以选择：\n"
+                        "- 直接完成目标，尽快脱身（完成后用 `/rg 结束` 结算）\n"
+                        "- 先不急着离开，继续探索这里的真相，设法从根源上解决怪谈，达成完美结局"
+                    )
 
             if result.is_fatal or player.status != PlayerStatus.ALIVE:
                 if player.sanity == 0:
@@ -819,13 +837,14 @@ class SharedCommandHandlersMixin:
             "- `/rg 剧情` - 重发剧情导入\n"
             "- `/rg 规则` - 查看你的规则笔记\n"
             "- `/rg 记录规则 <内容>` - 手动记录规则笔记\n"
-            "- `/rg 场景` - 回看你对场景的整体印象\n"
+            "- `/rg 场景` - 查看场景整体印象和当前位置\n"
+            "- `/rg 区域` - 查看场景中的全部区域\n"
             "- `/rg 道具 [名称]` - 查看道具列表或详情\n"
             "- `/rg 线索 [名称]` - 查看已整理出的线索\n"
             "- `/rg 提示 <规则/线索>` - 获取非剧透提示\n"
             "- `/rg 推理 <内容>` - 记录推理\n"
             "- `/rg 行动 <描述>` - 推进行动\n"
-            "- `/rg 继续` - 达成通关后继续探索\n"
+            "- `/rg 继续` - 达成目标后继续探索，冲击完美结局\n"
             "- `/rg 结束` - 结束游戏并判定结局\n\n"
             "**提示**\n"
             "- 规则不会一次性全部告诉你，探索、观察和推理都很重要。"
@@ -860,7 +879,7 @@ class SharedCommandHandlersMixin:
             scene_image = await image_generator.generate_scene_image(
                 scene_name=session.scene_name,
                 background=session.background,
-                arrival_reason=session.player_identity,
+                player_identity=session.player_identity,
                 core_symbols=getattr(session, "core_symbols", None),
                 use_cache=True,
             )
@@ -973,6 +992,39 @@ class SharedCommandHandlersMixin:
             current_location = str(getattr(player, "location", "") or "").strip() if player else ""
             await self.send_text(self._build_scene_overview_text(session, current_location=current_location, plural=False))
             return True, "场景已显示", 2
+        finally:
+            state.release()
+
+    async def _handle_区域(
+        self,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        rest_input: str,
+    ) -> tuple[bool, str | None, int]:
+        _ = user_id
+        _ = user_name
+        _ = rest_input
+
+        state_manager = GameStateManager()
+        state = await state_manager.get(group_id)
+        if not state or not state.session:
+            await self.send_text("当前没有正在进行的游戏。")
+            return False, "无游戏", 2
+
+        try:
+            if not await self._ensure_active_game_session(state.session):
+                return False, "游戏未开始", 2
+
+            areas = self._collect_scene_area_names(state.session)
+            if not areas:
+                await self.send_text("这里的区域暂时还无法确认。")
+                return False, "无区域信息", 2
+
+            lines = ["**场景区域**", ""]
+            lines.extend(f"{index}. {area}" for index, area in enumerate(areas, start=1))
+            await self.send_text("\n".join(lines))
+            return True, "区域已显示", 2
         finally:
             state.release()
 
@@ -1094,7 +1146,7 @@ class SharedCommandHandlersMixin:
                 return False, "游戏未开始", 2
 
             if not state.session.has_cleared:
-                await self.send_text("你还未达成通关条件，请继续探索。")
+                await self.send_text("你还没有达成目标，先继续探索吧。")
                 return False, "未通关", 2
 
             await self.send_text(
@@ -1272,6 +1324,7 @@ class SharedCommandHandlersMixin:
     _handle_end = _handle_结束
     _handle_help = _handle_帮助
     _handle_scene = _handle_场景
+    _handle_areas = _handle_区域
     _handle_plot = _handle_剧情
     _handle_story = _handle_剧情
     _handle_item = _handle_道具

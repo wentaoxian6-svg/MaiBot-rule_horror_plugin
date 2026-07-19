@@ -410,16 +410,17 @@ class EndingJudge:
         self,
         session: GameSession,
         player: Player,
-    ) -> bool:
+    ) -> dict:
         """
-        检查是否达成通关条件
-        
+        检查通关条件进度
+
         Args:
             session: 游戏会话
             player: 玩家对象
-        
+
         Returns:
-            是否达成通关条件
+            {"achieved": bool, "near": bool, "reason": str}
+            achieved 表示已达成通关条件；near 表示已备齐条件、只差一次行动完成目标
         """
         context = {
             "win_condition": session.win_condition,
@@ -434,11 +435,19 @@ class EndingJudge:
         
         system_prompt = """你是规则怪谈游戏的通关条件检查系统.
 
-请根据通关条件和玩家的状态,行动,发现的线索,判断玩家是否达成了通关条件.
+请根据通关条件和玩家的状态,行动,发现的线索,判断玩家的通关进度.
+
+判定标准:
+- achieved: 玩家已经实际完成了通关条件描述的达成状态
+- near: 玩家已经完成通关所需的全部准备，只差下一次使用 `/rg 行动 <描述>` 直接完成目标。例如已站在出口门前但还没离开，或已找到目标人物且就在身边但还没带出去
+- near 不能表示“还需要继续搜索、收集物品、推理、确认路线、处理多个步骤”或“理论上接近”；只要下一次行动不能直接完成目标，就必须为 false
+- 不要把玩家尚未明确拥有或抵达的条件当作已经准备完成；拿不准时填 false
+- 两者不能同时为 true;拿不准时都填 false,不要凭氛围猜测
 
 返回JSON格式:
 {
     "achieved": true/false,
+    "near": true/false,
     "reason": "判断理由"
 }"""
 
@@ -476,13 +485,17 @@ class EndingJudge:
             )
             
             result = response.parse_json()
-            achieved = result.get("achieved", False)
-            
+            achieved = bool(result.get("achieved", False))
+            near = bool(result.get("near", False)) and not achieved
+            reason = str(result.get("reason", "") or "")
+
             if achieved:
-                logger.info(f"达成通关条件: {result.get('reason', '')}")
-            
-            return achieved
-            
+                logger.info(f"达成通关条件: {reason}")
+            elif near:
+                logger.info(f"临近通关条件: {reason}")
+
+            return {"achieved": achieved, "near": near, "reason": reason}
+
         except Exception as e:
             logger.error(f"检查通关条件失败: {e}")
-            return False
+            return {"achieved": False, "near": False, "reason": ""}

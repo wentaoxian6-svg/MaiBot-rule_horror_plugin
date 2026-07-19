@@ -33,6 +33,28 @@ class GameGenerator:
         return normalized.strip()
 
     @classmethod
+    def _sanitize_background_text(cls, text: object) -> str:
+        normalized = cls._normalize_free_text(text)
+        if not normalized:
+            return ""
+
+        blocked = (
+            "规则", "规矩", "守则", "须知", "提醒", "目标", "任务", "通关", "玩家", "你要", "你必须",
+            "你不能", "你不要", "你需要", "你们要", "你们必须", "你们不能", "你们不要",
+        )
+        directive = re.compile(r"(?:必须|禁止|不得|严禁|务必|不要|不能).{0,28}(?:。|！|？|$)")
+        sentences = [item.strip() for item in re.split(r"(?<=[。！？])", normalized) if item.strip()]
+        kept: list[str] = []
+        for sentence in sentences:
+            if any(token in sentence for token in blocked):
+                continue
+            if directive.search(sentence):
+                continue
+            kept.append(sentence)
+
+        return "".join(kept).strip()
+
+    @classmethod
     def _compress_narrative_text(
         cls,
         text: object,
@@ -79,26 +101,15 @@ class GameGenerator:
 
     @classmethod
     def _sanitize_npc_guidance_texts(cls, data: GameData) -> GameData:
-        """收紧 NPC 开场文本，避免长图和对话变成培训手册。"""
         sanitized = dict(data)
-        sanitized["npc_behavior"] = cls._compress_narrative_text(
-            sanitized.get("npc_behavior", ""),
-            max_units=2,
-            max_chars=72,
-            clause_mode=False,
-        )
-        sanitized["npc_dialogue"] = cls._compress_narrative_text(
-            sanitized.get("npc_dialogue", ""),
-            max_units=4,
-            max_chars=88,
-            clause_mode=True,
-        )
-        sanitized["rule_carrier_description"] = cls._compress_narrative_text(
-            sanitized.get("rule_carrier_description", ""),
-            max_units=3,
-            max_chars=96,
-            clause_mode=False,
-        )
+        sanitized["npc_behavior"] = cls._normalize_free_text(sanitized.get("npc_behavior", ""))
+        sanitized["conversation_intent"] = cls._normalize_free_text(sanitized.get("conversation_intent", ""))
+        sanitized["npc_dialogue"] = ""
+        sanitized["rule_carrier_description"] = cls._normalize_free_text(sanitized.get("rule_carrier_description", ""))
+        hinted_raw = sanitized.get("hinted_rule_texts", [])
+        sanitized["hinted_rule_texts"] = [
+            str(item).strip() for item in hinted_raw if str(item).strip()
+        ][:2] if isinstance(hinted_raw, list) else []
         return sanitized
 
     def _normalize_rules(
@@ -205,13 +216,7 @@ class GameGenerator:
         # 生成场景和规则
         game_data = await self._generate_scene_and_rules(game_mode)
         
-        # 创建游戏会话
-        # 多人模式下：优先把“到来原因”作为对外展示的共同叙事入口，个人身份通过私聊下发
         player_identity = game_data.get("player_identity", "访客")
-        if game_mode == "多人":
-            arrival_reason = game_data.get("arrival_reason")
-            if isinstance(arrival_reason, str) and arrival_reason.strip():
-                player_identity = arrival_reason.strip()
 
         session = GameSession(
             group_id=group_id,
@@ -513,6 +518,7 @@ class GameGenerator:
         npc_role = str(npc_guidance.get("npc_role", "引导 NPC") or "引导 NPC").strip()
         npc_behavior = str(npc_guidance.get("npc_behavior", "") or "").strip()
         npc_attitude = str(npc_guidance.get("npc_attitude", "") or "").strip()
+        conversation_intent = str(npc_guidance.get("conversation_intent", "") or "").strip()
         return [
             {
                 "npc_id": "guide_0",
@@ -522,17 +528,17 @@ class GameGenerator:
                 "home_area": "",
                 "duty_areas": [],
                 "current_location": "",
-                "behavior_logic_summary": npc_behavior or "负责接待新来者、分派任务，并在异常出现前维持现场秩序。",
-                "current_goal": "维持当前场域秩序并观察新来者",
-                "last_action": "刚结束一次例行巡视",
-                "audible_signature": "平稳的脚步声",
+                "behavior_logic_summary": npc_behavior or f"{npc_role}正在处理自己的日常事务。",
+                "current_goal": conversation_intent or "处理眼前尚未完成的事情",
+                "last_action": npc_behavior,
+                "audible_signature": "",
                 "danger_level": "低",
                 "can_speak": True,
                 "knowledge_reliability": 0.75,
                 "deception_tendency": 0.1,
                 "corruption_level": 0.0,
                 "current_state": "稳定",
-                "bias_tags": ["维持秩序"],
+                "bias_tags": [],
                 "known_rule_ids": [],
             }
         ]
@@ -810,7 +816,7 @@ class GameGenerator:
         
         # Step 4: 生成NPC引导
         logger.info("Step 4: 生成NPC引导")
-        npc_guidance = await self._generate_npc_guidance(step1_data, step3_data)
+        npc_guidance = await self._generate_npc_guidance(step1_data, step2_data, step3_data, game_mode)
         npc_guidance["npc_roster"] = self._normalize_npc_roster(npc_guidance.get("npc_roster", []), npc_guidance)
         
         # 合并所有数据
@@ -843,15 +849,15 @@ class GameGenerator:
    - 避免：废弃的XX、神秘的XX、诡异的XX、阴森的XX
    - 场景名称要具体平实，如"青山医院"、"枫叶公寓"
 
-2. **背景故事**（200-300字）：表面正常的介绍，暗含诡异细节
-   - 描述场景的基本情况（建立时间、用途、规模等）
-   - 提及一些"奇怪的传闻"或"不成文的规矩"
-   - 用平淡的语气描述异常现象（如"员工流动率很高"、"某些房间总是空着"）
-   - 不要直接说"恐怖"、"悲剧"、"死亡"，而是用委婉暗示
+2. **背景故事**（160-240字）：只介绍场所本身的公共背景
+   - 只写场所的年代、用途、规模、服务对象、经营或管理现状、公开传闻与长期存在的异常迹象
+   - 使用第三人称客观叙述，不出现“你”“你们”“玩家”，不描述任何人此刻进入、醒来、搬入、报到或接受任务
+   - 严禁写规则、守则、禁令、行动建议、任务、目标、通关条件、NPC台词或玩家当下看到的场景
+   - 不使用“必须、禁止、不得、不要、务必”等命令式表达
+   - 背景只负责回答“这是一个什么地方，它过去和现在大致怎样”，不要承担开场剧情功能
 
-3. **玩家身份**：普通的日常身份
-   - 好的例子：新来的夜班护士、刚入职的便利店员工、新租户、实习生
-   - 身份要让玩家觉得"这可能发生在我身上"
+3. **玩家身份**：只写一个与场所自然匹配的日常身份
+   - 用一句简洁名词性短语描述，不编造到来原因，不附带任务、目标、规则或剧情
 
 4. **核心象征符号**：1-2个（不要超过2个！）
    - 符号应该是场景中反复出现的元素
@@ -867,7 +873,7 @@ class GameGenerator:
   "scene_name": "场景名称",
   "background": "背景故事",
   "player_identity": "玩家身份",
-  "arrival_reason": "到来原因",
+  "arrival_reason": "可留空，不用于背景或身份展示",
   "core_symbols": ["符号1", "符号2"],
   "hidden_truth": "隐藏真相"
 }
@@ -884,13 +890,13 @@ class GameGenerator:
 游戏模式：{game_mode}
 
 风格要求：
-1. 日常场景（医院、公寓、便利店、图书馆等）
+1. 从现实生活中选择具体场所，不受医院、公寓、便利店等常见题材限制
 2. 表面正常，细节诡异
 3. 用平淡语气描述异常
 4. 避免直接的恐怖描写
 5. 每次生成不同的场景
 
-{"多人模式特别要求：\n1. 场景应该支持多种不同身份（如医院可以有护士、医生、病人、护工等）\n2. 所有叙述使用第二人称复数'你们'，不要出现'你'、'你的'等单人叙述\n3. arrival_reason 描述一行人来到场景的共同原因\n4. player_identity 描述为'你们各自的身份'或'一行人的不同身份'\n5. background 中使用'你们发现'、'你们注意到'等复数表述" if game_mode == "多人" else "单人模式要求：\n1. 使用第二人称单数'你'、'你的'进行叙述\n2. 描述玩家独自来到场景的原因"}
+{"多人模式特别要求：\n1. 场景应支持多种合理身份\n2. background 仍使用第三人称客观叙述，不出现玩家视角\n3. player_identity 写成简洁的公共身份概括，个人身份由后续系统生成\n4. arrival_reason 留空" if game_mode == "多人" else "单人模式要求：\n1. background 使用第三人称客观叙述\n2. player_identity 只写身份本身\n3. arrival_reason 留空"}
 
 
 请直接返回JSON对象，不要有任何其他文字。"""
@@ -903,6 +909,27 @@ class GameGenerator:
             )
 
             data = response.parse_json()
+
+            background = self._sanitize_background_text(data.get("background", ""))
+            if len(background) < 80:
+                background_response = await self.llm_client.call(
+                    prompt=f"""请只重写场所背景。
+
+场景名称：{data.get('scene_name', '')}
+原始背景：{data.get('background', '')}
+
+要求：
+1. 160-240字，第三人称客观介绍场所的年代、用途、规模、服务对象、经营管理现状、公开传闻和长期异常迹象。
+2. 不出现玩家视角、到来过程、身份、任务、目标、规则、规矩、守则、禁令、行动建议、NPC台词或当前场景。
+3. 不使用“必须、禁止、不得、不要、务必”等命令式表达。
+4. 只输出背景正文。""",
+                    system_prompt="你只负责撰写场所公共背景，不写开场剧情、规则、身份、目标或对话。",
+                    temperature=0.8,
+                )
+                background = self._sanitize_background_text(background_response.clean_content)
+            data["background"] = background
+            data["player_identity"] = self._normalize_free_text(data.get("player_identity", ""))
+            data["arrival_reason"] = ""
 
             # 强制限制核心象征符号最多2个
             if "core_symbols" in data and len(data["core_symbols"]) > 2:
@@ -1012,9 +1039,11 @@ class GameGenerator:
    - 两条规则直接矛盾，无法同时遵守
    - 标记related_npc（该规则代表谁）和opposing_npc（对抗谁）
 
-5. **通关条件**：设定明确的通关条件
-   - 如：在规定时间内找到出口、收集特定物品、存活到天亮等
-   - 通关条件应该与规则和真相有逻辑关联
+5. **通关条件（win_condition）**：用一句话告诉玩家“怎样算通关”
+   - 必须是 12-30 字的单句，可直接判定是否达成，如“活着撑到天亮并离开这栋楼”“找到失踪的同事并带他出去”
+   - 只写达成状态本身，不写过程要求、行为限制、注意事项或“否则会怎样”
+   - 不使用“并且”“同时”串联多个独立条件；一句里最多一个动作加一个结果
+   - 严禁把规则内容塞进 win_condition；规则归规则，通关条件归通关条件
 
 6. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
 7. **显式语义字段**（重要）：
@@ -1085,82 +1114,57 @@ class GameGenerator:
     async def _generate_npc_guidance(
         self,
         plot_data: GameData,
-        rules_data: GameData
+        structure_data: GameData,
+        rules_data: GameData,
+        game_mode: str,
     ) -> GameData:
         """Step 4: 生成NPC引导和 NPC roster。"""
-        system_prompt = """你是规则怪谈游戏的开场遭遇生成器。请基于场景、隐藏真相和规则，为玩家生成一个更像真实剧情的 NPC 初次接触片段。
+        system_prompt = """你负责为规则怪谈建立开场时存在的人物与信息入口，但不要撰写开场正文，也不要预写 NPC 台词。
 
-你的目标不是“把规则宣布出来”，而是生成一个自然、沉浸、符合场景的开场遭遇：
+你的任务是先确定“现场有没有人、是谁、正在做什么、为什么会与玩家发生交流、玩家最初能接触到哪些规则信息”。真正说出口的话将在下一阶段根据现场即时生成。
 
-1. 开场不一定必须有 NPC。
-   - 可以有人接待、交接、分派任务
-   - 也可以完全没有 NPC，由玩家独自在空房间、值班室、病床、休息室、储物间等地点醒来或恢复意识，再自行探索
-2. 如果有 NPC，NPC 首要职责应是接待、分派任务、交接班、安排岗位、提醒异常、制造不安感，而不是像系统公告一样逐条宣读规则。
-3. 开场大多数情况下不要直接完整告诉玩家规则。
-4. 如果 NPC 开口提到注意事项，可以是零碎、口语化、带情绪或带个人立场的提醒，不要整理成清单。
-5. natural_language 模式下允许 NPC 说出一部分规则性内容，也允许夹杂无关提醒、误导、虚假规则或彼此矛盾的说法；这些内容只是剧情中的口述信息，不代表系统确认后的规则。
-6. natural_language 模式下，禁止 NPC 在开场直接完整宣读规则总表，也不要输出编号式、条文化、培训手册式的整段说明。
-7. 允许 NPC 什么都不明说，只给任务、态度、暗示、误导、回避或模棱两可的话。
-8. 如果使用 rule_carrier，也不要把载体内容完整展开；只描述 NPC 如何把某份纸面材料、便签、值班记录、工作守则留给玩家，真正内容留给后续探索。
-9. 如果没有 NPC，开场重点应放在：
-   - 玩家醒来时的身体感觉、环境异样、光线、声音、气味
-   - 房间里留下的痕迹、物件、纸张、广播、门外动静
-   - “为什么这里只有我”“刚刚这里发生了什么”的不安感
-10. 对话必须像场景中的人说出来的话，不能像旁白总结、系统提示、玩法教程或客服说明。
-11. 严禁出现以下表达：
-   - “接下来你要遵守以下规则”
-   - “这里有几条规则/一共X条规则”
-   - “系统会……”
-   - “请使用……命令”
-   - 任何编号、分点、清单式口吻
-12. natural_language 模式下，开场对话更适合：
-   - 简短交接
-   - 模糊警告
-   - 任务催促
-   - 不完整说明
-   - 带个人情绪的抱怨或回避
-13. natural_language 模式下，NPC 可以说“别去后面”“先干活”“十一点后别乱碰冷柜”“听见有人叫你也别急着回头”这类零散说法，但不要把它们包装成正式规则列表。
-14. 如果是多人开场，NPC 可以面对“一行人”统一说话，但不要在公开对话里直接暴露每个人的私密身份规则。
-15. 要保留危险感、含混感和世界内叙事感，让玩家觉得自己是在进入一个不对劲的地方，而不是在读玩法说明。
-16. 所有可见文本都应该像“现场片段”，不是“完整交接稿”。
-17. 如果 NPC 很赶时间，他只会留下零碎几句，不会站在原地讲长篇大论。
+要求：
+1. NPC 必须属于这个场所，而不是为了引导玩家临时出现的工具人。他应有自己的工作、麻烦、目的、偏见和注意力焦点。
+2. 不要默认使用接待员、值班人、交接员、前台、保安或管理员。只有场景确实需要时才能选择这些角色。
+3. NPC 不必主动欢迎或指导玩家。他可以忙于别的事、认错人、避开玩家、向玩家求助、质问玩家、无视玩家，或只因一个具体事件开口。
+4. 不要生成教程、任务清单或通关提示。
+5. NPC 不掌握完整规则总表和隐藏真相。他只可能零散知道你在 `hinted_rule_texts` 中选出的内容，其余规则他并不清楚。
+6. `npc_behavior` 只描述此刻可见的动作、神态、位置和正在处理的具体事情，必须能让读者看清空间关系。
+7. `conversation_intent` 只写 NPC 此刻为什么可能开口、想从玩家那里得到什么、想隐瞒什么或想让交流走向哪里；不要写任何直接台词。
+8. 只有当这个场所此刻确实不该有人时才使用 `none`（如凌晨的空置楼层）。大多数有人气的场所应选择 natural_language 或 rule_carrier，不要为了省事全部留空。
+9. `rule_carrier` 表示现场存在一个玩家可见或可拾取的自然载体（守则、告示、值班记录、便签等）。载体在开场只需“被看见”，内容由玩家主动查看后获得。
+10. NPC roster 中的角色必须使用场景结构里真实存在的区域，行为目标必须是世界内目标。
 
 字段要求：
 
 1. guidance_method
-   - natural_language：NPC 用自然对话、交接、催促、盘问、命令、抱怨、含糊提醒等方式出场
-   - rule_carrier：NPC 主要通过交付某种纸面/物件/记录完成开场接触
-   - none：开场没有 NPC，玩家独自醒来或独自置身场景中
+   - natural_language：NPC 在场，可能在交流中自然带出零散的注意事项
+   - rule_carrier：开场信息主要来自一份现场可见的纸面/物件/记录
+   - none：开场既没有人也没有明显的信息载体，玩家完全自行探索
 
 2. npc_behavior
-   - 35-80 字
-   - 第二人称视角
-   - 只写玩家眼前看到的动作、神态、环境细节，不要写 NPC 台词
-   - 最多 2 句，不要写成长段旁白
-   - 如果 guidance_method 为 none，这里改为“玩家醒来或察觉环境异常时，眼前发生的事”
+   - 只写可见动作、神态、具体位置和正在处理的事情
+   - 不写玩家感受，不写台词，不写“负责引导玩家”
 
-3. npc_dialogue
-   - 40-110 字
-   - 仅在 natural_language 下填写
-   - 必须是 NPC 直接说出口的话
-   - 允许停顿、岔开话题、欲言又止、重复强调某个异常点
-   - 最多 4 个短句，像真人匆忙交代，不要连续讲一大段
-   - 更适合“交接班”“分派任务”“催促开工”“低声提醒”“不耐烦地纠正”
-   - 可以包含少量规则性提醒、误导、虚假说法、矛盾说法或无关紧要的规矩
-   - 禁止出现完整规则总表、编号式注意事项、培训手册式说明
-   - 禁止一口气连续交代 5 件以上事情，也不要出现“记住了”“我再说一遍”这类总结口吻
+3. conversation_intent
+   - 描述 NPC 的交流动机、关注点和隐瞒点
+   - 禁止写引号内台词或完整对话
 
-4. rule_carrier_title / rule_carrier_description
+4. hinted_rule_texts
+   - 从提供的正式规则中挑选 0-2 条，表示 NPC 平时耳闻或亲身遵守、可能在交流中顺口带出的内容
+   - 只填规则原文，改写工作交给下一阶段；natural_language 下建议至少选 1 条
+   - none 或 rule_carrier 模式下可留空列表
+
+5. rule_carrier_title / rule_carrier_description
    - 仅在 rule_carrier 下填写
    - title 是物件或文书本身的名称，如“夜班交接单”“四层保洁记录”“值班室抽屉里的便签”
-   - description 只描述它如何被递来、塞来、指给玩家、留在某处，不要把正文规则完整写出来
+   - description 描述它此刻在现场的位置与状态（贴在哪、压在哪、由谁递来），不要把正文规则完整写出来
    - 40-100 字，1-2 句即可
 
-5. npc_roster
+6. npc_roster
    - 如果 guidance_method 为 none，则允许为空列表
    - 生成 1-3 个可进入运行时模拟的 NPC
-   - 至少包含一个负责开场接待或岗位分派的 NPC
-   - 其他 NPC 可以是巡逻者、同事、沉默观察者、其他岗位人员
+   - 角色职业与行为应由场景决定，不要求任何人负责接待或岗位分派
    - 每个 NPC 都要给出岗位区域、行为逻辑摘要、当前目标、开场前刚做过什么、可听特征
    - current_goal 必须是世界内目标，例如“整理夜班登记簿”“巡视四层病房”“确认新来者是否按要求到岗”，不要写“完成开场引导”
    - knowledge_reliability 表示这名 NPC 掌握信息的可靠度，0.0~1.0
@@ -1176,9 +1180,11 @@ class GameGenerator:
   "npc_role": "NPC角色",
   "npc_attitude": "NPC对玩家的态度或气质，如冷淡、疲惫、急躁、敷衍、和善、戒备",
   "npc_behavior": "玩家眼前看到的开场动作与氛围",
-  "npc_dialogue": "NPC直接说出口的话",
+  "conversation_intent": "NPC此刻的交流动机、关注点和隐瞒点",
+  "hinted_rule_texts": ["NPC可能顺口带出的规则原文"],
+  "npc_dialogue": "留空",
   "rule_carrier_title": "载体名称",
-  "rule_carrier_description": "NPC交付或指向载体的场景描述",
+  "rule_carrier_description": "载体此刻在现场的位置与状态",
   "npc_roster": [
     {
       "npc_id": "guide_0",
@@ -1206,14 +1212,30 @@ class GameGenerator:
 仅返回 JSON，不要包含其他说明。"""
 
 
-        user_prompt = f"""请基于以下信息，生成一个自然、沉浸的 NPC 开场遭遇。
+        scene_structure = structure_data.get("scene_structure", {})
+        rules_raw = rules_data.get("rules", []) if isinstance(rules_data, dict) else []
+        rule_texts: list[str] = []
+        if isinstance(rules_raw, list):
+            for rule in rules_raw:
+                if isinstance(rule, dict):
+                    text = str(rule.get("text", "") or "").strip()
+                    if text:
+                        rule_texts.append(text)
+        user_prompt = f"""请建立开场现场中的人物状态与初始信息入口，不要生成台词。
 
 场景：{plot_data.get('scene_name', '')}
+公共背景：{plot_data.get('background', '')}
 玩家身份：{plot_data.get('player_identity', '')}
-隐藏真相：{plot_data.get('hidden_truth', '')}
-完整规则：{rules_data.get('rules', [])}
+游戏模式：{game_mode}
+建筑类型：{scene_structure.get('building_type', '') if isinstance(scene_structure, dict) else ''}
+总体布局：{scene_structure.get('overall_layout', '') if isinstance(scene_structure, dict) else ''}
+楼层与区域：{scene_structure.get('floors', []) if isinstance(scene_structure, dict) else []}
+特殊区域：{scene_structure.get('special_areas', []) if isinstance(scene_structure, dict) else []}
 
-如果适合，也可以完全不安排 NPC 出场，让玩家独自醒来并自行探索。"""
+本局正式规则（仅用于挑选 hinted_rule_texts，禁止全部塞给NPC）：
+{chr(10).join(f"- {text}" for text in rule_texts) if rule_texts else "- 无"}
+
+不要让角色承担“向玩家解释玩法”的职责。只有场所此刻确实无人时才选择 none。"""
 
 
         try:
@@ -1231,6 +1253,8 @@ class GameGenerator:
                 data["npc_name"] = ""
                 data["npc_role"] = ""
                 data["npc_attitude"] = ""
+                data["conversation_intent"] = ""
+                data["hinted_rule_texts"] = []
                 data["npc_dialogue"] = ""
                 data["rule_carrier_title"] = ""
                 data["rule_carrier_description"] = ""
@@ -1246,22 +1270,18 @@ class GameGenerator:
 
         except Exception as e:
             logger.error(f"生成NPC引导失败: {e}")
-            # NPC引导失败不影响游戏，返回默认值
             fallback = {
-                "guidance_method": "natural_language",
-                "npc_name": "值班人",
-                "npc_role": "夜班交接员",
-                "npc_attitude": "疲惫",
-                "npc_behavior": "值班桌后的那个人抬头看了你一眼，指尖还压着没整理完的登记表。他没有立刻招呼你，只是先确认门有没有关好，才朝你招了招手。",
-                "npc_dialogue": "新来的？先把门带上。今晚先待在自己该待的地方，拿不准的事就回来问我。",
-                "npc_roster": self._build_default_npc_roster(
-                    {
-                        "npc_name": "值班人",
-                        "npc_role": "夜班交接员",
-                        "npc_attitude": "疲惫",
-                        "npc_behavior": "值班桌后的那个人一边整理登记表，一边观察新来者的反应。",
-                    }
-                ),
+                "guidance_method": "none",
+                "npc_name": "",
+                "npc_role": "",
+                "npc_attitude": "",
+                "npc_behavior": "",
+                "conversation_intent": "",
+                "hinted_rule_texts": [],
+                "npc_dialogue": "",
+                "rule_carrier_title": "",
+                "rule_carrier_description": "",
+                "npc_roster": [],
             }
             return self._sanitize_npc_guidance_texts(fallback)
 

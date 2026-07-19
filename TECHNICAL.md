@@ -105,7 +105,7 @@ rule_horror_plugin-main/
 
 包含独立系统实现，例如：
 
-- `environment_evolution.py`: 环境演化
+- `environment_evolution.py`: 开局环境状态生成与保存
 - `environment_state.py`: 环境状态结构
 - `game_time_manager.py`: 时间推进
 - `multiplayer_physics_system.py`: 多人物理存在感
@@ -150,9 +150,13 @@ rule_horror_plugin-main/
 命令由 `plugin.py` 统一装配，随后委托给 `commands/handler.py` 和 `commands/shared_handlers.py`。常见命令包括：
 
 - 开局类：`开始`、`强制开始`、`加入`、`离开`
-- 查询类：`状态`、`剧情`、`规则`、`场景`、`身份`、`道具`、`线索`
+- 查询类：`状态`、`剧情`、`规则`、`场景`、`区域`、`身份`、`道具`、`线索`
 - 行为类：`行动`、`推理`、`记录规则`、`提示`、`继续`、`结束`
 - 存档类：`保存`、`读取`、`恢复`、`存档列表`、`清理存档`
+
+`/rg 场景` 只组合 `scene_impression` 与玩家当前位置；场景结构中全部楼层区域和特殊区域由 `/rg 区域` 单独以去重列表展示，避免把区域清单混入场景叙述。
+
+开局环境由 `EnvironmentEvolutionSystem.initialize_environment()` 使用主 LLM 生成并写入 `session.environment_state["environment_evolution"]`。该系统不再承担 NPC、规则、随机事件、身份权限或区域违规后果等已废弃职责。
 
 ### 规则笔记机制
 

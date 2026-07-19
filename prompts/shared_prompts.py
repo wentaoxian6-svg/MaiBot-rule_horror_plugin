@@ -309,18 +309,18 @@ def build_action_prompt_base(
 
 {'行动玩家：' + user_name + '，行动：' + action if is_action_player else '其他玩家行动：' + user_name + '，行动：' + action}
 
-当前时间：{time_system.get('current_time', '深夜')}
-时间描述：{time_system.get('time_description', '午夜时分，周围一片死寂')}
+当前时间：{time_system.get('current_time', '开场时刻')}
+时间描述：{time_system.get('time_description', '场所维持着当前的日常运行状态')}
 已过时间：{elapsed_minutes}分钟
 
 核心象征符号：{game_state.get('core_symbols', [])}
 
 环境状况：
-- 光线：{environment.get('lighting', '昏暗')}
-- 温度：{environment.get('temperature', '寒冷')}
-- 声音：{', '.join(environment.get('sounds', ['寂静']))}
-- 气味：{', '.join(environment.get('smells', ['霉味']))}
-- 氛围：{environment.get('atmosphere', '压抑')}
+- 光线：{environment.get('lighting', '未特别记录')}
+- 温度：{environment.get('temperature', '未特别记录')}
+- 声音：{', '.join(environment.get('sounds', [])) or '未特别记录'}
+- 气味：{', '.join(environment.get('smells', [])) or '未特别记录'}
+- 氛围：{environment.get('atmosphere', '由当前场景决定')}
 
 **环境记忆信息（避免重复描述）：**
 - 已访问过的地点：{[loc['location'] for loc in environment_memory.get('visited_locations', [])]}

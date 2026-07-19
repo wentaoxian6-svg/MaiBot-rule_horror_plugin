@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -73,6 +74,15 @@ class RuleHorrorPlugin(MaiBotPlugin):
         self.llm_client: LLMClient | None = None
         self.image_generator: AsyncImageGenerator | None = None
         self._temp_images_dir: str = ""
+        self._generation_locks: dict[str, asyncio.Lock] = {}
+
+    def get_generation_lock(self, group_id: str) -> asyncio.Lock:
+        """获取当前群组的开局生成锁。"""
+        lock = self._generation_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._generation_locks[group_id] = lock
+        return lock
 
     async def on_load(self) -> None:
         """加载插件运行时资源并初始化核心服务。"""
@@ -143,7 +153,12 @@ class RuleHorrorPlugin(MaiBotPlugin):
 
         return f"用户{user_id}"
 
-    @Command("rule_horror", description="规则怪谈游戏主命令", pattern=r"^/rg\s+(?P<action>\S+)(?:\s+(?P<rest>.+))?")
+    @Command(
+        "rule_horror",
+        description="规则怪谈游戏主命令",
+        pattern=r"^/rg\s+(?P<action>\S+)(?:\s+(?P<rest>.+))?",
+        timeout_ms=600_000,
+    )
     async def handle_rule_horror(
         self,
         stream_id: str = "",

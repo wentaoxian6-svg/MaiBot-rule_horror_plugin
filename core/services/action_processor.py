@@ -234,14 +234,14 @@ class ActionProcessor:
 
                 # 更新时间描述
                 if elapsed_minutes < 60:
-                    session.time_manager["current_time"] = "深夜"
-                    session.time_manager["time_description"] = "午夜时分，周围一片死寂"
+                    session.time_manager["current_time"] = "开场后"
+                    session.time_manager["time_description"] = "距离开场过去了不到一小时"
                 elif elapsed_minutes < 180:
-                    session.time_manager["current_time"] = "凌晨"
-                    session.time_manager["time_description"] = "黎明前的黑暗，空气中弥漫着不安"
+                    session.time_manager["current_time"] = "数小时后"
+                    session.time_manager["time_description"] = "场所仍按自身的时间节奏运行"
                 else:
-                    session.time_manager["current_time"] = "黎明"
-                    session.time_manager["time_description"] = "东方泛起鱼肚白，但黑暗仍未完全消散"
+                    session.time_manager["current_time"] = "更晚的时候"
+                    session.time_manager["time_description"] = "距离开场已经过去较长时间"
 
             # 创建结果对象
             result = ActionResult(
@@ -528,26 +528,7 @@ class ActionProcessor:
         target["memory"] = mem.to_dict()
 
         if not asking_rules:
-            # 普通搭话：依据态度给一句“像人”的回应（不强行输出规则）
-            state_note = ""
-            if float(npc_profile.get("corruption_level", 0.0) or 0.0) >= 0.6:
-                state_note = "他的瞳孔像是短暂失了焦，语尾也有些飘。"
-            elif str(npc_profile.get("current_state", "")) in {"紧张", "戒备"}:
-                state_note = "他像一直在留意四周的动静，说话前先停顿了一下。"
-            if help_level == 0:
-                if attitude == NPCAttitude.HOSTILE:
-                    text = f"你试着向{loc}的{name}搭话。{state_note}他抬眼看了你一下，目光像钉子：『别挡路。』"
-                elif attitude == NPCAttitude.SUSPICIOUS:
-                    text = f"你试着向{loc}的{name}搭话。{state_note}他没有立刻回答，只反问：『你问这个干什么？』"
-                else:
-                    text = f"你试着向{loc}的{name}搭话。{state_note}他像是在听远处的动静，只敷衍地嗯了一声。"
-            else:
-                npc_dialogue = str((session.npc_guidance or {}).get("npc_dialogue") or "").strip()
-                if npc_dialogue:
-                    text = f"你试着向{loc}的{name}搭话。{state_note}{name}低声道：『{npc_dialogue}』"
-                else:
-                    text = f"你试着向{loc}的{name}搭话。{state_note}他压低嗓音：『别大声。这里不喜欢热闹。』"
-            return ActionResult(description=text)
+            return None
 
         # 询问规则：把“愿不愿意说”和“说得靠不靠谱”分开处理
         recorded_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
@@ -1624,24 +1605,12 @@ class ActionProcessor:
                 player, session, violated_rule, action
             )
 
-            # 2. 判断违规类型
-            is_area_violation = self._is_area_violation(player.location, session)
+            await self._handle_general_violation(player, session, violation_context, group_id)
 
-            # 3. 根据类型调用不同处理
-            if is_area_violation:
-                # 区域违规 - 使用 environment_evolution.py
-                await self._handle_area_violation(session, player, violation_context, group_id)
-            else:
-                # 一般违规 - 使用 immersive_feedback.py
-                await self._handle_general_violation(player, session, violation_context, group_id)
-
-            # 4. 更新NPC态度
             await self._update_npc_attitudes(player, session, violation_context)
 
-            # 5. 检查是否触发追杀
             await self._check_hunt_trigger(player, session, violation_context)
 
-            # 6. 如果是双刃剑规则，处理收益
             rule_info = violation_context.get("rule_info")
             if isinstance(rule_info, dict) and rule_info.get("rule_type") == "double_edged":
                 await self._handle_double_edged_violation(
@@ -1696,71 +1665,6 @@ class ActionProcessor:
             "is_special_location": is_special,
             "scene_name": session.scene_name,
         }
-
-    def _is_area_violation(self, location: str, session: GameSession) -> bool:
-        """判断是否为区域违规"""
-        # 检查当前位置是否为禁止/限制区域
-        env_state = session.environment_state or {}
-        if not isinstance(env_state, dict):
-            return False
-
-        # 简化判断：如果有environment_evolution数据，可能涉及区域违规
-        env_evolution = env_state.get("environment_evolution", {})
-        if not isinstance(env_evolution, dict):
-            return False
-
-        identity_system = env_evolution.get("identity_system", {})
-        if not isinstance(identity_system, dict):
-            return False
-
-        access_permissions = identity_system.get("access_permissions", {})
-        if not isinstance(access_permissions, dict):
-            return False
-
-        forbidden_areas = access_permissions.get("forbidden_areas", [])
-        restricted_areas = access_permissions.get("restricted_areas", [])
-
-        return location in forbidden_areas or location in restricted_areas
-
-    async def _handle_area_violation(
-        self,
-        session: GameSession,
-        player: Player,
-        violation_context: dict[str, Any],
-        group_id: str = "",
-    ) -> None:
-        """处理区域违规 - 调用 EnvironmentEvolutionSystem"""
-        env_system = getattr(session, '_environment_system', None)
-        if not env_system:
-            logger.debug("环境系统未初始化，回退到一般违规处理")
-            await self._handle_general_violation(player, session, violation_context, group_id)
-            return
-
-        try:
-            # 调用现有方法 trigger_area_violation_consequences
-            consequence = await env_system.trigger_area_violation_consequences(
-                group_id=session.group_id,
-                player_identity=player.identity or "未知身份",
-                target_area=player.location,
-                api_url=getattr(self, 'api_url', ''),
-                api_key=getattr(self, 'api_key', ''),
-                model_list=getattr(self, 'model_list', []),
-                current_model_index=0,
-                temperature=0.8
-            )
-
-            if consequence:
-                logger.info(f"区域违规后果生成成功: {player.name}")
-                # 检查死亡风险
-                death_risk = consequence.get('death_risk', '')
-                if death_risk in ['高', '极高'] and player.health > 0:
-                    # 根据风险设置伤害
-                    damage = 50 if death_risk == '极高' else 30
-                    player.health = max(0, player.health - damage)
-                    logger.info(f"区域违规造成{damage}点伤害")
-
-        except Exception as e:
-            logger.error(f"区域违规处理失败: {e}")
 
     async def _handle_general_violation(
         self,

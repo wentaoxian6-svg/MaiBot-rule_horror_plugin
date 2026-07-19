@@ -77,49 +77,29 @@ class RuntimeSupportMixin:
         current_location: str = "",
         plural: bool = False,
     ) -> str:
-        """将内部结构化场景转换成更自然的玩家可见文本。"""
+        """将内部结构化场景转换成玩家可见的整体描述。"""
         scene_structure = getattr(session, "scene_structure", {}) or {}
         if not isinstance(scene_structure, Mapping):
             scene_structure = {}
 
-        viewpoint = "你们" if plural else "你"
         scene_name = str(getattr(session, "scene_name", "") or "这里").strip() or "这里"
         building_type = str(scene_structure.get("building_type", "") or "").strip()
         overall_layout = str(scene_structure.get("overall_layout", "") or "").strip()
         scene_impression = str(scene_structure.get("scene_impression", "") or "").strip()
-        exploration_hint = str(scene_structure.get("exploration_hint", "") or "").strip()
-        area_names = self._collect_scene_area_names(session)
-        area_text = self._join_cn_items(area_names, limit=5)
-        special_areas = scene_structure.get("special_areas", [])
-        special_text = self._join_cn_items(
-            [str(area).strip() for area in special_areas if str(area).strip()] if isinstance(special_areas, list) else [],
-            limit=3,
-        )
-
-        paragraphs: list[str] = []
         if scene_impression:
-            paragraphs.append(scene_impression)
+            description = scene_impression
         else:
-            intro_parts = [f"{scene_name}"]
+            intro_parts = [scene_name]
             if building_type:
                 intro_parts.append(f"更像一处{building_type}")
             if overall_layout:
                 intro_parts.append(f"整体呈{overall_layout}")
-            intro = "，".join(intro_parts)
-            paragraphs.append(f"{viewpoint}重新打量四周时，最先感受到的是{intro}带来的压迫感。")
+            description = "，".join(intro_parts)
 
         if current_location:
-            paragraphs.append(f"此刻{viewpoint}大概正停在{current_location}附近，能活动的范围还没有完全摸清。")
-        elif area_text:
-            paragraphs.append(f"从眼下能确认的范围来看，这地方至少牵扯到{area_text}这些区域。")
-
-        if special_text:
-            paragraphs.append(f"真正让人不太放心的，往往是{special_text}这些位置，它们像被刻意从正常秩序里剥离了出去。")
-
-        if exploration_hint:
-            paragraphs.append(exploration_hint)
-
-        return "\n\n".join(part for part in paragraphs if part.strip())
+            viewpoint = "你们" if plural else "你"
+            return f"{description}\n\n此刻{viewpoint}位于：{current_location}"
+        return description
 
     def _has_opening_guidance(self, session: GameSession) -> bool:
         """判断当前是否有可展示的统一开场正文。"""
@@ -139,6 +119,8 @@ class RuntimeSupportMixin:
         """获取或创建环境演化系统（延迟初始化）"""
         if self._environment_system is None:
             self._environment_system = EnvironmentEvolutionSystem(game_states)
+        else:
+            self._environment_system.game_states.update(game_states)
         return self._environment_system
 
     def _get_or_create_npc_simulator(self) -> NPCSimulator:
@@ -869,7 +851,11 @@ class RuntimeSupportMixin:
         game_mode: str,
         lobby_players: list[tuple[str, str]],
     ) -> None:
-        """按玩法发送初始规则载体，并在最后发送目标长图。"""
+        """按玩法处理初始规则载体的记录，并在最后发送纯目标长图。
+
+        规则载体给出的规则只记录到玩家笔记（通过 `/rg 规则` 查看），
+        不再以规则图形式占用开局展示位；开局第三张图只展示单一目标。
+        """
         image_generator = self.get_image_generator()
 
         npc_guidance = getattr(session, "npc_guidance", {}) or {}
@@ -921,21 +907,11 @@ class RuntimeSupportMixin:
                                 texts = [str(item).strip() for item in rules if str(item).strip()] if isinstance(rules, list) else []
                                 self._record_rule_texts(player, texts)
 
-                            first_carrier = visible[0]
-                            rules_image = await image_generator.generate_rules_image(
-                                rules_title=str(first_carrier.get("title", f"{session.scene_name} - 规则") or f"{session.scene_name} - 规则"),
-                                rules=self._normalize_rules_list(first_carrier.get("revealed_rules", [])) if isinstance(first_carrier.get("revealed_rules", []), list) else [],
-                                win_condition="",
-                                game_mode=game_mode,
-                            )
-                            await self._send_image_path(rules_image)
-
-        if str(session.win_condition or "").strip():
-            goal_image = await image_generator.generate_rules_image(
-                rules_title="你该记住的事",
-                rules=[],
-                win_condition=session.win_condition,
-                game_mode=game_mode,
+        goal_text = str(session.win_condition or "").strip()
+        if goal_text:
+            goal_image = await image_generator.generate_goal_image(
+                goal_text=goal_text,
+                scene_name=session.scene_name,
             )
             await self._send_image_path(goal_image)
 
@@ -973,66 +949,101 @@ class RuntimeSupportMixin:
         npc_name = ""
         npc_role = ""
         npc_behavior = ""
-        npc_dialogue = ""
+        conversation_intent = ""
         rule_carrier_title = ""
         rule_carrier_description = ""
+        hinted_rule_texts: list[str] = []
         if isinstance(npc_guidance, Mapping):
             guidance_method = str(npc_guidance.get("guidance_method", "") or "").strip().lower()
             npc_name = str(npc_guidance.get("npc_name", "") or "").strip()
             npc_role = str(npc_guidance.get("npc_role", "") or "").strip()
             npc_behavior = str(npc_guidance.get("npc_behavior", "") or "").strip()
-            npc_dialogue = str(npc_guidance.get("npc_dialogue", "") or "").strip()
+            conversation_intent = str(npc_guidance.get("conversation_intent", "") or "").strip()
             rule_carrier_title = str(npc_guidance.get("rule_carrier_title", "") or "").strip()
             rule_carrier_description = str(npc_guidance.get("rule_carrier_description", "") or "").strip()
+            hinted_raw = npc_guidance.get("hinted_rule_texts", [])
+            if isinstance(hinted_raw, list):
+                hinted_rule_texts = [str(item).strip() for item in hinted_raw if str(item).strip()][:2]
+
+        scene_structure = getattr(session, "scene_structure", {}) or {}
+        if not isinstance(scene_structure, Mapping):
+            scene_structure = {}
+        building_type = str(scene_structure.get("building_type", "") or "").strip()
+        overall_layout = str(scene_structure.get("overall_layout", "") or "").strip()
+        scene_impression = str(scene_structure.get("scene_impression", "") or "").strip()
+        floors = scene_structure.get("floors", [])
+        floor_summary: list[str] = []
+        if isinstance(floors, list):
+            for floor in floors[:4]:
+                if not isinstance(floor, Mapping):
+                    continue
+                floor_name = str(floor.get("name", "") or "").strip()
+                rooms = floor.get("rooms", [])
+                room_names = [str(room).strip() for room in rooms[:6] if str(room).strip()] if isinstance(rooms, list) else []
+                if floor_name or room_names:
+                    floor_summary.append(f"{floor_name}：{'、'.join(room_names)}".strip("："))
+
+        player = next(iter(session.players.values()), None)
+        start_location = str(getattr(player, "location", "") or "").strip() if player else ""
+        if not start_location:
+            for floor in floors if isinstance(floors, list) else []:
+                if isinstance(floor, Mapping):
+                    rooms = floor.get("rooms", [])
+                    if isinstance(rooms, list) and rooms:
+                        start_location = str(rooms[0] or "").strip()
+                        if start_location:
+                            break
+        start_location = start_location or session.scene_name
 
         plural_hint = ""
-        default_entrance = f"你来到了{session.scene_name}。这里的气氛让你感到不安。"
+        default_entrance = f"你站在{start_location}，周围的布局一时还看不全。眼前没有人主动解释这里的情况。"
         if getattr(session, "game_mode", GameModes.SINGLE.value) == GameModes.MULTI.value:
             plural_hint = "\n8. 必须使用第二人称复数'你们'，禁止出现'你'、'你的'等单数表述\n9. 描述一行人一起进入场景，而不是单独一人\n"
-            default_entrance = f"你们来到了{session.scene_name}。这里的气氛让你们感到不安。"
+            default_entrance = f"你们站在{start_location}，周围的布局一时还看不全。眼前没有人主动解释这里的情况。"
         if guidance_method == "none":
             if getattr(session, "game_mode", GameModes.SINGLE.value) == GameModes.MULTI.value:
-                default_entrance = f"你们在{session.scene_name}里先后恢复意识，四周一时看不见任何人。空气里弥漫着异样的安静。"
+                default_entrance = f"你们停在{start_location}。附近没有人，能看见的出入口和陈设都保持着日常使用过的样子，只是暂时没人回应你们。"
             else:
-                default_entrance = f"你在{session.scene_name}里醒来，四周空无一人。短暂的恍惚过去后，你才意识到这里安静得有些不正常。"
+                default_entrance = f"你停在{start_location}。附近没有人，能看见的出入口和陈设都保持着日常使用过的样子，只是暂时没人回应你。"
 
-        system_prompt = f"""你是规则怪谈游戏的开场正文生成器。你需要把玩家刚进入场景时发生的事写成一段完整、自然、统一的正文。
+        system_prompt = f"""你负责生成规则怪谈开局的第二部分：玩家此刻所在的具体场景，以及现场自然发生的交流。
 
 要求：
-1. 只能输出一整段连续正文，不要分段标题，不要把“环境”“动作”“台词”拆成几段。
-2. 这段正文应该像小说开场片段，而不是说明书、交接稿、玩法提示或剪贴拼接。
-3. 如果有 NPC 或纸面载体参与开场，也要自然融进同一段正文里，不要像“先写行为，再写台词，再写说明”那样机械组合。
-4. NPC 说话必须像真人在当下情境里会说的话，允许含糊、跳跃、急躁、敷衍、停顿，但不要长篇大论。
-5. 不要列事项，不要编号，不要总结，不要出现“接下来”“以下规则”“记住了”这类教程口吻。
-6. 要写出现场的气味、光线、声音、人的动作和玩家当下的感受。
-7. 长度：160-240字{plural_hint}
-8. 如果当前开场没有 NPC，就写“玩家独自或一行人醒来/进入后感到异常”的场景，不要硬造说话的人。
-9. 如果当前开场有 NPC，重点是“这一刻发生了什么”，不是“把所有该说的话一次说完”。
-10. 最终读起来必须像同一时刻发生的一件事，而不是几个字段拼起来的组合文本。
-11. 必须使用正常、自然的中文标点，不要把整段写成一长串逗号连接的信息块。
-12. 至少要明确三件事：玩家此刻身在何处、眼前的人或物正在做什么、此刻最先感到的不对劲是什么。
-13. 如果出现提醒或规矩，只能自然带过一件最要紧的，不要一下塞进很多条。
+1. 只写此刻现场，不复述场所历史、公共背景、玩家身份、到来原因或游戏目标。
+2. 第一两句必须明确玩家具体站在哪里、最近的出入口或相邻区域是什么、眼前最显眼的物件或人物在哪里。禁止只写“来到某地”“气氛不安”“四周诡异”这类空泛句子。
+3. 空间描述优先使用给定的真实区域与布局，不要虚构结构中不存在的房间。除了位置关系，再挑二到三个能被看到、听到或闻到的具体细节展开（正在运转的设备、贴在墙上的纸、柜台上的物件、光线来源、某个方向传来的动静），让现场有可探索感。
+4. 如果有 NPC，由你根据他的身份、动作、交流动机和当下事件即时决定是否开口、说多少、说什么。输入中没有预制台词，也不要套用欢迎、交接、培训、提醒新人、分配任务等固定流程。
+5. NPC 可以不理会玩家、说到一半被打断、答非所问、认错人、先处理手头事情、向玩家索取信息，或根本不开口。交流必须服务于他的当下目的，而不是服务于教程。
+6. 如果输入提供了“NPC可能顺口带出的说法”，你可以让 NPC 在交流中用自己的口吻自然带出其中一条：可以改写、说一半、夹在抱怨里、当成个人经验讲，但不要逐字宣读，不要说成“规则”“守则”，更不要一次抛出多条。也可以选择完全不提。
+7. 除了上述说法，NPC 不知道其他后台规则和隐藏真相，禁止他给出规则清单、编号事项、通关提示或系统说明。
+8. 如果现场有纸面载体（守则、告示、便签等），把它作为场景中的实物写出来：它贴在哪、压在哪、被谁递过来、纸面状态如何。只让玩家“看见它的存在”，不要展开正文内容。
+9. 如果没有 NPC，就用可见物件、正在运行的设备、远近声源和出入口状态建立现场，不要硬造人物，也不要默认玩家从昏迷中醒来。
+10. 只输出一段连贯正文，不加标题、不分点、不总结。长度 180-300 字。{plural_hint}
+11. 使用具体名词和动作，减少“似乎、仿佛、让人不安、诡异、阴森、死寂”等抽象气氛词。
+12. 不要替玩家决定行动，也不要用结尾句催促玩家去某处。
 
 返回纯文本，不要JSON格式。"""
 
 
         user_prompt = f"""场景名称：{session.scene_name}
 
-背景：{session.background}
+建筑类型：{building_type}
+总体布局：{overall_layout}
+可用区域：{'；'.join(floor_summary)}
+起始位置：{start_location}
+第一空间印象：{scene_impression}
+现场类型：{"没有 NPC" if guidance_method == "none" else "现场存在 NPC 或载体"}
 
-玩家身份：{session.player_identity}
-
-开场类型：{"无NPC开场，玩家独自或一行人醒来后自行探索" if guidance_method == "none" else "存在NPC或载体参与的开场"}
-
-NPC/载体参考信息（仅作素材，不要逐项照抄，不要拼贴）：
+NPC/载体状态：
 - NPC姓名：{npc_name}
 - NPC角色：{npc_role}
-- 眼前动作：{npc_behavior}
-- NPC原话：{npc_dialogue}
+- 此刻可见动作：{npc_behavior}
+- 交流动机：{conversation_intent}
+- NPC可能顺口带出的说法（可改写可不提，最多带一条）：{'；'.join(hinted_rule_texts) if hinted_rule_texts else '无'}
 - 载体名称：{rule_carrier_title}
-- 载体出现方式：{rule_carrier_description}
+- 载体所在方式：{rule_carrier_description}
 
-请生成统一的开场正文。"""
+直接写出此刻的场景与自然交流。"""
 
         try:
             response = await llm_client.call(
@@ -1041,7 +1052,33 @@ NPC/载体参考信息（仅作素材，不要逐项照抄，不要拼贴）：
                 temperature=0.8,
             )
 
-            return response.clean_content
+            opening = response.clean_content.strip()
+            opening = re.sub(r"(?m)^\s*(?:场景|开场|正文)\s*[:：]\s*", "", opening)
+            blocked_markers = ("以下规则", "规则如下", "通关条件", "你的目标", "玩家身份", "你必须", "你们必须", "严禁")
+            location_is_clear = bool(start_location and start_location in opening)
+            content_crossed_boundary = any(marker in opening for marker in blocked_markers)
+            if content_crossed_boundary or not location_is_clear or len(opening) < 120:
+                correction_prompt = f"""请重写上一版开场。
+
+必须做到：
+1. 第一两句明确出现起始位置“{start_location}”，并说明它附近的出入口、相邻区域或显眼物件。
+2. 补足二到三个可见、可听或可闻的具体环境细节，让现场有可探索感。
+3. 不得复述背景、身份、目标或通关条件；不得输出规则清单或编号事项。
+4. NPC 是否说话、说多少由现场和他的交流动机决定，不使用欢迎、交接、培训、提醒新人模板；若有可顺口带出的说法，最多自然带一条。
+5. 若现场有纸面载体，只写出它的位置和状态，不展开内容。
+6. 只输出 180-300 字的一段现场正文。
+
+上一版：{opening}"""
+                corrected = await llm_client.call(
+                    prompt=correction_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.9,
+                )
+                corrected_text = corrected.clean_content.strip()
+                corrected_text = re.sub(r"(?m)^\s*(?:场景|开场|正文)\s*[:：]\s*", "", corrected_text)
+                if corrected_text:
+                    opening = corrected_text
+            return opening or default_entrance
         except Exception as e:
             logger.error(f"生成入场描述失败: {e}")
             # 返回默认描述

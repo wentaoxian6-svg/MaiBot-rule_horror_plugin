@@ -11,6 +11,7 @@ import random
 import re
 import sys
 import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -268,6 +269,30 @@ class AsyncImageGenerator:
             stripped += "……"
         return stripped
 
+    def _build_output_path(self, prefix: str) -> str:
+        """生成带时间戳与随机 UUID 的图片输出路径，避免并发覆盖。"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique = uuid.uuid4().hex[:12]
+        safe_prefix = re.sub(r"[^0-9a-zA-Z_\-]+", "_", str(prefix or "image")).strip("_") or "image"
+        return str(self.output_dir / f"{safe_prefix}_{timestamp}_{unique}.png")
+
+    def _draw_section_heading(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        text: str,
+        font: Font,
+        x: int,
+        y: int,
+        fill: str = "#8B0000",
+    ) -> int:
+        """绘制小节标题，并返回下一行可用的 y。"""
+        heading = str(text or "").strip()
+        if not heading:
+            return y
+        draw.text((x, y), heading, fill=fill, font=font)
+        return y + 34
+
     def _get_cached_image(self, cache_key: str) -> str | None:
         """获取缓存的图片路径"""
         if cache_key in self._cache_index:
@@ -508,19 +533,19 @@ class AsyncImageGenerator:
         self,
         scene_name: str,
         background: str,
-        arrival_reason: str,
+        player_identity: str,
         core_symbols: Sequence[CoreSymbol] | None = None,
         output_path: str | None = None,
     ) -> str:
-        """同步方法：生成剧情导入长图（统一叙事正文）"""
+        """同步方法：生成背景与身份长图（分区展示，避免身份突兀出现在末尾）"""
         _ = core_symbols  # 不显示核心象征符号
-        
+
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"plot_{timestamp}.png")
+            output_path = self._build_output_path("plot")
 
         # 加载字体
         font_title = self._get_font(self._font_path, 36)
+        font_section = self._get_font(self._font_path, 24)
         font_normal = self._get_font(self._font_path, 20)
 
         margin = 60
@@ -529,78 +554,99 @@ class AsyncImageGenerator:
         width = 900
         line_available_width = width - margin * 2
 
-        body_parts = [str(background or "").strip(), str(arrival_reason or "").strip()]
-        narrative_text = self._truncate_display_text("\n".join(part for part in body_parts if part), max_chars=360)
-        content_lines = self._wrap_text_by_width(narrative_text, font_normal, line_available_width)
-        total_height = margin * 2 + title_height + len(content_lines) * line_height + 70
-        
+        background_text = self._normalize_display_text(background)
+        identity_text = self._normalize_display_text(player_identity)
+        background_lines = self._wrap_text_by_width(background_text, font_normal, line_available_width) if background_text else []
+        identity_lines = self._wrap_text_by_width(identity_text, font_normal, line_available_width) if identity_text else []
+
+        total_height = margin * 2 + title_height + 40
+        if background_lines:
+            total_height += 34 + len(background_lines) * line_height + 24
+        if identity_lines:
+            total_height += 34 + len(identity_lines) * line_height + 20
+
         # 创建图片（纯黑背景）
         img = Image.new('RGB', (width, total_height), color='#000000')
         draw = ImageDraw.Draw(img)
-        
+
         # 绘制标题（动态居中）
-        title_text = str(scene_name or "").strip() or "故事开始"
+        scene_title = str(scene_name or "").strip()
+        title_text = f"{scene_title} · 背景与身份" if scene_title else "背景与身份"
         title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
         title_width = title_bbox[2] - title_bbox[0]
         title_x = (width - title_width) // 2
         draw.text((title_x, margin), title_text, fill='#8B0000', font=font_title)
-        
+
         # 绘制分隔线
         draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill='#8B0000', width=2)
-        
+
         current_y = margin + 110
 
-        for line in content_lines:
-            draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
-            current_y += line_height
-        
+        if background_lines:
+            current_y = self._draw_section_heading(draw, text="【背景】", font=font_section, x=margin, y=current_y)
+            for line in background_lines:
+                draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+                current_y += line_height
+            current_y += 18
+
+        if identity_lines:
+            current_y = self._draw_section_heading(draw, text="【身份】", font=font_section, x=margin, y=current_y)
+            for line in identity_lines:
+                draw.text((margin, current_y), line, fill='#FF0000', font=font_normal)
+                current_y += line_height
+
         # 保存图片
         img.save(output_path, 'PNG')
-        logger.info(f"剧情导入长图已生成：{output_path}")
-        
+        logger.info(f"背景与身份长图已生成：{output_path}")
+
         return output_path
 
     async def generate_scene_image(
         self,
         scene_name: str,
         background: str,
-        arrival_reason: str,
+        player_identity: str = "",
+        arrival_reason: str = "",
         core_symbols: Sequence[CoreSymbol] | None = None,
         output_path: str | None = None,
         use_cache: bool = True,
     ) -> str:
-        """异步生成剧情导入长图（支持缓存）"""
+        """异步生成背景与身份长图（支持缓存）
+
+        保留 ``arrival_reason`` 参数仅用于向后兼容，实际渲染以 ``player_identity`` 为准。
+        """
+        identity_text = str(player_identity or arrival_reason or "").strip()
         # 生成缓存键
         cache_key = self._get_cache_key(
             type="scene",
-            render_version="scene_narrative_v3",
+            render_version="scene_background_identity_v1",
             scene_name=scene_name,
             background=background,
-            arrival_reason=arrival_reason,
+            player_identity=identity_text,
         )
-        
+
         # 检查缓存
         if use_cache:
             cached_path = self._get_cached_image(cache_key)
             if cached_path:
                 return cached_path
-        
+
         # 生成新图片
         loop = asyncio.get_event_loop()
         func = functools.partial(
             self._generate_scene_image_sync,
             scene_name=scene_name,
             background=background,
-            arrival_reason=arrival_reason,
+            player_identity=identity_text,
             core_symbols=core_symbols,
             output_path=output_path,
         )
         result_path = await loop.run_in_executor(self._executor, func)
-        
+
         # 缓存图片
         if use_cache:
             self._cache_image(cache_key, result_path)
-        
+
         return result_path
 
     # ==================== 规则长图 ====================
@@ -616,8 +662,7 @@ class AsyncImageGenerator:
     ) -> str:
         """同步方法：生成规则长图（怪谈纸面式文本）"""
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"rules_{timestamp}.png")
+            output_path = self._build_output_path("rules")
 
         # 加载字体
         font_title = self._get_font(self._font_path, 36)
@@ -892,8 +937,7 @@ class AsyncImageGenerator:
     ) -> str:
         """同步方法：生成行动结果长图（统一叙事正文）"""
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"action_{timestamp}_{random.randint(1000, 9999)}.png")
+            output_path = self._build_output_path("action")
 
         # 加载字体
         font_subtitle = self._get_font(self._font_path, 24)
@@ -1070,8 +1114,7 @@ class AsyncImageGenerator:
     ) -> str:
         """同步方法：生成结局长图（纯黑背景+鲜红字体）"""
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"ending_{timestamp}.png")
+            output_path = self._build_output_path("ending")
 
         # 加载字体
         font_title = self._get_font(self._font_path, 40)
@@ -1170,8 +1213,7 @@ class AsyncImageGenerator:
     ) -> str:
         """同步方法：生成物品栏图片（纯黑背景+鲜红字体）"""
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"inventory_{timestamp}.png")
+            output_path = self._build_output_path("inventory")
 
         font_title = self._get_font(self._font_path, 28)
         font_item = self._get_font(self._font_path, 20)
@@ -1270,8 +1312,7 @@ class AsyncImageGenerator:
     ) -> str:
         """同步方法：生成入场长图（只展示统一开场正文）"""
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"entrance_{timestamp}.png")
+            output_path = self._build_output_path("entrance")
 
         # 加载字体
         font_title = self._get_font(self._font_path, 36)
@@ -1281,7 +1322,8 @@ class AsyncImageGenerator:
         title_height = 80
         line_height = 35  # 增加行高，避免字体重叠
 
-        title = str(scene_name or "").strip() or "开场"
+        scene_title = str(scene_name or "").strip()
+        title = f"{scene_title} · 开场" if scene_title else "故事开场"
 
         # 创建图片（纯黑背景）
         width = 900
@@ -1293,7 +1335,7 @@ class AsyncImageGenerator:
         
         # 只使用统一开场正文，不再拼接行为/台词/载体描述。
         opening_text_source = entrance_description
-        entrance_text = self._truncate_display_text(opening_text_source, max_chars=360)
+        entrance_text = self._normalize_display_text(opening_text_source)
         content_lines = self._wrap_text_by_width(entrance_text, font_normal, line_available_width)
 
         # 计算总高度
@@ -1352,7 +1394,7 @@ class AsyncImageGenerator:
         cache_key = self._get_cache_key(
             type="entrance_long",
             # 变更展示策略时用于自动失效旧缓存
-            render_version="entrance_long_v6",
+            render_version="entrance_long_v7",
             scene_name=scene_name,
             entrance_description=entrance_description,
             npc_guidance=npc_guidance,
@@ -1391,8 +1433,7 @@ class AsyncImageGenerator:
     ) -> str:
         """同步方法：生成场景概览长图。"""
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(self.output_dir / f"scene_overview_{timestamp}.png")
+            output_path = self._build_output_path("scene_overview")
 
         font_title = self._get_font(self._font_path, 32)
         font_normal = self._get_font(self._font_path, 20)
@@ -1404,7 +1445,7 @@ class AsyncImageGenerator:
         line_available_width = width - margin * 2
 
         title = str(overview_title or "").strip() or "此刻你能确认的情况"
-        content_text = self._truncate_display_text(overview_text, max_chars=520)
+        content_text = self._normalize_display_text(overview_text)
         content_lines = self._wrap_text_by_width(content_text, font_normal, line_available_width)
 
         total_height = margin * 2 + title_height + len(content_lines) * line_height + 50
@@ -1456,6 +1497,92 @@ class AsyncImageGenerator:
             self._generate_scene_overview_image_sync,
             overview_title=overview_title,
             overview_text=overview_text,
+            output_path=output_path,
+        )
+        result_path = await loop.run_in_executor(self._executor, func)
+
+        if use_cache:
+            self._cache_image(cache_key, result_path)
+
+        return result_path
+
+    # ==================== 纯目标长图 ====================
+
+    def _generate_goal_image_sync(
+        self,
+        goal_text: str,
+        scene_name: str = "",
+        output_path: str | None = None,
+    ) -> str:
+        """同步方法：生成纯目标长图（仅展示单一目标，不夹带规则/条件）"""
+        if output_path is None:
+            output_path = self._build_output_path("goal")
+
+        font_title = self._get_font(self._font_path, 36)
+        font_section = self._get_font(self._font_path, 24)
+        font_normal = self._get_font(self._font_path, 20)
+
+        margin = 60
+        title_height = 80
+        line_height = 34
+        width = 900
+        line_available_width = width - margin * 2
+
+        goal_clean = self._normalize_display_text(goal_text)
+        goal_lines = self._wrap_text_by_width(goal_clean, font_normal, line_available_width) if goal_clean else []
+
+        total_height = margin * 2 + title_height + 40
+        if goal_lines:
+            total_height += 34 + len(goal_lines) * line_height + 20
+
+        img = Image.new("RGB", (width, total_height), color="#000000")
+        draw = ImageDraw.Draw(img)
+
+        scene_title = str(scene_name or "").strip()
+        title_text = f"{scene_title} · 目标" if scene_title else "目标"
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, margin), title_text, fill="#8B0000", font=font_title)
+
+        draw.line([(margin, margin + 80), (width - margin, margin + 80)], fill="#8B0000", width=2)
+
+        current_y = margin + 110
+        if goal_lines:
+            current_y = self._draw_section_heading(draw, text="【你的目标】", font=font_section, x=margin, y=current_y)
+            for line in goal_lines:
+                draw.text((margin, current_y), line, fill="#DC143C", font=font_normal)
+                current_y += line_height
+
+        img.save(output_path, "PNG")
+        logger.info(f"目标长图已生成：{output_path}")
+        return output_path
+
+    async def generate_goal_image(
+        self,
+        goal_text: str,
+        scene_name: str = "",
+        output_path: str | None = None,
+        use_cache: bool = True,
+    ) -> str:
+        """异步生成纯目标长图（支持缓存）。"""
+        cache_key = self._get_cache_key(
+            type="goal",
+            render_version="goal_v1",
+            scene_name=scene_name,
+            goal_text=goal_text,
+        )
+
+        if use_cache:
+            cached_path = self._get_cached_image(cache_key)
+            if cached_path:
+                return cached_path
+
+        loop = asyncio.get_event_loop()
+        func = functools.partial(
+            self._generate_goal_image_sync,
+            goal_text=goal_text,
+            scene_name=scene_name,
             output_path=output_path,
         )
         result_path = await loop.run_in_executor(self._executor, func)
