@@ -3,8 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 import asyncio
 import base64
+import json
 import logging
+import os
 import re
+from urllib.request import Request, urlopen
 
 from ..common import GameModes, JsonObject, JsonValue, RuleDict
 from ..core import GameSession, LLMClient, Player
@@ -22,6 +25,24 @@ from ..systems import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _report_debug_event(event: str, payload: dict[str, object]) -> None:
+    endpoint = os.environ.get("DEBUG_SERVER_URL", "").strip()
+    session_id = os.environ.get("DEBUG_SESSION_ID", "").strip()
+    if not endpoint or not session_id:
+        return
+    data = json.dumps({"session_id": session_id, "event": event, "payload": payload}).encode("utf-8")
+
+    def send() -> None:
+        request = Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        with urlopen(request, timeout=2):
+            pass
+
+    try:
+        await asyncio.to_thread(send)
+    except Exception:
+        pass
 
 
 class RuntimeSupportMixin:
@@ -161,23 +182,42 @@ class RuntimeSupportMixin:
 
     async def _send_private_text(self, target_user_id: str, target_user_name: str, content: str) -> bool:
         """向指定用户发起私聊并发送文本。"""
+        debug_payload = {"target_user_id": str(target_user_id or "").strip(), "target_name_present": bool(target_user_name)}
         try:
             uid = str(target_user_id or "").strip()
             if not uid:
+                await _report_debug_event("private_send_rejected", {**debug_payload, "stage": "empty_target"})
                 return False
 
             stream_result = await self.ctx.chat.get_stream_by_user_id(user_id=uid)
             stream_info = stream_result.get("stream") if isinstance(stream_result, dict) else None
+            await _report_debug_event(
+                "private_stream_lookup",
+                {
+                    **debug_payload,
+                    "stage": "lookup",
+                    "lookup_success": stream_result.get("success") if isinstance(stream_result, dict) else None,
+                    "stream_found": isinstance(stream_info, dict),
+                    "stream_session_id_present": bool(stream_info.get("session_id")) if isinstance(stream_info, dict) else False,
+                },
+            )
             if not isinstance(stream_info, dict):
                 logger.warning("未找到用户 %s 的私聊流，无法发送身份信息", target_user_name or uid)
                 return False
 
             private_stream_id = str(stream_info.get("session_id", "") or "").strip()
             if not private_stream_id:
+                await _report_debug_event("private_send_rejected", {**debug_payload, "stage": "empty_stream_session"})
                 return False
 
-            return await self.ctx.send.text(content, private_stream_id)
+            send_result = await self.ctx.send.text(content, private_stream_id)
+            await _report_debug_event(
+                "private_send_result",
+                {**debug_payload, "stage": "send", "stream_session_id_present": True, "send_result": bool(send_result)},
+            )
+            return send_result
         except Exception as e:
+            await _report_debug_event("private_send_exception", {**debug_payload, "stage": "exception", "error_type": type(e).__name__})
             logger.error(f"发送私聊消息失败: {e}")
             return False
 
@@ -1083,4 +1123,3 @@ NPC/载体状态：
             logger.error(f"生成入场描述失败: {e}")
             # 返回默认描述
             return default_entrance
-
