@@ -27,7 +27,7 @@
   "capabilities": [
     "send.text",
     "send.image",
-    "chat.get_stream_by_user_id",
+    "chat.open_session",
     "message.get_recent",
     "config.get"
   ],
