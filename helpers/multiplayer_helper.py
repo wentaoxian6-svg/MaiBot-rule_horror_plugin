@@ -246,36 +246,3 @@ def _record_assignments_to_environment(
 
     multiplayer_info["assigned_identities"] = assignments.copy()
 
-
-def get_common_rules(session: GameSession) -> list[JsonObject]:
-    """获取共同规则
-
-    Args:
-        session: 游戏会话
-
-    Returns:
-        共同规则列表
-    """
-    multi_identity = get_multi_identity_info(session)
-    common_rules = multi_identity.get("common_rules")
-
-    if not isinstance(common_rules, list):
-        return []
-
-    return [r for r in common_rules if isinstance(r, dict)]
-
-
-def extract_rule_text(rule: object) -> str:
-    """从规则对象中提取文本
-
-    Args:
-        rule: 规则对象（可能是字典或字符串）
-
-    Returns:
-        规则文本
-    """
-    if isinstance(rule, dict):
-        return str(rule.get("text", "") or "").strip()
-
-    return str(rule).strip()
-

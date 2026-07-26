@@ -7,15 +7,46 @@ from typing import Any
 
 from ..common import GameModes
 from ..core import (
+    GameSession,
     GameStateManager,
     GameStatus,
     LLMClient,
+    Player,
     PlayerStatus,
     SaveManager,
     get_default_max_tokens,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_spoiler(
+    hint_text: str,
+    next_action: str,
+    hidden_truth: str,
+    guidance_target: str,
+) -> tuple[bool, list[str]]:
+    """检测 LLM 输出是否泄露隐藏真相。返回 (是否泄露, 命中关键词列表)。"""
+    if not hidden_truth:
+        return False, []
+
+    combined = f"{hint_text} {next_action}"
+    leaked: list[str] = []
+
+    # 1. hidden_truth 前 20 字片段检测
+    probe = hidden_truth[:20].strip()
+    if probe and probe in combined:
+        leaked.append(probe)
+
+    # 2. truth 方向时加强真相关键词检测
+    if guidance_target == "truth":
+        # 按标点切分 hidden_truth，保留长度 >= 3 的片段
+        keywords = [w for w in re.split(r"[，。；,.;\s]+", hidden_truth) if len(w) >= 3]
+        for kw in keywords:
+            if kw in combined:
+                leaked.append(kw)
+
+    return bool(leaked), leaked
 
 
 class SharedCommandHandlersMixin:
@@ -51,7 +82,7 @@ class SharedCommandHandlersMixin:
     ) -> tuple[bool, str | None, int]:
         _ = rest_input
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
 
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
@@ -87,7 +118,7 @@ class SharedCommandHandlersMixin:
             await self.send_text("\n".join(message_lines))
             return True, "离开成功", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_状态(
         self,
@@ -100,7 +131,7 @@ class SharedCommandHandlersMixin:
         _ = user_name
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -152,7 +183,7 @@ class SharedCommandHandlersMixin:
             await self.send_text("\n\n".join(parts))
             return True, "状态已显示", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_规则(
         self,
@@ -165,7 +196,7 @@ class SharedCommandHandlersMixin:
         _ = user_name
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -200,7 +231,7 @@ class SharedCommandHandlersMixin:
             await self.send_text("\n".join(lines))
             return True, "规则已显示", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_线索(
         self,
@@ -210,7 +241,7 @@ class SharedCommandHandlersMixin:
         rest_input: str,
     ) -> tuple[bool, str | None, int]:
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -271,7 +302,7 @@ class SharedCommandHandlersMixin:
             await self.send_text("\n".join(lines))
             return True, "线索已显示", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_提示(
         self,
@@ -280,10 +311,16 @@ class SharedCommandHandlersMixin:
         user_name: str,
         rest_input: str,
     ) -> tuple[bool, str | None, int]:
-        hint_type = (rest_input or "规则").strip()
+        hint_type = (rest_input or "").strip()
+        if "线索" in hint_type:
+            player_preference = "clue"
+        elif "规则" in hint_type:
+            player_preference = "rule"
+        else:
+            player_preference = "auto"
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -302,50 +339,19 @@ class SharedCommandHandlersMixin:
                 return False, "无提示次数", 2
 
             player.hint_count -= 1
-            want_clue = "线索" in hint_type
-            hint_mode = "clue" if want_clue else "rule"
 
+            # 完整规则表（真实基准）
             all_rules = [self._extract_rule_text(rule) for rule in (session.rules or [])]
             all_rules = [text for text in all_rules if text]
-            player_rules = self._get_player_rules_for_display(session, player)
 
-            target_rule_index_1b: int | None = None
-            target_rule_text = ""
-            if not want_clue:
-                match = re.search(r"(\d{1,2})", hint_type)
-                if match:
-                    try:
-                        index = int(match.group(1))
-                        if 1 <= index <= len(player_rules):
-                            target_rule_index_1b = index
-                    except Exception:
-                        target_rule_index_1b = None
+            # 调用者与全队规则笔记（用于进度推断）
+            team_rules_data = self._collect_team_rules_for_hint(session, user_id)
+            requester_rules = team_rules_data["requester_rules"]
+            is_multi_player = team_rules_data["is_multi_player"]
+            teammate_rules = team_rules_data["teammate_rules"]
 
-                if target_rule_index_1b is None and player_rules:
-                    target_rule_index_1b = len(player_rules)
-
-                if target_rule_index_1b is not None and 1 <= target_rule_index_1b <= len(player_rules):
-                    target_rule_text = player_rules[target_rule_index_1b - 1]
-
+            # 背包物品列表（参考材料）
             inventory = getattr(player, "inventory", []) or []
-            clue_query = hint_type.replace("线索", "", 1).strip() if want_clue else ""
-            selected_item: dict[str, Any] | None = None
-            if want_clue and inventory:
-                if clue_query:
-                    for item in inventory:
-                        if isinstance(item, dict) and clue_query in str(item.get("name", "") or ""):
-                            selected_item = item
-                            break
-                if selected_item is None:
-                    for item in reversed(inventory):
-                        if isinstance(item, dict) and bool(item.get("is_key_item", False)):
-                            selected_item = item
-                            break
-                if selected_item is None:
-                    for item in reversed(inventory):
-                        if isinstance(item, dict) and str(item.get("name", "") or "").strip():
-                            selected_item = item
-                            break
 
             def format_item(item: dict[str, Any]) -> str:
                 name = str(item.get("name", "") or "").strip()
@@ -361,10 +367,30 @@ class SharedCommandHandlersMixin:
                     parts.append(f"观察提示:{observation_hint}")
                 return " | ".join(parts)
 
-            selected_item_text = format_item(selected_item) if isinstance(selected_item, dict) else ""
-            rules_block = "\n".join(f"{index + 1}. {text}" for index, text in enumerate(all_rules))
-            known_rules_block = "\n".join(f"- {text}" for text in player_rules) if player_rules else "（暂无）"
+            # 调用者笔记带编号（便于 LLM 自主引用）
+            requester_rules_block = (
+                "\n".join(f"{i + 1}. {text}" for i, text in enumerate(requester_rules))
+                if requester_rules
+                else "（暂无）"
+            )
 
+            # 多人模式：队友笔记
+            teammate_block = ""
+            if is_multi_player:
+                teammate_lines = []
+                for mate in teammate_rules:
+                    mate_name = mate["player_name"]
+                    mate_rules = mate["rules"]
+                    if mate_rules:
+                        mate_text = "; ".join(mate_rules)
+                    else:
+                        mate_text = "（暂无）"
+                    teammate_lines.append(f"- {mate_name}: {mate_text}")
+                teammate_block = "\n\n【队友规则笔记】（用于推断全队进度）：\n" + "\n".join(teammate_lines)
+
+            rules_block = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(all_rules)) if all_rules else "（无）"
+
+            # 背包物品列表（参考材料）
             inventory_lines: list[str] = []
             for item in inventory:
                 if isinstance(item, dict) and str(item.get("name", "") or "").strip():
@@ -374,80 +400,88 @@ class SharedCommandHandlersMixin:
             inventory_block = "\n".join(f"- {text}" for text in inventory_lines) if inventory_lines else "（空）"
 
             system_prompt = (
-                "你是规则怪谈游戏的提示生成器。你知道后台完整规则与隐藏真相，但必须严格控制剧透。\n"
+                "你是规则怪谈游戏的提示生成器。你知道后台完整规则与隐藏真相，但必须严格控制剧透。\n\n"
+                "推理流程（内部完成，不要在输出中展示）：\n"
+                "1) 对比【玩家规则笔记】与【完整规则表】，识别：\n"
+                "   - 误解：玩家笔记中与真实规则矛盾或反向的条目\n"
+                "   - 遗漏：玩家尚未记录但对通关关键的真实规则\n"
+                "   - 误信：玩家笔记中把假规则当真，或把真规则当假\n"
+                "2) 对比【玩家规则笔记】与【隐藏真相】，判断玩家是否触及真相：\n"
+                "   - 未触及：笔记只停留在表层规则\n"
+                "   - 接近：笔记中出现与真相相关的线索碎片但未串联\n"
+                "   - 偏离：玩家推理方向与真相背道而驰\n"
+                "3) 基于进度选择本次引导目标 guidance_target：\n"
+                "   - rule：玩家存在误解/遗漏/误信，需要纠正或补全规则认知\n"
+                "   - truth：玩家规则基本正确，但未触及或已偏离真相，需要暗示规则之间的反常或关联\n"
+                "   若玩家偏好与进度判断冲突，以进度判断为主，偏好仅作次要参考\n\n"
                 "硬性要求：\n"
-                "1) 只输出 JSON，不要 markdown，不要多余文字。\n"
-                "2) 禁止直接复述或泄露隐藏真相；禁止给出完整答案。\n"
-                "3) 提示要可执行，必须给出一个低风险下一步建议。\n"
-                "4) kind 必须与请求一致：rule 或 clue。\n"
-                "5) rule 模式只能围绕一条玩家已知规则；clue 模式只能围绕一个物品。\n\n"
+                "1) 只输出 JSON，不要 markdown，不要多余文字，不要解释推理过程\n"
+                "2) 禁止直接复述或泄露隐藏真相；禁止给出完整答案\n"
+                "3) 提示必须间接、隐喻、可执行——给出一个低风险观察/验证方向，而非结论\n"
+                "4) 不得直白说'你错了''真相是'，要让玩家自己产生怀疑\n\n"
                 "输出 JSON：\n"
-                '- rule：{"kind":"rule","rule_index":1,"hint":"...","next_action":"..."}\n'
-                '- clue：{"kind":"clue","item":"...","hint":"...","next_action":"..."}'
+                '{"guidance_target":"rule|truth","progress_assessment":"10字内进度标签","hint":"...","next_action":"..."}'
             )
 
             user_prompt = (
-                f"本次提示类型(kind)：{hint_mode}\n"
                 f"场景：{session.scene_name}\n"
                 f"背景：{session.background}\n"
                 f"通关条件：{session.win_condition}\n"
                 f"隐藏真相（仅供内部推理，禁止输出）：{session.hidden_truth}\n\n"
-                f"完整规则表：\n{rules_block if rules_block else '（无）'}\n\n"
-                f"玩家规则笔记：\n{known_rules_block}\n\n"
-                f"玩家状态：理智{player.sanity}/100 体力{player.health}/100 位置:{player.location}\n\n"
-                f"背包物品：\n{inventory_block}\n\n"
+                f"【后台完整规则表】（真实基准）：\n{rules_block}\n\n"
+                f"【调用者规则笔记】（待评估）：\n{requester_rules_block}\n"
+                f"{teammate_block}\n\n"
+                f"【玩家状态】理智{player.sanity}/100 体力{player.health}/100 位置:{player.location}\n"
+                f"【背包物品】（参考材料，可选择性引用）：\n{inventory_block}\n\n"
+                f"【玩家本次偏好】：{player_preference}\n"
+                "请按 system 流程推断进度后选择 guidance_target，给出非直白引导。"
             )
-            if hint_mode == "rule":
-                if target_rule_text:
-                    user_prompt += (
-                        f"本次必须点评的规则笔记编号：{target_rule_index_1b or 1}\n"
-                        f"规则内容：{target_rule_text}\n"
-                    )
-                else:
-                    user_prompt += "玩家当前没有规则笔记，请给出如何低风险获得规则信息的提示。\n"
-            elif selected_item_text:
-                user_prompt += f"本次必须提示的物品：{selected_item_text}\n"
-            else:
-                user_prompt += "玩家背包为空，请给出如何低风险获得线索的提示。\n"
 
-            hint_text = ""
-            next_action = ""
-            try:
+            hidden_truth = session.hidden_truth
+
+            async def _call_llm(temp: float, extra_note: str = "") -> dict[str, str]:
+                prompt = user_prompt
+                if extra_note:
+                    prompt = f"{user_prompt}\n\n{extra_note}"
                 response = await LLMClient().call(
-                    prompt=user_prompt,
+                    prompt=prompt,
                     system_prompt=system_prompt,
-                    temperature=0.4,
+                    temperature=temp,
                     max_tokens=min(600, get_default_max_tokens()),
                 )
                 data = response.parse_json()
-                if isinstance(data, dict):
-                    hint_text = str(data.get("hint", "") or "").strip()
-                    next_action = str(data.get("next_action", "") or "").strip()
-                    hidden_truth = str(getattr(session, "hidden_truth", "") or "")
-                    hidden_truth_probe = hidden_truth[:20].strip() if hidden_truth else ""
-                    if hidden_truth_probe and (hidden_truth_probe in hint_text or hidden_truth_probe in next_action):
-                        logger.warning("LLM 提示疑似泄露隐藏真相片段，已回退到兜底提示")
-                        hint_text = ""
-                        next_action = ""
-            except Exception as exc:
-                logger.warning("LLM 提示生成失败，将使用兜底提示: %s", exc)
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"LLM 返回非 JSON 对象: {response!r}")
+                return {
+                    "guidance_target": str(data.get("guidance_target", "") or "").strip(),
+                    "progress_assessment": str(data.get("progress_assessment", "") or "").strip(),
+                    "hint": str(data.get("hint", "") or "").strip(),
+                    "next_action": str(data.get("next_action", "") or "").strip(),
+                }
 
-            if not hint_text:
-                if want_clue:
-                    hint_text = (
-                        "先别急着做高风险动作。优先检查书写痕迹、标签、票据、墙面告示，"
-                        "再观察这些信息与当前场景、身份任务是否存在对应关系。"
-                    )
-                elif player_rules:
-                    hint_text = (
-                        "把这条规则拆成三个部分再验证：触发条件、必须动作、禁止动作。"
-                        "先用最小代价确认它的触发条件是否真的出现。"
-                    )
-                else:
-                    hint_text = (
-                        "你现在更需要先获得信息，而不是直接冒险。"
-                        "尝试观察 NPC 行为、搜索当前位置，或检查任何像告示、值班记录、便签的载体。"
-                    )
+            # 首次生成
+            result = await _call_llm(0.4)
+            guidance_target = result["guidance_target"]
+            progress_assessment = result["progress_assessment"]
+            hint_text = result["hint"]
+            next_action = result["next_action"]
+
+            leaked, leaked_words = _detect_spoiler(hint_text, next_action, hidden_truth, guidance_target)
+            if leaked:
+                logger.warning("首次提示生成命中剧透检测，重试一次。泄露片段: %s", leaked_words)
+                # 重试一次
+                result = await _call_llm(0.7, "上一次生成疑似泄露真相，请严格避免")
+                guidance_target = result["guidance_target"]
+                progress_assessment = result["progress_assessment"]
+                hint_text = result["hint"]
+                next_action = result["next_action"]
+                leaked, leaked_words = _detect_spoiler(hint_text, next_action, hidden_truth, guidance_target)
+                if leaked:
+                    logger.error("二次提示生成仍命中剧透检测，泄露片段: %s", leaked_words)
+                    raise RuntimeError("提示生成失败：检测到剧透风险")
+
+            # 进度标签与引导方向仅写日志
+            logger.info("提示生成: guidance_target=%s progress_assessment=%s", guidance_target, progress_assessment)
 
             hint_message = f"{hint_text}\n\n下一步建议：{next_action}" if next_action else hint_text
             await SaveManager().schedule_save(group_id, session)
@@ -458,7 +492,7 @@ class SharedCommandHandlersMixin:
             await self.send_text(f"生成提示时出错：{exc}")
             return False, "生成失败", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_推理(
         self,
@@ -472,7 +506,7 @@ class SharedCommandHandlersMixin:
             return False, "缺少推理内容", 2
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -494,7 +528,7 @@ class SharedCommandHandlersMixin:
             await self.send_text(f"**{user_name} 的推理**\n\n{rest_input.strip()}\n\n推理已记录。")
             return True, "推理已记录", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_记录规则(
         self,
@@ -509,7 +543,7 @@ class SharedCommandHandlersMixin:
             return False, "缺少规则内容", 2
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -539,7 +573,7 @@ class SharedCommandHandlersMixin:
             )
             return True, "规则已记录", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_行动(
         self,
@@ -554,11 +588,12 @@ class SharedCommandHandlersMixin:
             return False, "缺少行动描述", 2
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+
+        # 阶段1：短临界区校验。持玩家锁校验玩家在游戏里、游戏激活、玩家活着，立即释放锁。
+        state = await state_manager.get_for_player(group_id, user_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
-
         try:
             session = state.session
             player = session.players.get(user_id)
@@ -570,171 +605,427 @@ class SharedCommandHandlersMixin:
             if player.status != PlayerStatus.ALIVE:
                 await self.send_text("你已经死亡，无法行动。")
                 return False, "已死亡", 2
+        finally:
+            state.release_player(user_id)
 
-            self._ensure_story_runtime(
-                session,
-                game_mode=getattr(session, "game_mode", None),
-                initial_player_id=user_id,
-            )
-            result = await self._action_processor.process_action(
-                action=action_text,
-                player=player,
-                session=session,
-                group_id=group_id,
-            )
+        # 阶段2：取只读快照。重建 Player 和 GameSession 副本用于 LLM 判定，避免持锁。
+        snapshot = await state_manager.get_snapshot(group_id)
+        if not snapshot:
+            return False, "快照不可用", 2
 
-            now = datetime.now()
-            player.action_history.append({"action": action_text, "timestamp": now.isoformat()})
-            player.last_action_at = now
+        # 在快照基础上重建副本
+        session_snapshot = GameSession.from_dict(snapshot["session"])
+        player_snapshot = Player.from_dict(snapshot["players_snapshot"][user_id])
 
-            discovered_carriers = self._discover_rule_carriers_for_player(session, player, action_text)
+        # 阶段3：无锁 LLM 判定。在快照副本上跑 process_action 和 npc_simulator，完全无锁，可并行。
+        self._ensure_story_runtime(
+            session_snapshot,
+            game_mode=getattr(session_snapshot, "game_mode", None),
+            initial_player_id=user_id,
+        )
+        result = await self._action_processor.process_action(
+            action=action_text,
+            player=player_snapshot,
+            session=session_snapshot,
+            group_id=group_id,
+        )
 
-            npc_perception: dict[str, Any] = {}
-            if bool(self.get_config("npc_sim.enabled", True)) and bool(self.get_config("npc_sim.trigger_on_every_action", True)):
-                action_payload = {
-                    "description": result.description,
-                    "sanity_change": result.sanity_change,
-                    "health_change": result.health_change,
-                    "discovered_clues": list(result.discovered_clues),
-                    "found_items": list(result.found_items),
-                    "triggered_event": result.triggered_event,
-                    "is_fatal": result.is_fatal,
-                    "violated_rule": result.violated_rule,
-                }
-                try:
-                    await self._get_or_create_npc_simulator().simulate_after_action(
-                        session,
-                        player,
-                        action_text,
-                        action_payload,
-                    )
-                    npc_perception = self._get_or_create_npc_simulator().build_perception_for_player(session, player)
-                except Exception as exc:
-                    logger.warning("NPC 模拟执行失败: %s", exc)
+        now = datetime.now()
+        player_snapshot.action_history.append({"action": action_text, "timestamp": now.isoformat()})
+        player_snapshot.last_action_at = now
 
-            near_win = False
-            if not session.has_cleared:
-                win_progress = await self._ending_judge.check_win_condition(session=session, player=player)
-                if isinstance(win_progress, dict):
-                    if win_progress.get("achieved"):
-                        session.has_cleared = True
-                    elif win_progress.get("near"):
-                        near_win = True
-                elif win_progress:
-                    # 兼容旧的布尔返回
-                    session.has_cleared = True
+        discovered_carriers = self._discover_rule_carriers_for_player(session_snapshot, player_snapshot, action_text)
 
-            injury = str(getattr(player, "injury", "无伤") or "无伤")
-            fatigue = self._get_player_fatigue_level(player)
-            state_desc = str(getattr(player, "state", "正常") or "正常")
-            emotion = str(getattr(player, "emotion", "平静") or "平静")
-            fear_level = int(getattr(player, "fear_level", 0) or 0)
-            anxiety_level = int(getattr(player, "anxiety_level", 0) or 0)
-            stress_level = int(getattr(player, "stress_level", 0) or 0)
-            image_generator = self.get_image_generator()
-            action_image = await image_generator.generate_action_result_image(
-                user_name=user_name,
-                action=action_text,
-                is_dead=(player.status != PlayerStatus.ALIVE),
-                scene_description=result.description,
-                action_feedback=result.triggered_event or "",
-                health=player.health,
-                injury=injury,
-                fatigue=fatigue,
-                sanity=player.sanity,
-                state=state_desc,
-                emotion=emotion,
-                fear_level=fear_level,
-                anxiety_level=anxiety_level,
-                stress_level=stress_level,
-                found_items=list(result.found_items),
-                found_clues=list(result.discovered_clues),
-                new_location=player.location,
-                random_event=None,
-            )
-            await self._send_image_path(action_image)
-
-            follow_up_sections: list[str] = []
-            if discovered_carriers:
-                follow_up_sections.append(self._format_discovered_carrier_text(discovered_carriers))
-
-            if npc_perception:
-                perception_lines: list[str] = []
-                visible_npcs = npc_perception.get("visible_npcs", [])
-                if isinstance(visible_npcs, list) and visible_npcs:
-                    names = []
-                    for npc in visible_npcs:
-                        if not isinstance(npc, dict):
-                            continue
-                        npc_name = str(npc.get("name", "NPC") or "NPC").strip()
-                        npc_action = str(npc.get("last_action", "") or "").strip()
-                        names.append(f"{npc_name}（{npc_action or '就在附近'}）")
-                    if names:
-                        perception_lines.append("你能直接看到：" + "、".join(names))
-
-                visible_events = npc_perception.get("visible_events", [])
-                if isinstance(visible_events, list):
-                    for event_text in visible_events:
-                        text = str(event_text or "").strip()
-                        if text:
-                            perception_lines.append(text)
-
-                audible_events = npc_perception.get("audible_events", [])
-                if isinstance(audible_events, list):
-                    for event_text in audible_events:
-                        text = str(event_text or "").strip()
-                        if text:
-                            perception_lines.append(f"你听见：{text}")
-
-                hints = npc_perception.get("player_perception_hints", [])
-                if isinstance(hints, list):
-                    for hint in hints:
-                        text = str(hint or "").strip()
-                        if text:
-                            perception_lines.append(text)
-
-                if perception_lines:
-                    follow_up_sections.append("\n".join(perception_lines))
-
-            if follow_up_sections:
-                await self.send_text("\n\n".join(section for section in follow_up_sections if section.strip()))
-
-            if session.has_cleared:
-                await self.send_text(
-                    "目标已经达成，这一局随时可以收束。\n\n"
-                    "- `/rg 结束`：直接以当前状态通关结算\n"
-                    "- `/rg 继续`：留下来继续探索，弄清怪谈的根源，冲击完美结局"
+        npc_perception: dict[str, Any] = {}
+        if bool(self.get_config("npc_sim.enabled", True)) and bool(self.get_config("npc_sim.trigger_on_every_action", True)):
+            action_payload = {
+                "description": result.description,
+                "sanity_change": result.sanity_change,
+                "health_change": result.health_change,
+                "discovered_clues": list(result.discovered_clues),
+                "found_items": list(result.found_items),
+                "triggered_event": result.triggered_event,
+                "is_fatal": result.is_fatal,
+                "violated_rule": result.violated_rule,
+            }
+            try:
+                npc_result = await self._get_or_create_npc_simulator().simulate_after_action(
+                    session_snapshot,
+                    player_snapshot,
+                    action_text,
+                    action_payload,
                 )
-            elif near_win:
-                env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
-                if not env_state.get("near_win_notified"):
-                    env_state["near_win_notified"] = True
+                npc_perception = self._get_or_create_npc_simulator().build_perception_for_player(session_snapshot, player_snapshot)
+            except Exception as exc:
+                logger.warning("NPC 模拟执行失败: %s", exc)
+                npc_result = None
+        else:
+            npc_result = None
+
+        near_win = False
+        if not session_snapshot.has_cleared:
+            win_progress = await self._ending_judge.check_win_condition(session=session_snapshot, player=player_snapshot)
+            if isinstance(win_progress, dict):
+                if win_progress.get("achieved"):
+                    session_snapshot.has_cleared = True
+                elif win_progress.get("near"):
+                    near_win = True
+            elif win_progress:
+                # 兼容旧的布尔返回
+                session_snapshot.has_cleared = True
+
+        # 阶段4：短临界区提交变更。重新持玩家锁，把 LLM 结果中的玩家私有变更应用回真 player；
+        # 同时持世界锁，把世界变更应用回真 session。
+        state = await state_manager.get_for_player(group_id, user_id)
+        if not state or not state.session:
+            await self.send_text("提交时发现游戏已结束。")
+            return False, "游戏结束", 2
+        try:
+            session = state.session
+            player = session.players.get(user_id)
+            if not player:
+                await self.send_text("提交时发现玩家已不在游戏中。")
+                return False, "玩家消失", 2
+
+            # 应用玩家私有变更
+            self._apply_player_changes(player, player_snapshot, result)
+
+            # 应用世界变更（短世界锁）。注意：get_world 已持世界锁，需用 release_world 释放，
+            # 不能用 async with（GameState 已不再实现 __aenter__/__aexit__ 上下文管理器协议）。
+            world_state = await state_manager.get_world(group_id)
+            try:
+                if world_state and world_state.session:
+                    self._apply_world_changes(world_state.session, session_snapshot, result, npc_result)
+            finally:
+                if world_state:
+                    world_state.release_world()
+        finally:
+            state.release_player(user_id)
+
+        # 阶段5：无锁广播 + 后续处理（图片、文本、存档）。
+        await self._broadcast_action_events(group_id, user_id, result, npc_result, snapshot)
+
+        # 用真 session 的最新状态生成展示
+        state_for_display = await state_manager.get_snapshot(group_id)
+        if state_for_display:
+            session = GameSession.from_dict(state_for_display["session"])
+            player = session.players.get(user_id, player_snapshot)
+        else:
+            session = session_snapshot
+            player = player_snapshot
+
+        injury = str(getattr(player, "injury", "无伤") or "无伤")
+        fatigue = self._get_player_fatigue_level(player)
+        state_desc = str(getattr(player, "state", "正常") or "正常")
+        emotion = str(getattr(player, "emotion", "平静") or "平静")
+        fear_level = int(getattr(player, "fear_level", 0) or 0)
+        anxiety_level = int(getattr(player, "anxiety_level", 0) or 0)
+        stress_level = int(getattr(player, "stress_level", 0) or 0)
+        image_generator = self.get_image_generator()
+        action_image = await image_generator.generate_action_result_image(
+            user_name=user_name,
+            action=action_text,
+            is_dead=(player.status != PlayerStatus.ALIVE),
+            scene_description=result.description,
+            action_feedback=result.triggered_event or "",
+            health=player.health,
+            injury=injury,
+            fatigue=fatigue,
+            sanity=player.sanity,
+            state=state_desc,
+            emotion=emotion,
+            fear_level=fear_level,
+            anxiety_level=anxiety_level,
+            stress_level=stress_level,
+            found_items=list(result.found_items),
+            found_clues=list(result.discovered_clues),
+            new_location=player.location,
+            random_event=None,
+        )
+        session.image_paths.append(action_image)
+        await self._send_image_path(action_image)
+
+        follow_up_sections: list[str] = []
+        if discovered_carriers:
+            follow_up_sections.append(self._format_discovered_carrier_text(discovered_carriers))
+
+        if npc_perception:
+            perception_lines: list[str] = []
+            visible_npcs = npc_perception.get("visible_npcs", [])
+            if isinstance(visible_npcs, list) and visible_npcs:
+                names = []
+                for npc in visible_npcs:
+                    if not isinstance(npc, dict):
+                        continue
+                    npc_name = str(npc.get("name", "NPC") or "NPC").strip()
+                    npc_action = str(npc.get("last_action", "") or "").strip()
+                    names.append(f"{npc_name}（{npc_action or '就在附近'}）")
+                if names:
+                    perception_lines.append("你能直接看到：" + "、".join(names))
+
+            visible_events = npc_perception.get("visible_events", [])
+            if isinstance(visible_events, list):
+                for event_text in visible_events:
+                    text = str(event_text or "").strip()
+                    if text:
+                        perception_lines.append(text)
+
+            audible_events = npc_perception.get("audible_events", [])
+            if isinstance(audible_events, list):
+                for event_text in audible_events:
+                    text = str(event_text or "").strip()
+                    if text:
+                        perception_lines.append(f"你听见：{text}")
+
+            hints = npc_perception.get("player_perception_hints", [])
+            if isinstance(hints, list):
+                for hint in hints:
+                    text = str(hint or "").strip()
+                    if text:
+                        perception_lines.append(text)
+
+            if perception_lines:
+                follow_up_sections.append("\n".join(perception_lines))
+
+        if follow_up_sections:
+            await self.send_text("\n\n".join(section for section in follow_up_sections if section.strip()))
+
+        if session.has_cleared:
+            await self.send_text(
+                "目标已经达成，这一局随时可以收束。\n\n"
+                "- `/rg 结束`：直接以当前状态通关结算\n"
+                "- `/rg 继续`：留下来继续探索，弄清怪谈的根源，冲击完美结局"
+            )
+        elif near_win:
+            # 持世界锁写入真实 session 的 near_win_notified 标记，
+            # 避免在展示用 session 副本上写丢失导致提示反复发送。
+            world_state = await state_manager.get_world(group_id)
+            if world_state and world_state.session:
+                real_env = world_state.session.environment_state
+                if not isinstance(real_env, dict):
+                    real_env = {}
+                    world_state.session.environment_state = real_env
+                if not real_env.get("near_win_notified"):
+                    real_env["near_win_notified"] = True
+                    world_state.release_world()
                     await self.send_text(
                         "你距离目标只差最后一步了。\n\n"
                         "现在你可以选择：\n"
                         "- 直接完成目标，尽快脱身（完成后用 `/rg 结束` 结算）\n"
                         "- 先不急着离开，继续探索这里的真相，设法从根源上解决怪谈，达成完美结局"
                     )
-
-            if result.is_fatal or player.status != PlayerStatus.ALIVE:
-                if player.sanity == 0:
-                    await self.send_text("……\n\n你感到某种‘秩序’正在接纳你。")
                 else:
-                    violated = result.violated_rule or "未知"
-                    await self.send_text(
-                        f"你已经死了。\n\n"
-                        f"真正把你推到这一步的，是那条被你碰开的规则：{violated}\n\n"
-                        "现在可以用 `/rg 结束` 看这一局最终落到了什么结局。"
-                    )
+                    world_state.release_world()
+            else:
+                # session 不存在，仍然发送提示
+                await self.send_text(
+                    "你距离目标只差最后一步了。\n\n"
+                    "现在你可以选择：\n"
+                    "- 直接完成目标，尽快脱身（完成后用 `/rg 结束` 结算）\n"
+                    "- 先不急着离开，继续探索这里的真相，设法从根源上解决怪谈，达成完美结局"
+                )
 
-            await SaveManager().schedule_save(group_id, session)
-            return True, "行动已执行", 2
-        except Exception as exc:
-            logger.error("处理行动失败: %s", exc, exc_info=True)
-            await self.send_text(f"处理行动时出错：{exc}")
-            return False, "处理失败", 2
-        finally:
-            state.release()
+        if result.is_fatal or player.status != PlayerStatus.ALIVE:
+            if player.sanity == 0:
+                await self.send_text("……\n\n你感到某种‘秩序’正在接纳你。")
+            else:
+                violated = result.violated_rule or "未知"
+                await self.send_text(
+                    f"你已经死了。\n\n"
+                    f"真正把你推到这一步的，是那条被你碰开的规则：{violated}\n\n"
+                    "现在可以用 `/rg 结束` 看这一局最终落到了什么结局。"
+                )
+
+        await SaveManager().schedule_save(group_id, session)
+        return True, "行动已执行", 2
+
+    def _apply_player_changes(
+        self,
+        player: Player,
+        snapshot_player: Player,
+        result: "ActionResult",
+    ) -> None:
+        """把 LLM 判定结果中玩家私有状态变更应用回真 player。
+
+        Args:
+            player: 真实 player（持玩家锁）
+            snapshot_player: 快照副本（LLM 在其上跑判定）
+            result: ActionResult
+        """
+        # 基本状态
+        player.sanity = snapshot_player.sanity
+        player.health = snapshot_player.health
+        player.fatigue = snapshot_player.fatigue
+        player.stress_level = snapshot_player.stress_level
+        player.anxiety_level = snapshot_player.anxiety_level
+        player.fear_level = snapshot_player.fear_level
+        player.injury = snapshot_player.injury
+        player.state = snapshot_player.state
+        player.emotion = snapshot_player.emotion
+
+        # 位置
+        player.location = snapshot_player.location
+
+        # 背包：直接替换为快照版本（因为 LLM 可能添加/删除物品）
+        player.inventory = list(snapshot_player.inventory)
+
+        # 规则笔记
+        player.recorded_rules = list(snapshot_player.recorded_rules)
+
+        # 行动历史
+        player.action_history = list(snapshot_player.action_history)
+        player.last_action_at = snapshot_player.last_action_at
+
+        # 死亡判定
+        if result.is_fatal or player.sanity == 0 or player.health == 0:
+            player.status = PlayerStatus.DEAD
+
+    def _apply_world_changes(
+        self,
+        session: GameSession,
+        snapshot_session: GameSession,
+        result: "ActionResult",
+        npc_result: dict | None,
+    ) -> None:
+        """把 LLM 判定结果中的世界变更应用回真 session（持世界锁）。
+
+        Args:
+            session: 真实 session（持世界锁）
+            snapshot_session: 快照副本
+            result: ActionResult
+            npc_result: NPC 模拟结果（可为 None）
+        """
+        # 版本检查：若世界在 LLM 判定期间被其他玩家修改过，记录 warning。
+        # 采用最后写赢策略（last-write-wins），不抛异常以免阻塞玩家行动。
+        snapshot_version = snapshot_session.world_version
+        current_version = session.world_version
+        if snapshot_version != current_version:
+            logger.warning(
+                "世界版本不匹配（snapshot=%d, current=%d），采用最后写赢策略，可能丢失部分更新",
+                snapshot_version, current_version,
+            )
+
+        _ = npc_result  # NPC 推进结果已通过 snapshot_session.environment_state 体现
+
+        # 应用 environment_state（包含 NPC 推进、规则载体变更、room_events 等）
+        if isinstance(snapshot_session.environment_state, dict):
+            # 直接替换 environment_state，因为 LLM/NPC 模拟直接修改了它
+            session.environment_state = dict(snapshot_session.environment_state)
+
+        # 应用规则变异记录
+        if snapshot_session.rule_mutations:
+            # 追加新增的变异记录（避免重复）
+            existing_count = len(session.rule_mutations)
+            new_mutations = snapshot_session.rule_mutations[existing_count:]
+            if new_mutations:
+                session.rule_mutations.extend(new_mutations)
+                session.last_mutation_time = snapshot_session.last_mutation_time
+
+        # 应用通关状态
+        if snapshot_session.has_cleared:
+            session.has_cleared = True
+
+        # 应用 environment_memory
+        if isinstance(snapshot_session.environment_memory, dict):
+            # 合并 visited_locations / interacted_objects / time_based_events
+            for key in ("visited_locations", "interacted_objects"):
+                existing = set(session.environment_memory.get(key, []))
+                new_items = snapshot_session.environment_memory.get(key, [])
+                for item in new_items:
+                    if item not in existing:
+                        session.environment_memory.setdefault(key, []).append(item)
+                        existing.add(item)
+            # time_based_events 直接追加新的
+            existing_time_events = len(session.environment_memory.get("time_based_events", []))
+            new_time_events = snapshot_session.environment_memory.get("time_based_events", [])[existing_time_events:]
+            if new_time_events:
+                session.environment_memory.setdefault("time_based_events", []).extend(new_time_events)
+
+        # 同步世界版本号：快照版本是 LLM 判定时的版本，应用变更后真实版本应为"快照版本+1"
+        session.world_version = snapshot_session.world_version + 1
+
+        session.updated_at = datetime.now()
+
+    async def _broadcast_action_events(
+        self,
+        group_id: str,
+        user_id: str,
+        result: "ActionResult",
+        npc_result: dict | None,
+        snapshot: dict | None,
+    ) -> None:
+        """把本次行动发布给其他可感知的玩家。
+
+        基于 snapshot 计算可见/可听集合，构造 GameEvent 并发布到 EventBus。
+        单人模式不产生任何事件推送。
+        """
+        _ = npc_result
+        if not snapshot:
+            return
+        session_data = snapshot.get("session", {})
+        # 判断多人模式（GameModes.MULTI.value 是 "多人"）
+        game_mode = session_data.get("game_mode")
+        if game_mode != GameModes.MULTI.value:
+            return
+
+        players_snapshot = snapshot.get("players_snapshot", {})
+        player_snapshot_data = players_snapshot.get(user_id, {})
+        player_location = player_snapshot_data.get("location", "")
+        player_name = player_snapshot_data.get("name", "玩家")
+
+        # 推算可见/可听集合
+        visible_to: set[str] = set()
+        audible_to: set[str] = set()
+        for pid, pdata in players_snapshot.items():
+            if pid == user_id:
+                continue
+            if pdata.get("status") != "alive":
+                # 兼容枚举值
+                if str(pdata.get("status", "")).lower() != "alive":
+                    continue
+            other_location = pdata.get("location", "")
+            if other_location == player_location and other_location:
+                visible_to.add(pid)
+            # 邻接房间：可听（P3 阶段会改用物理系统；这里先用房间拓扑兜底）
+            # 简化：所有其他位置都算可听（实际应该用 room_graph 判断邻接）
+            # 这里先用简单的"非同房间但都存在"作为可听条件，避免引入复杂的 room_graph 查找
+            elif other_location and other_location != player_location:
+                audible_to.add(pid)
+
+        # 判断是否高重要性
+        is_high_importance = bool(getattr(result, "is_fatal", False)) or bool(getattr(result, "violated_rule", None))
+
+        description = str(getattr(result, "description", ""))[:200]
+        audible_description = self._summarize_audible(description)
+
+        from ..core.services.event_bus import GameEvent
+        event = GameEvent(
+            event_type="player_action",
+            group_id=group_id,
+            actor_id=user_id,
+            actor_name=player_name,
+            location=player_location,
+            description=description,
+            audible_description=audible_description,
+            visible_to=visible_to,
+            audible_to=audible_to,
+            importance="high" if is_high_importance else "normal",
+        )
+
+        event_bus = self._get_or_create_event_bus()
+        await event_bus.publish(event)
+
+    def _summarize_audible(self, description: str) -> str:
+        """把行动描述压成可听范围内的声音提示。
+
+        Args:
+            description: 完整的行动描述
+
+        Returns:
+            50 字内的声音提示
+        """
+        snippet = description[:50].rstrip()
+        return f"从附近传来声响，似乎是有人在{snippet}……"
 
     async def _handle_结束(
         self,
@@ -747,13 +1038,15 @@ class SharedCommandHandlersMixin:
         _ = user_name
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
 
         try:
             session = state.session
+            # 停止 NPC tick（多人模式可能已启动）
+            await state.stop_npc_tick()
             player = session.players.get(user_id)
             if not player:
                 await self.send_text("你不在游戏中。")
@@ -792,8 +1085,11 @@ class SharedCommandHandlersMixin:
                 hidden_truth=hidden_truth,
                 ending_type=ending.ending_type,
             )
+            session.image_paths.append(ending_image)
             await self._send_image_path(ending_image)
 
+            # 先清理本局生成的图片，再删除存档
+            await SaveManager().mark_ended_and_cleanup(group_id)
             await state_manager.remove(group_id)
             await SaveManager().delete(group_id)
 
@@ -804,7 +1100,7 @@ class SharedCommandHandlersMixin:
             await self.send_text(f"判定结局时出错：{exc}")
             return False, "判定失败", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_帮助(
         self,
@@ -864,7 +1160,7 @@ class SharedCommandHandlersMixin:
         _ = rest_input
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -883,6 +1179,7 @@ class SharedCommandHandlersMixin:
                 core_symbols=getattr(session, "core_symbols", None),
                 use_cache=True,
             )
+            session.image_paths.append(scene_image)
             await self._send_image_path(scene_image)
 
             entrance_description = None
@@ -897,6 +1194,7 @@ class SharedCommandHandlersMixin:
                     npc_guidance=npc_guidance,
                     use_cache=True,
                 )
+                session.image_paths.append(entrance_long_image)
                 await self._send_image_path(entrance_long_image)
 
             return True, "剧情已显示", 2
@@ -905,7 +1203,7 @@ class SharedCommandHandlersMixin:
             await self.send_text(f"显示剧情时出错：{exc}")
             return False, "显示失败", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_道具(
         self,
@@ -973,7 +1271,7 @@ class SharedCommandHandlersMixin:
         _ = rest_input
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -993,7 +1291,7 @@ class SharedCommandHandlersMixin:
             await self.send_text(self._build_scene_overview_text(session, current_location=current_location, plural=False))
             return True, "场景已显示", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_区域(
         self,
@@ -1007,7 +1305,7 @@ class SharedCommandHandlersMixin:
         _ = rest_input
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -1026,7 +1324,7 @@ class SharedCommandHandlersMixin:
             await self.send_text("\n".join(lines))
             return True, "区域已显示", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_物品栏(
         self,
@@ -1036,7 +1334,7 @@ class SharedCommandHandlersMixin:
         rest_input: str,
     ) -> tuple[bool, str | None, int]:
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -1093,6 +1391,7 @@ class SharedCommandHandlersMixin:
                     player_name=user_name,
                     use_cache=True,
                 )
+                session.image_paths.append(inventory_image)
                 await self._send_image_path(inventory_image)
             except Exception as exc:
                 logger.debug("生成或发送道具图片失败，回退为文本: %s", exc)
@@ -1113,7 +1412,7 @@ class SharedCommandHandlersMixin:
             await self.send_text("\n".join(lines))
             return True, "物品栏已显示", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_背包(
         self,
@@ -1136,7 +1435,7 @@ class SharedCommandHandlersMixin:
         _ = rest_input
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -1155,7 +1454,7 @@ class SharedCommandHandlersMixin:
             )
             return True, "继续探索", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_恢复(
         self,
@@ -1179,12 +1478,12 @@ class SharedCommandHandlersMixin:
                 return False, "存档已结束", 2
 
             state_manager = GameStateManager()
-            state = await state_manager.get_or_create(group_id)
+            state = await state_manager.get_world_or_create(group_id)
             try:
                 self.rehydrate_session_runtime(session, group_id)
                 state.session = session
             finally:
-                state.release()
+                state.release_world()
 
             await self.send_text(
                 f"你重新接上了《{session.scene_name}》这局游戏里的进度。\n\n"
@@ -1212,7 +1511,7 @@ class SharedCommandHandlersMixin:
             return False, "缺少存档名称", 2
 
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -1230,7 +1529,7 @@ class SharedCommandHandlersMixin:
             await self.send_text(f"保存存档时出错：{exc}")
             return False, "保存失败", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _handle_读取(
         self,
@@ -1257,12 +1556,12 @@ class SharedCommandHandlersMixin:
                 return False, "存档已结束", 2
 
             state_manager = GameStateManager()
-            state = await state_manager.get_or_create(group_id)
+            state = await state_manager.get_world_or_create(group_id)
             try:
                 self.rehydrate_session_runtime(session, group_id)
                 state.session = session
             finally:
-                state.release()
+                state.release_world()
 
             await self.send_text(
                 f"**存档已读取**\n\n"

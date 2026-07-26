@@ -47,7 +47,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用规则怪谈插件")
-    config_version: str = Field(default="2.3.0", description="配置文件版本")
+    config_version: str = Field(default="2.4.0", description="配置文件版本")
     auto_save_interval: int = Field(default=ConfigDefaults.AUTO_SAVE_INTERVAL, description="自动保存间隔(秒)")
     font_path: str = Field(default="", description="图片渲染使用的字体文件路径（留空自动选择）")
 

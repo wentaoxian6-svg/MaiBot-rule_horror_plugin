@@ -118,7 +118,7 @@ class PluginConfig(BaseModel):
     """插件基础配置。"""
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.3.0", description="配置文件版本")
+    config_version: str = Field(default="2.4.0", description="配置文件版本")
     auto_save_interval: int = Field(default=30, ge=10, le=300, description="自动保存间隔(秒)")
     font_path: str = Field(default="", description="图片渲染使用的字体文件路径（留空自动选择）")
 

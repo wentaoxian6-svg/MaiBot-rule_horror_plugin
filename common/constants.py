@@ -77,15 +77,68 @@ class FatigueMultipliers:
 
 
 class SanityThresholds:
-    """理智值阈值"""
-    HIGH = 70
-    MEDIUM = 40
-    LOW = 0
-    MAX = 100
+    """理智值阈值
+
+    分段语义（与 action_processor._judge_action 对齐）：
+    - sanity == LOW（0）：理智崩坏模式
+    - LOW < sanity < MEDIUM（< 30）：理智低下模式，出现幻觉
+    - MEDIUM <= sanity < HIGH（30-70）：理智中等模式
+    - sanity >= HIGH（>= 70）：理智正常模式
+
+    数值边界：
+    - MIN/MAX 用于状态钳制（max(MIN, min(MAX, ...))），与 LOW 数值一致但语义独立
+    - LOW 为崩坏阈值（分段语义），MIN 为数值下限（钳制边界）
+    """
+    HIGH = 70      # 正常模式阈值（>= HIGH 为正常）
+    MEDIUM = 30    # 低下/中等边界（< MEDIUM 为低下，出现幻觉）
+    LOW = 0        # 崩坏阈值（== LOW 为崩坏）
+    MAX = 100      # 理智值数值上限
+    MIN = 0        # 理智值数值下限（钳制边界，与 LOW 数值一致但语义独立）
 
 
 class HealthThresholds:
     """生命值阈值"""
+    MAX = 100
+    MIN = 0
+
+
+class FearThresholds:
+    """恐惧值阈值（分段叙事反馈，由 Task 11 实现）"""
+    HIGH = 70      # 高恐惧（手抖、心跳加速、视线不稳）
+    MEDIUM = 40    # 中恐惧（紧张、警觉）
+    LOW = 30       # 低恐惧（轻微不安）
+    MAX = 100
+    MIN = 0
+
+
+class AnxietyThresholds:
+    """焦虑值阈值（分段叙事反馈，由 Task 11 实现）"""
+    HIGH = 70
+    MEDIUM = 40
+    LOW = 30
+    MAX = 100
+    MIN = 0
+
+
+class StressThresholds:
+    """压力值阈值（分段叙事反馈，由 Task 11 实现）"""
+    HIGH = 70
+    MEDIUM = 40
+    LOW = 30
+    MAX = 100
+    MIN = 0
+
+
+class FatigueThresholds:
+    """疲劳值阈值（分段叙事反馈，由 Task 11 实现）
+
+    与 FatigueLevel/FatigueMultipliers 区别：
+    - FatigueLevel/FatigueMultipliers 描述疲劳等级与时间倍率
+    - FatigueThresholds 用于叙事分段（高/中/低疲劳的描述差异）
+    """
+    HIGH = 70
+    MEDIUM = 40
+    LOW = 30
     MAX = 100
     MIN = 0
 

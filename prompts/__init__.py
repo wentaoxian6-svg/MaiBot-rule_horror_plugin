@@ -1,30 +1,9 @@
 """
-Prompt模板模块 - 用于LLM的提示词模板
-"""
-from .shared_prompts import (
-    RULE_DESIGN_PRINCIPLES,
-    build_rules_prompt,
-    build_scene_description_requirements,
-    build_json_output_format_example,
-    build_self_check_requirements,
-    build_clear_condition_prompt,
-    build_action_prompt_base,
-    build_scene_description_requirements_normal,
-    build_scene_description_requirements_corrupted,
-    build_perception_level_prompt,
-    remove_emojis,
-)
+Prompt 模板模块 - 用于 LLM 的提示词工具
 
-__all__ = [
-    "RULE_DESIGN_PRINCIPLES",
-    "build_rules_prompt",
-    "build_scene_description_requirements",
-    "build_json_output_format_example",
-    "build_self_check_requirements",
-    "build_clear_condition_prompt",
-    "build_action_prompt_base",
-    "build_scene_description_requirements_normal",
-    "build_scene_description_requirements_corrupted",
-    "build_perception_level_prompt",
-    "remove_emojis",
-]
+历史上这里曾导出 11 个 Prompt 构造函数，但全代码库零调用点，
+实际 Prompt 均以 inline 形式散落在 services 层。现仅导出 remove_emojis 工具函数。
+"""
+from .shared_prompts import remove_emojis
+
+__all__ = ["remove_emojis"]

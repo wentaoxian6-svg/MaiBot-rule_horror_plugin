@@ -1,6 +1,7 @@
 """LLM 客户端模块"""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -352,7 +353,8 @@ class LLMClient:
     """LLM 客户端"""
 
     def __init__(self):
-        pass
+        # 全局并发上限，避免多玩家同时行动打爆 API
+        self._concurrency_sem = asyncio.Semaphore(8)
 
     @staticmethod
     def _get_section_config(config_obj: Any, config_section: str) -> Any:
@@ -459,24 +461,9 @@ class LLMClient:
             logger.error("[规则怪谈] %s 模型列表为空", resolved_section)
             raise LLMError("模型列表为空")
 
-        default_system_prompt = """你是一位精通规则怪谈创作的游戏设计师和叙事专家。你的任务是：
-1. 生成令人毛骨悚然、逻辑严密的规则怪谈场景
-2. 创造具有欺骗性和层次感的规则系统
-3. 构建充满细节和氛围的环境描述
-4. 提供引人入胜的剧情推进
-
-创作原则：
-- 恐怖氛围：通过环境细节、感官描写营造压抑不安的氛围
-- 逻辑自洽：所有规则和事件必须有内在逻辑
-- 层次递进：规则应该有表里两层，表面规则隐藏深层真相
-- 心理暗示：通过细节暗示而非直接揭示真相
-- 玩家自主：给玩家足够的探索空间和选择自由
-
-输出要求：
-- 使用JSON格式输出结构化数据
-- 描述要具体、生动，避免笼统
-- 保持中文表达的自然流畅
-- 严禁使用emoji表情符号"""
+        # 默认 system_prompt 留空，强制调用方在业务侧显式传入所需的身份与约束。
+        # inline prompt 应当自包含足够上下文，不应隐式依赖任何"规则怪谈设计师"身份。
+        default_system_prompt = ""
 
         final_system_prompt = system_prompt if system_prompt else default_system_prompt
         last_error = None
@@ -598,13 +585,18 @@ class LLMClient:
         config_section: str = "llm",
     ) -> LLMResponse:
         """调用指定配置段的 LLM。"""
-        return await self._call_internal(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            config_section=config_section,
-        )
+        # 通过信号量限制全局并发，避免多玩家同时行动打爆 API。
+        # 注意：call_main / call_npc_sim / call_with_fallback 等方法内部
+        # 均通过 call 进入实际请求，因此只在 call 加 Semaphore 即可，
+        # 不在其内部嵌套调用上重复获取，避免 asyncio.Semaphore 不可重入导致的死锁。
+        async with self._concurrency_sem:
+            return await self._call_internal(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                config_section=config_section,
+            )
 
     async def call_main(
         self,

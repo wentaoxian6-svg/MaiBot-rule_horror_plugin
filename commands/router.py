@@ -9,6 +9,42 @@ from typing import Callable
 from ..common.constants import GameCommands
 
 
+# 命令到处理器方法名的统一映射表：
+# - 中文键来自 GameCommands 枚举值与少量字面量
+# - 英文键原先通过 handler.py 的类属性赋值提供别名，现统一收口到这里
+_COMMAND_MAP: dict[str, str] = {
+    GameCommands.START.value: "_handle_开始",
+    GameCommands.FORCE_START.value: "_handle_强制开始",
+    GameCommands.RESTORE.value: "_handle_恢复",
+    GameCommands.SAVE.value: "_handle_保存",
+    GameCommands.LOAD.value: "_handle_读取",
+    GameCommands.SAVE_LIST.value: "_handle_存档列表",
+    GameCommands.CLEAN_SAVES.value: "_handle_清理存档",
+    GameCommands.JOIN.value: "_handle_加入",
+    GameCommands.LEAVE.value: "_handle_离开",
+    GameCommands.STATUS.value: "_handle_状态",
+    GameCommands.PLOT.value: "_handle_剧情",
+    GameCommands.RULES.value: "_handle_规则",
+    GameCommands.SCENE.value: "_handle_场景",
+    GameCommands.AREAS.value: "_handle_区域",
+    GameCommands.ITEMS.value: "_handle_道具",
+    "物品栏": "_handle_物品栏",
+    "背包": "_handle_背包",
+    GameCommands.CLUES.value: "_handle_线索",
+    GameCommands.HINT.value: "_handle_提示",
+    GameCommands.REASON.value: "_handle_推理",
+    GameCommands.RECORD_RULE.value: "_handle_记录规则",
+    GameCommands.ACTION.value: "_handle_行动",
+    GameCommands.CONTINUE.value: "_handle_继续",
+    GameCommands.END.value: "_handle_结束",
+    GameCommands.HELP.value: "_handle_帮助",
+    GameCommands.IDENTITY.value: "_handle_身份",
+    # 英文别名（原 handler.py 类属性赋值）
+    "start": "_handle_开始",
+    "force_start": "_handle_强制开始",
+    "join": "_handle_加入",
+    "identity": "_handle_身份",
+}
 
 
 CommandHandler = Callable[
@@ -61,44 +97,13 @@ class CommandRouter:
 
 def create_default_router() -> CommandRouter:
     """创建默认的命令路由器
-    
+
     Returns:
         配置好的命令路由器
     """
     router = CommandRouter()
-    
-    # 注册所有命令（实际的处理器将在RuleHorrorCommand中定义）
-    # 这里只是定义路由映射关系
-    command_map = {
-        GameCommands.START.value: "_handle_开始",
-        GameCommands.FORCE_START.value: "_handle_强制开始",
-        GameCommands.RESTORE.value: "_handle_恢复",
-        GameCommands.SAVE.value: "_handle_保存",
-        GameCommands.LOAD.value: "_handle_读取",
-        GameCommands.SAVE_LIST.value: "_handle_存档列表",
-        GameCommands.CLEAN_SAVES.value: "_handle_清理存档",
-        GameCommands.JOIN.value: "_handle_加入",
-        GameCommands.LEAVE.value: "_handle_离开",
-        GameCommands.STATUS.value: "_handle_状态",
-        GameCommands.PLOT.value: "_handle_剧情",
-        GameCommands.RULES.value: "_handle_规则",
-        GameCommands.SCENE.value: "_handle_场景",
-        GameCommands.AREAS.value: "_handle_区域",
-        GameCommands.ITEMS.value: "_handle_道具",
-        GameCommands.CLUES.value: "_handle_线索",
-        GameCommands.HINT.value: "_handle_提示",
-        GameCommands.REASON.value: "_handle_推理",
-        GameCommands.RECORD_RULE.value: "_handle_记录规则",
-        GameCommands.ACTION.value: "_handle_行动",
-        GameCommands.CONTINUE.value: "_handle_继续",
-        GameCommands.END.value: "_handle_结束",
-        GameCommands.HELP.value: "_handle_帮助",
-        GameCommands.IDENTITY.value: "_handle_身份",
-    }
-
-    
     # 注册路由（实际处理器将通过方法名动态获取）
-    for command, handler_name in command_map.items():
+    for command, handler_name in _COMMAND_MAP.items():
         # 这里存储处理器方法名，实际调用时会通过getattr获取
         router.register(command, handler_name)
 
@@ -107,39 +112,11 @@ def create_default_router() -> CommandRouter:
 
 def get_handler_method_name(command: str) -> str | None:
     """获取命令对应的处理器方法名
-    
+
     Args:
         command: 命令名称
-        
+
     Returns:
         处理器方法名，如果未找到则返回None
     """
-    command_map = {
-        GameCommands.START.value: "_handle_开始",
-        GameCommands.FORCE_START.value: "_handle_强制开始",
-        GameCommands.RESTORE.value: "_handle_恢复",
-        GameCommands.SAVE.value: "_handle_保存",
-        GameCommands.LOAD.value: "_handle_读取",
-        GameCommands.SAVE_LIST.value: "_handle_存档列表",
-        GameCommands.CLEAN_SAVES.value: "_handle_清理存档",
-        GameCommands.JOIN.value: "_handle_加入",
-        GameCommands.LEAVE.value: "_handle_离开",
-        GameCommands.STATUS.value: "_handle_状态",
-        GameCommands.PLOT.value: "_handle_剧情",
-        GameCommands.RULES.value: "_handle_规则",
-        GameCommands.SCENE.value: "_handle_场景",
-        GameCommands.AREAS.value: "_handle_区域",
-        GameCommands.ITEMS.value: "_handle_道具",
-        GameCommands.CLUES.value: "_handle_线索",
-        GameCommands.HINT.value: "_handle_提示",
-        GameCommands.REASON.value: "_handle_推理",
-        GameCommands.RECORD_RULE.value: "_handle_记录规则",
-        GameCommands.ACTION.value: "_handle_行动",
-        GameCommands.CONTINUE.value: "_handle_继续",
-        GameCommands.END.value: "_handle_结束",
-        GameCommands.HELP.value: "_handle_帮助",
-        GameCommands.IDENTITY.value: "_handle_身份",
-    }
-
-    
-    return command_map.get(command)
+    return _COMMAND_MAP.get(command)

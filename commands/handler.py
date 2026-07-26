@@ -5,12 +5,12 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from ..core import AsyncImageGenerator, GameSession, GameStateManager, TextFormatter
+from ..core import AsyncImageGenerator, GameSession, GameStateManager
 from ..core.services import ActionProcessor, EndingJudge, GameGenerator, ImmersiveFeedback, NPCSimulator
 from ..common import DirectoryNames, ErrorMessages, GameModes, resolve_data_dir
 from ..flows.multiplayer_flow import MultiplayerFlow
 from ..flows.singleplayer_flow import SingleplayerFlow
-from ..systems import ClueDiscoverySystem, EnvironmentEvolutionSystem, GameTimeManager, MultiplayerPhysicsSystem, RuleMutationSystem
+from ..systems import EnvironmentEvolutionSystem, RuleMutationSystem
 from .runtime_support import RuntimeSupportMixin
 from .session_runtime import SessionRuntimeMixin
 from .shared_handlers import SharedCommandHandlersMixin
@@ -79,7 +79,6 @@ class RuleHorrorCommand(SessionRuntimeMixin, RuntimeSupportMixin, SharedCommandH
         self.matched_groups = dict(matched_groups) if matched_groups else {}
         self.plugin_config = plugin_config_dict
 
-        self._formatter = TextFormatter()
         self._feedback_system = ImmersiveFeedback()
         self._action_processor = ActionProcessor(
             message_sender=self.send_text,
@@ -89,10 +88,7 @@ class RuleHorrorCommand(SessionRuntimeMixin, RuntimeSupportMixin, SharedCommandH
         self._ending_judge = EndingJudge()
         self._npc_simulator: NPCSimulator | None = None
         self._environment_system: EnvironmentEvolutionSystem | None = None
-        self._game_time_manager: GameTimeManager | None = None
         self._rule_mutation_system: RuleMutationSystem | None = None
-        self._clue_discovery_system: ClueDiscoverySystem | None = None
-        self._multiplayer_physics_system: MultiplayerPhysicsSystem | None = None
         self._singleplayer_flow = SingleplayerFlow(self)
         self._multiplayer_flow = MultiplayerFlow(self)
         
@@ -219,7 +215,7 @@ class RuleHorrorCommand(SessionRuntimeMixin, RuntimeSupportMixin, SharedCommandH
         """处理查看身份命令（多人模式主动拉取身份信息）。"""
         _ = rest_input
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
 
         if not state or not state.session:
             await self.send_text("当前没有正在进行的游戏。")
@@ -231,7 +227,7 @@ class RuleHorrorCommand(SessionRuntimeMixin, RuntimeSupportMixin, SharedCommandH
                 await self.send_text("当前不是多人模式游戏，没有身份分配。")
                 return False, "非多人模式", 2
         finally:
-            state.release()
+            state.release_world()
 
         return await self._multiplayer_flow.handle_identity(group_id, user_id, user_name)
 
@@ -257,8 +253,3 @@ class RuleHorrorCommand(SessionRuntimeMixin, RuntimeSupportMixin, SharedCommandH
         if game_mode == GameModes.SINGLE.value:
             return await self._singleplayer_flow.handle_force_start(group_id, user_id, user_name)
         return await self._multiplayer_flow.handle_force_start(group_id, user_id, user_name, rest_input)
-
-    _handle_start = _handle_开始
-    _handle_join = _handle_加入
-    _handle_force_start = _handle_强制开始
-    _handle_identity = _handle_身份

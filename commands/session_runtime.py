@@ -36,17 +36,6 @@ class SessionRuntimeMixin:
         session.environment_state.setdefault("rule_mutations", [])
         session.environment_state.setdefault("discovered_clues", [])
 
-    def _bind_multiplayer_physics_runtime(self, session: GameSession) -> None:
-        """重新绑定多人位置运行时。"""
-        if session.game_mode != GameModes.MULTI.value:
-            return
-        physics_system = self._get_or_create_multiplayer_physics_system()
-        for player in session.players.values():
-            physics_system.register_player(player.player_id, player.name)
-        if not isinstance(session.environment_state, dict):
-            session.environment_state = {}
-        session.environment_state["physics_state"] = physics_system.to_dict()
-
     def _guess_initial_player_id(self, session: GameSession) -> str | None:
         """恢复 story runtime 时推断一个稳定的初始玩家。"""
         for player in session.players.values():
@@ -69,8 +58,6 @@ class SessionRuntimeMixin:
 
         self._bind_environment_runtime(session, group_id)
         self._bind_rule_mutation_runtime(session)
-        self._bind_multiplayer_physics_runtime(session)
-        self._get_or_create_clue_discovery_system()
         self._ensure_story_runtime(
             session,
             game_mode=session.game_mode,

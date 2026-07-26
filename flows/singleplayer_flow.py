@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 from ..common import GameModes, JsonObject
 from ..core import GameStateManager, GameStatus, Player, SaveManager
-from ..systems import EnvironmentState
 
 if TYPE_CHECKING:
     from ..commands.handler import RuleHorrorCommand
@@ -150,8 +149,20 @@ class SingleplayerFlow:
         env_state = session.environment_state
         if isinstance(environment_evolution, dict) and environment_evolution:
             env_state["environment_evolution"] = environment_evolution
-        env_snapshot = EnvironmentState()
-        env_state["environment_snapshot"] = env_snapshot.to_dict()
+        env_state["environment_snapshot"] = {
+            "doors": {},
+            "items": {},
+            "lights": {},
+            "walls": {},
+            "floors": {},
+            "objects": {},
+            "atmosphere": {},
+            "sounds": [],
+            "smells": [],
+            "temperature": 20.0,
+            "humidity": 50.0,
+            "entropy_level": 0.0,
+        }
 
         session.time_manager = {
             "current_time": 0,
@@ -163,18 +174,16 @@ class SingleplayerFlow:
         session._rule_mutation_system = rule_mutation
         env_state["rule_mutations"] = []
 
-        clue_system = self.command._get_or_create_clue_discovery_system()
-        _ = clue_system
         env_state["discovered_clues"] = []
 
         state_manager = GameStateManager()
-        state = await state_manager.get_or_create(group_id)
+        state = await state_manager.get_world_or_create(group_id)
         try:
             state.session = session
             save_manager = SaveManager()
             await save_manager.save_immediately(group_id, session)
         finally:
-            state.release()
+            state.release_world()
 
         image_generator = self.command.get_image_generator()
         core_symbols = getattr(session, "core_symbols", None)
@@ -185,6 +194,7 @@ class SingleplayerFlow:
             core_symbols=core_symbols,
             use_cache=use_cache,
         )
+        session.image_paths.append(scene_image)
         await self.command._send_image_path(scene_image)
         await asyncio.sleep(1.0)
 
@@ -206,6 +216,7 @@ class SingleplayerFlow:
                 npc_guidance=getattr(session, "npc_guidance", {}) or {},
                 use_cache=use_cache,
             )
+            session.image_paths.append(entrance_long_image)
             await self.command._send_image_path(entrance_long_image)
             await asyncio.sleep(1.0)
 

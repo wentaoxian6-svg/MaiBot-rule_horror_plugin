@@ -10,6 +10,8 @@ from typing import Callable, TypeAlias
 from enum import Enum
 from dataclasses import dataclass
 
+from ..common.constants import TimeThresholds
+
 logger = logging.getLogger(__name__)
 
 # 类型定义
@@ -334,5 +336,32 @@ def create_default_mutation_conditions() -> list[MutationCondition]:
         check_function=check_special_location_condition,
         priority=2
     ))
-    
+
+    def check_midnight_time_condition(game_state: GameState, player_action: str | None,
+                                       system: RuleMutationSystem) -> bool:
+        """时间条件：午夜到来触发规则变异
+
+        说明：当游戏内累计时间首次达到 TimeThresholds.MIDNIGHT（60 分钟）时触发。
+        午夜是规则怪谈中“规则开始变得不稳定”的关键节点，
+        “场景意识”在此时段让某些规则发生变异，呼应玩家对“夜深了”的紧张感。
+
+        注意：本条件由 check_conditions 的 triggered_conditions 集合保证只触发一次，
+        不会在每个 tick 都重复触发；mutation_cooldown 也提供额外保护。
+        """
+        time_system = game_state.get("time_system", {})
+        if not isinstance(time_system, dict):
+            return False
+        elapsed_minutes = time_system.get("elapsed_minutes", 0)
+        # bool 是 int 的子类，需要显式排除，避免 True/False 被当作 1/0
+        if isinstance(elapsed_minutes, bool) or not isinstance(elapsed_minutes, (int, float)):
+            return False
+        return int(elapsed_minutes) >= TimeThresholds.MIDNIGHT
+
+    conditions.append(MutationCondition(
+        condition_type=MutationTriggerType.TIME,
+        description="午夜到来时，某些规则开始变异",
+        check_function=check_midnight_time_condition,
+        priority=3
+    ))
+
     return conditions

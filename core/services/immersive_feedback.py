@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from collections.abc import Mapping
 
+from ...common import SanityThresholds
 from ...common.models import JsonValue, StateUpdatesDict
 from ..llm.client import LLMClient, get_default_max_tokens
 
@@ -316,21 +317,73 @@ class ImmersiveFeedback:
         )
 
     async def generate_sensory_description(self, target: str, game_state: Mapping[str, JsonValue]) -> str:
-        """生成某个目标的感官描写（纯文本）"""
+        """生成某个目标的感官描写（纯文本，四感分层 + sanity 模式）"""
+
+        # 从 game_state 抽取环境状态与理智值；缺失时给安全默认值
+        raw_env = game_state.get("environment_state", {})
+        env_state: Mapping[str, JsonValue] = raw_env if isinstance(raw_env, Mapping) else {}
+        lighting = env_state.get("lighting", "")
+        sounds = env_state.get("sounds", [])
+        smells = env_state.get("smells", [])
+        temperature = env_state.get("temperature", "")
+        atmosphere = env_state.get("atmosphere", "")
+
+        raw_sanity = game_state.get("sanity", 100)
+        if isinstance(raw_sanity, bool) or not isinstance(raw_sanity, (int, float)):
+            sanity = 100
+        else:
+            sanity = int(raw_sanity)
+
+        # 根据 sanity 阈值构建感官模式提示（与 action_processor._judge_action 的分档对齐）
+        if sanity <= SanityThresholds.LOW:
+            sanity_mode = (
+                "**理智崩坏模式**：玩家理智极低，必须显式包含幻觉元素——"
+                "扭曲的视觉、不存在的声音、错乱的触感。让感官描写带有强烈的不可靠性与恐怖感。"
+            )
+        elif sanity < SanityThresholds.MEDIUM:
+            sanity_mode = (
+                "**理智低下模式**：玩家理智偏低，感官描写应出现轻微幻觉——"
+                "影子的形状不太对、声音听起来有回响、触感模糊。"
+            )
+        elif sanity >= SanityThresholds.HIGH:
+            sanity_mode = (
+                "**理智敏锐模式**：玩家理智充足，感官异常敏锐，能捕捉到微弱的细节——"
+                "光线中浮动的尘埃、远处极轻的声响、空气中淡薄的气味。"
+            )
+        else:
+            sanity_mode = "**理智正常模式**：感官描写保持正常，克制而细腻。"
 
         system_prompt = (
             "你是规则怪谈游戏的感官描写生成器。\n"
-            "请为给定目标生成一段多感官描写（80-160字），只输出纯文本。\n"
+            "请为给定目标生成一段四感分层描写（总长 80-160 字），只输出纯文本。\n\n"
+            "四感分层要求：\n"
+            "- 视觉：基于光照状况（lighting）。黑暗时弱化视觉（\"几乎看不见\"），明亮时清晰描写。\n"
+            "- 听觉：基于声音列表（sounds），捕捉环境中的声响。\n"
+            "- 嗅觉：基于气味列表（smells），描写闻到的气味。\n"
+            "- 触觉：基于温度（temperature），描写体感温度与空气触感。\n"
+            "每感 1-2 句，自然融合，不要出现分节标题或感官标签。\n"
+            f"\n{sanity_mode}\n"
             "要求：克制、细节、暗示，不要出现 emoji。"
         )
         scene_name = game_state.get("scene_name", "未知场景")
         background = game_state.get("background", "")
 
+        # 构建环境状态描述区块
+        sounds_text = "、".join(str(s) for s in sounds) if isinstance(sounds, list) and sounds else "无"
+        smells_text = "、".join(str(s) for s in smells) if isinstance(smells, list) and smells else "无"
+
         prompt = (
             f"场景: {scene_name}\n"
             f"背景: {background}\n"
             f"目标: {target}\n\n"
-            "请输出感官描写。"
+            "当前环境状态：\n"
+            f"- 光照: {lighting or '未记录'}\n"
+            f"- 声音: {sounds_text}\n"
+            f"- 气味: {smells_text}\n"
+            f"- 温度: {temperature or '未记录'}\n"
+            f"- 氛围: {atmosphere or '未记录'}\n"
+            f"- 理智值: {sanity}/100\n\n"
+            "请基于以上环境状态与理智值，输出四感分层感官描写。"
         )
 
         try:

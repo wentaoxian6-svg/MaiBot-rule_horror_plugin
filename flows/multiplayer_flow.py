@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from ..common import GameModes, JsonObject
 from ..core import GameSession, GameStateManager, GameStatus, Player, SaveManager
 from ..helpers import assign_multiplayer_identities
-from ..systems import EnvironmentState
 
 if TYPE_CHECKING:
     from ..commands.handler import RuleHorrorCommand
@@ -45,7 +44,7 @@ class MultiplayerFlow:
                 multi_start = True
 
         state_manager = GameStateManager()
-        state = await state_manager.get_or_create(group_id)
+        state = await state_manager.get_world_or_create(group_id)
         lobby_players: list[tuple[str, str]] = []
         lobby_order: list[str] = []
 
@@ -157,7 +156,7 @@ class MultiplayerFlow:
                     lobby_players.append((pid, player.name))
                     lobby_order.append(pid)
         finally:
-            state.release()
+            state.release_world()
 
         lock = self.command.plugin.get_generation_lock(group_id)
         if lock.locked():
@@ -221,13 +220,13 @@ class MultiplayerFlow:
         await save_manager.mark_ended_and_cleanup(group_id)
         await save_manager.delete(group_id)
 
-        state = await state_manager.get_or_create(group_id)
+        state = await state_manager.get_world_or_create(group_id)
         try:
             lobby = self._create_lobby(group_id, user_id, user_name, target_players=multi_target)
             state.session = lobby
             await save_manager.save_immediately(group_id, lobby)
         finally:
-            state.release()
+            state.release_world()
 
         target_txt = f"{multi_target}人" if multi_target else "未指定人数"
         await self.command.send_text(
@@ -247,15 +246,13 @@ class MultiplayerFlow:
         user_name: str,
     ) -> tuple[bool, str | None, int]:
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
-        if not state or not state.session:
-            if state:
-                state.release()
+        state = await state_manager.get_world(group_id)
+        if not state:
             restored_session = await SaveManager().load(group_id)
             if not restored_session:
                 await self.command.send_text("当前没有正在进行的游戏。请先使用 `/rg 开始` 开始游戏")
                 return False, "无游戏", 2
-            state = await state_manager.get_or_create(group_id)
+            state = await state_manager.get_world_or_create(group_id)
             self.command.rehydrate_session_runtime(restored_session, group_id)
             state.session = restored_session
 
@@ -305,7 +302,7 @@ class MultiplayerFlow:
             )
             return True, "加入成功", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def handle_identity(
         self,
@@ -314,7 +311,7 @@ class MultiplayerFlow:
         user_name: str,
     ) -> tuple[bool, str | None, int]:
         state_manager = GameStateManager()
-        state = await state_manager.get(group_id)
+        state = await state_manager.get_world(group_id)
         if not state or not state.session:
             await self.command.send_text("当前没有正在进行的游戏。")
             return False, "无游戏", 2
@@ -340,7 +337,7 @@ class MultiplayerFlow:
                 )
             return True, "身份已发送", 2
         finally:
-            state.release()
+            state.release_world()
 
     async def _activate_multiplayer_session(
         self,
@@ -389,8 +386,20 @@ class MultiplayerFlow:
         env_state = session.environment_state
         if isinstance(environment_evolution, dict) and environment_evolution:
             env_state["environment_evolution"] = environment_evolution
-        env_snapshot = EnvironmentState()
-        env_state["environment_snapshot"] = env_snapshot.to_dict()
+        env_state["environment_snapshot"] = {
+            "doors": {},
+            "items": {},
+            "lights": {},
+            "walls": {},
+            "floors": {},
+            "objects": {},
+            "atmosphere": {},
+            "sounds": [],
+            "smells": [],
+            "temperature": 20.0,
+            "humidity": 50.0,
+            "entropy_level": 0.0,
+        }
         session.time_manager = {
             "current_time": 0,
             "time_description": "开场时刻",
@@ -398,22 +407,20 @@ class MultiplayerFlow:
         }
         session._rule_mutation_system = self.command._get_or_create_rule_mutation_system()
         env_state["rule_mutations"] = []
-        _ = self.command._get_or_create_clue_discovery_system()
         env_state["discovered_clues"] = []
 
-        physics_system = self.command._get_or_create_multiplayer_physics_system()
-        for pid, name in lobby_players:
-            physics_system.register_player(pid, name)
-        env_state["physics_state"] = physics_system.to_dict()
+        # 房间级模型：player.location 即为权威位置，不再需要坐标级物理系统初始化
 
         state_manager = GameStateManager()
-        state = await state_manager.get_or_create(group_id)
+        state = await state_manager.get_world_or_create(group_id)
         try:
             state.session = session
+            # 启动 NPC tick（多人模式专属）
+            state.start_npc_tick(self.command)
             save_manager = SaveManager()
             await save_manager.save_immediately(group_id, session)
         finally:
-            state.release()
+            state.release_world()
 
         await self.command._send_multiplayer_private_infos(session, lobby_players, group_id)
 
@@ -426,6 +433,7 @@ class MultiplayerFlow:
             core_symbols=core_symbols,
             use_cache=use_cache,
         )
+        session.image_paths.append(scene_image)
         await self.command._send_image_path(scene_image)
         await asyncio.sleep(1.0)
 
@@ -443,6 +451,7 @@ class MultiplayerFlow:
                 npc_guidance=getattr(session, "npc_guidance", {}) or {},
                 use_cache=use_cache,
             )
+            session.image_paths.append(entrance_long_image)
             await self.command._send_image_path(entrance_long_image)
             await asyncio.sleep(1.0)
 

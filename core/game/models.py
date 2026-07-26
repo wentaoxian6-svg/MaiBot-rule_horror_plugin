@@ -48,6 +48,7 @@ class Rule:
     opposing_npc: str | None = None
     truth_status: str = "unknown"
     confidence: float = 1.0
+    version: int = 0  # 规则版本号，每次变异 +1，0 表示原始未变异版本
 
     @staticmethod
     def _as_str(value: object, default: str = "") -> str:
@@ -116,6 +117,7 @@ class Rule:
             "opposing_npc": self.opposing_npc,
             "truth_status": truth_status,
             "confidence": max(0.0, min(1.0, self.confidence)),
+            "version": self.version,
         }
 
     @classmethod
@@ -152,6 +154,15 @@ class Rule:
         confidence = cls._as_float(data.get("confidence"), reliability)
         rule_id = cls._as_str(data.get("rule_id")) or f"rule_{fallback_index}"
 
+        # version 字段：兼容旧数据（无 version 视为 0），非数字也视为 0
+        version_raw = data.get("version", 0)
+        if isinstance(version_raw, bool):
+            version = 0
+        elif isinstance(version_raw, (int, float)):
+            version = int(version_raw)
+        else:
+            version = 0
+
         return cls(
             rule_id=rule_id,
             surface_text=surface_text,
@@ -170,6 +181,7 @@ class Rule:
             opposing_npc=cls._as_str(data.get("opposing_npc")) or None,
             truth_status=cls._normalize_truth_status(data.get("truth_status"), is_authentic),
             confidence=max(0.0, min(1.0, confidence)),
+            version=version,
         )
 
 
@@ -367,12 +379,20 @@ class GameSession:
     })
     rule_mutations: list[JsonObject] = field(default_factory=list)
     last_mutation_time: datetime | None = None
+    # 规则历史：每次变异前深拷贝的规则快照，保留完整结构化字段用于审计与回溯
+    rule_history: list[JsonObject] = field(default_factory=list)
     rule_network: JsonObject = field(default_factory=lambda: {
         "rule_connections": [],
         "collaborative_rules": [],
     })
     # 全局世界状态：记录公共环境状态（关键道具位置、所有玩家状态等）
     world_flags: JsonObject = field(default_factory=dict)
+    # 共享世界状态的版本号，用于乐观锁检测并发写冲突
+    world_version: int = 0
+    # 本局游戏生成过的所有图片路径，用于存档结束时统一清理
+    image_paths: list[str] = field(default_factory=list)
+    # 待触发的延迟反馈队列：每项含 trigger_at_elapsed/content/target_player_id
+    pending_feedbacks: list[JsonObject] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """统一规则结构，避免旧存档和新生成数据混用时分叉。"""
@@ -435,13 +455,17 @@ class GameSession:
         if location not in self.environment_memory["visited_locations"]:
             self.environment_memory["visited_locations"].append(location)
             self.updated_at = datetime.now()
-    
+            # 共享世界状态发生变更，递增版本号用于乐观锁检测
+            self.world_version += 1
+
     def add_interacted_object(self, obj: str) -> None:
         """添加已互动物体"""
         if obj not in self.environment_memory["interacted_objects"]:
             self.environment_memory["interacted_objects"].append(obj)
             self.updated_at = datetime.now()
-    
+            # 共享世界状态发生变更，递增版本号用于乐观锁检测
+            self.world_version += 1
+
     def add_time_event(self, event: str) -> None:
         """添加时间事件"""
         self.environment_memory["time_based_events"].append({
@@ -449,6 +473,8 @@ class GameSession:
             "event": event,
         })
         self.updated_at = datetime.now()
+        # 共享世界状态发生变更，递增版本号用于乐观锁检测
+        self.world_version += 1
     
     def add_rule_mutation(self, old_rule: str, new_rule: str, reason: str) -> None:
         """添加规则变异记录"""
@@ -460,6 +486,8 @@ class GameSession:
         })
         self.last_mutation_time = datetime.now()
         self.updated_at = datetime.now()
+        # 共享世界状态发生变更，递增版本号用于乐观锁检测
+        self.world_version += 1
 
     def to_dict(self) -> JsonObject:
         """转换为字典"""
@@ -492,7 +520,11 @@ class GameSession:
             "rule_mutations": self.rule_mutations,
             "last_mutation_time": self.last_mutation_time.isoformat() if self.last_mutation_time else None,
             "rule_network": self.rule_network,
+            "rule_history": self.rule_history,
             "world_flags": self.world_flags,
+            "world_version": self.world_version,
+            "image_paths": list(self.image_paths),
+            "pending_feedbacks": self.pending_feedbacks,
         }
 
     @classmethod
@@ -614,9 +646,24 @@ class GameSession:
             "collaborative_rules": [],
         }
 
+        # 加载规则历史快照列表，兼容旧存档（无该字段时为空列表）
+        rh = data.get("rule_history", [])
+        session.rule_history = [x for x in rh if isinstance(x, dict)] if isinstance(rh, list) else []
+
         # 加载全局世界状态
         wf = data.get("world_flags", {})
         session.world_flags = wf if isinstance(wf, dict) else {}
+
+        # 加载世界状态版本号，兼容旧数据（无 world_version 字段时默认为 0）
+        session.world_version = _to_int(data.get("world_version", 0), 0)
+
+        # 加载本局生成的图片路径列表，用于存档结束时统一清理
+        ip = data.get("image_paths", [])
+        session.image_paths = [str(p) for p in ip if isinstance(p, str)] if isinstance(ip, list) else []
+
+        # 加载待触发的延迟反馈队列，兼容旧存档（无该字段时为空列表）
+        pf = data.get("pending_feedbacks", [])
+        session.pending_feedbacks = [x for x in pf if isinstance(x, dict)] if isinstance(pf, list) else []
 
         # 兼容旧版全局已知规则字段：迁移到玩家个人规则笔记后清理旧键。
         if session.players and isinstance(session.environment_state, dict):

@@ -312,38 +312,20 @@ class SaveManager:
                         data["session"]["status"] = "ended"
                         data["session"]["ended_at"] = datetime.now().isoformat()
 
-                        # 收集需要清理的图片路径
+                        # 收集需要清理的图片路径（本局生成过的所有图片）
                         images_to_cleanup: list[str] = []
                         session = data.get("session", {})
 
-                        # 清理场景图片
-                        if session.get("scene_image"):
-                            images_to_cleanup.append(session["scene_image"])
+                        image_paths = session.get("image_paths", [])
+                        if isinstance(image_paths, list):
+                            images_to_cleanup.extend(str(p) for p in image_paths if isinstance(p, str))
 
-                        # 清理结局图片
-                        if session.get("ending_image"):
-                            images_to_cleanup.append(session["ending_image"])
-
-                        # 清理玩家相关图片
-                        for player_id, player_data in session.get("players", {}).items():
-                            if isinstance(player_data, dict):
-                                if player_data.get("status_image"):
-                                    images_to_cleanup.append(player_data["status_image"])
-
-                        # 清理环境图片
-                        env_state = session.get("environment_state", {})
-                        if isinstance(env_state, dict):
-                            for key, value in env_state.items():
-                                if isinstance(value, dict) and value.get("image"):
-                                    images_to_cleanup.append(value["image"])
-
-                    # 保存修改后的存档
+                    # 保存修改后的存档（原子写入，避免写入过程中崩溃导致存档损坏）
+                    json_str = json.dumps(data, ensure_ascii=False, indent=2)
                     if file_path.suffix == ".gz":
-                        with gzip.open(file_path, "wt", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        self._write_compressed_atomically(file_path, json_str)
                     else:
-                        with open(file_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        self._write_text_atomically(file_path, json_str)
 
                     logger.info(f"标记存档为结束: {group_id}")
 
@@ -534,6 +516,20 @@ class SaveManager:
 
                 if session.get("status") != "ended":
                     continue
+
+                # 删存档前先清理本局生成过的图片
+                image_paths = session.get("image_paths", [])
+                if isinstance(image_paths, list):
+                    for image_path in image_paths:
+                        if not isinstance(image_path, str):
+                            continue
+                        try:
+                            img_path = Path(image_path)
+                            if img_path.exists():
+                                img_path.unlink()
+                                logger.info(f"清理图片: {image_path}")
+                        except Exception as e:
+                            logger.warning(f"清理图片失败 {image_path}: {e}")
 
                 file_path.unlink()
                 cleaned += 1

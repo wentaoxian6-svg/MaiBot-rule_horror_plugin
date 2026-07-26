@@ -460,6 +460,15 @@ class NPC:
         self.max_dialogue_history: int = 50  # 最大对话历史记录数
         self.target_location: str | None = None
         self.current_behavior: BehaviorType | None = None
+        # 需求系统 (0-100)：驱动 NPC 主动行为，每 tick 衰减/增长
+        self.hunger: float = 30.0       # 饥饿度：递增，>80 触发找食物
+        self.fatigue: float = 20.0      # 疲劳度：工作时递增、休息时递减，>90 触发找休息处
+        self.curiosity: float = 50.0    # 好奇心：递减，>70 触发调查
+        # 作息字段：根据游戏时段切换，影响行为优先级
+        self.shift: str = "flexible"           # 班次：day/night/flexible
+        self.current_activity: str = "working"  # 当前活动：working/resting
+        # NPC-NPC 关系矩阵：记录对其他 NPC 的态度
+        self.relationships: dict[str, NPCAttitude] = {}
 
     def record_dialogue(self, player_id: str, player_message: str, npc_response: str) -> None:
         """记录对话历史
@@ -672,7 +681,124 @@ class NPC:
                     return result
 
         return {"status": "idle"}
-    
+
+    def tick_needs(self) -> None:
+        """每次 tick 更新需求值。
+
+        饥饿度持续递增；疲劳度根据作息递增或递减；好奇心缓慢递减。
+        """
+        # 饥饿度每 tick 递增
+        self.hunger = min(100.0, self.hunger + 1.5)
+        # 疲劳度：工作时递增，休息时递减
+        if self.current_activity == "resting":
+            self.fatigue = max(0.0, self.fatigue - 5.0)
+        else:
+            self.fatigue = min(100.0, self.fatigue + 2.0)
+        # 好奇心每 tick 缓慢递减（调查后可回升）
+        self.curiosity = max(0.0, self.curiosity - 0.5)
+
+    def update_activity_by_phase(self, time_phase: str) -> None:
+        """根据游戏时段切换作息。
+
+        Args:
+            time_phase: 时段标签（opening/midnight/deep_night/pre_dawn/dawn）
+        """
+        night_phases = ("midnight", "deep_night", "pre_dawn", "dawn")
+        is_night = time_phase in night_phases
+
+        if self.shift == "night":
+            # 夜班：夜间工作，白天休息
+            self.current_activity = "working" if is_night else "resting"
+        elif self.shift == "day":
+            # 白班：白天工作，夜间休息
+            self.current_activity = "resting" if is_night else "working"
+        else:
+            # flexible：疲劳度高时自动休息
+            self.current_activity = "resting" if self.fatigue > 80 else "working"
+
+    def decide_intent(self, time_phase: str, game_state: GameStateDict | None = None) -> BehaviorType:
+        """根据行为树+态度向量+需求+作息决定意图类别。
+
+        优先级（从高到低）：
+        1. 行为树评估（环境/玩家交互条件，激活 build_behavior_tree）
+        2. 态度向量极端值（恐惧/敌意/怀疑，6维向量）
+        3. 需求驱动（饥饿/疲劳）
+        4. 作息驱动（班次+时段）
+        5. 好奇心驱动
+        6. 默认巡逻
+
+        Args:
+            time_phase: 当前游戏时段标签（opening/midnight/deep_night/pre_dawn/dawn）
+            game_state: 可选的游戏状态，用于行为树条件评估
+
+        Returns:
+            意图类别（BehaviorType 枚举）
+        """
+        # 确保行为树已构建（激活行为树）
+        if not self.behavior_tree:
+            self.build_behavior_tree()
+
+        # 1. 行为树优先级评估（ESCAPE > ATTACK > INVESTIGATE > INTERACT）
+        if game_state and self.behavior_tree:
+            for node in sorted(self.behavior_tree.children, key=lambda n: n.priority):
+                if node.evaluate(self, game_state):
+                    self.current_behavior = node.behavior_type
+                    return node.behavior_type
+
+        # 2. 态度向量极端值（6维向量，补充行为树未覆盖的情况）
+        for hostility_level in self.memory.player_hostility.values():
+            if hostility_level > 80:
+                self.current_behavior = BehaviorType.ATTACK
+                return BehaviorType.ATTACK
+        for fear_level in self.memory.player_fear.values():
+            if fear_level > 70:
+                self.current_behavior = BehaviorType.ESCAPE
+                return BehaviorType.ESCAPE
+        for suspicion_level in self.memory.player_suspicion.values():
+            if suspicion_level > 60:
+                self.current_behavior = BehaviorType.INVESTIGATE
+                return BehaviorType.INVESTIGATE
+
+        # 3. 需求驱动
+        if self.fatigue > 90:
+            # 疲劳极高，找休息处（巡逻回家区域）
+            self.current_behavior = BehaviorType.PATROL
+            return BehaviorType.PATROL
+        if self.hunger > 80:
+            # 饥饿极高，找食物
+            self.current_behavior = BehaviorType.PATROL
+            return BehaviorType.PATROL
+
+        # 4. 作息驱动
+        night_phases = ("midnight", "deep_night", "pre_dawn", "dawn")
+        is_night = time_phase in night_phases
+        if self.shift == "night" and is_night and self.current_activity == "working":
+            # 夜班 NPC 在夜间巡逻
+            self.current_behavior = BehaviorType.PATROL
+            return BehaviorType.PATROL
+        if self.shift == "day" and is_night and self.current_activity == "resting":
+            # 白班 NPC 夜间被惊醒，调查
+            self.current_behavior = BehaviorType.INVESTIGATE
+            return BehaviorType.INVESTIGATE
+
+        # 5. 好奇心驱动
+        if self.curiosity > 70:
+            self.current_behavior = BehaviorType.INVESTIGATE
+            return BehaviorType.INVESTIGATE
+
+        # 6. 默认巡逻
+        self.current_behavior = BehaviorType.PATROL
+        return BehaviorType.PATROL
+
+    def update_relationship(self, other_npc_id: str, attitude: NPCAttitude) -> None:
+        """更新对其他 NPC 的态度。
+
+        Args:
+            other_npc_id: 其他 NPC 的 ID
+            attitude: 态度（NPCAttitude 枚举）
+        """
+        self.relationships[other_npc_id] = attitude
+
     def generate_dialogue(self, player_id: str, context: str) -> str:
         """生成对话内容"""
         attitude = self.memory.get_attitude(player_id)
@@ -740,7 +866,13 @@ class NPC:
             "known_rule_ids": self.known_rule_ids,
             "dialogue_history": self.dialogue_history,
             "target_location": self.target_location,
-            "current_behavior": self.current_behavior.value if self.current_behavior else None
+            "current_behavior": self.current_behavior.value if self.current_behavior else None,
+            "hunger": self.hunger,
+            "fatigue": self.fatigue,
+            "curiosity": self.curiosity,
+            "shift": self.shift,
+            "current_activity": self.current_activity,
+            "relationships": {k: v.value for k, v in self.relationships.items()}
         }
 
     @classmethod
@@ -755,6 +887,19 @@ class NPC:
                 try:
                     return max(0.0, min(1.0, float(value.strip())))
                 except Exception:
+                    return default
+            return default
+
+        def _clamp_0_100(value: object, default: float) -> float:
+            """将值钳制到 0-100 区间（用于需求系统字段）。"""
+            if isinstance(value, bool):
+                return 100.0 if value else 0.0
+            if isinstance(value, (int, float)):
+                return max(0.0, min(100.0, float(value)))
+            if isinstance(value, str):
+                try:
+                    return max(0.0, min(100.0, float(value.strip())))
+                except (TypeError, ValueError):
                     return default
             return default
 
@@ -799,5 +944,23 @@ class NPC:
         behavior_str = data.get("current_behavior")
         if behavior_str:
             npc.current_behavior = BehaviorType(behavior_str)
-        
+
+        # 需求系统 (0-100)
+        npc.hunger = _clamp_0_100(data.get("hunger"), 30.0)
+        npc.fatigue = _clamp_0_100(data.get("fatigue"), 20.0)
+        npc.curiosity = _clamp_0_100(data.get("curiosity"), 50.0)
+        # 作息字段
+        shift_raw = str(data.get("shift", "flexible") or "flexible").strip().lower()
+        npc.shift = shift_raw if shift_raw in ("day", "night", "flexible") else "flexible"
+        activity_raw = str(data.get("current_activity", "working") or "working").strip().lower()
+        npc.current_activity = activity_raw if activity_raw in ("working", "resting") else "working"
+        # NPC-NPC 关系矩阵
+        relationships_raw = data.get("relationships", {})
+        if isinstance(relationships_raw, dict):
+            for other_id, attitude_str in relationships_raw.items():
+                try:
+                    npc.relationships[str(other_id)] = NPCAttitude(attitude_str)
+                except (TypeError, ValueError):
+                    continue
+
         return npc

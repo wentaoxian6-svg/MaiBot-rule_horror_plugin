@@ -20,6 +20,7 @@ from typing import TypeAlias, cast
 
 from PIL import Image, ImageDraw, ImageFont
 
+from ...common.constants import SanityThresholds
 from ...common.models import JsonValue, RuleDict
 
 logger = logging.getLogger(__name__)
@@ -343,7 +344,7 @@ class AsyncImageGenerator:
 
     def _distort_text(self, text: str, sanity: int) -> str:
         """对文本应用理智崩坏效果"""
-        if sanity >= 30:
+        if sanity >= SanityThresholds.MEDIUM:
             return text
         
         # 理智值越低，文字扭曲越严重
@@ -481,7 +482,7 @@ class AsyncImageGenerator:
     ) -> tuple[Image.Image, ImageDraw.ImageDraw]:
         """应用理智崩坏时的视觉扭曲效果"""
         _ = font_normal
-        if sanity >= 30 or sanity == 0:
+        if sanity >= SanityThresholds.MEDIUM or sanity == SanityThresholds.LOW:
             return img, draw
         
         width, height = img.size
@@ -658,7 +659,7 @@ class AsyncImageGenerator:
         win_condition: str,
         game_mode: str = "单人",
         output_path: str | None = None,
-        sanity: int = 100,
+        sanity: int = SanityThresholds.MAX,
     ) -> str:
         """同步方法：生成规则长图（怪谈纸面式文本）"""
         if output_path is None:
@@ -677,7 +678,7 @@ class AsyncImageGenerator:
         line_available_width = width - margin * 2
 
         # 理智崩坏模式（sanity=0）：只显示规则内容，不显示标题和标签
-        is_insane_mode = (sanity == 0)
+        is_insane_mode = (sanity == SanityThresholds.LOW)
 
         # 渲染前去重：避免“同一句规则”因提取/合并/规则表重复而展示多次
         def _norm_rule_text(t: str) -> str:
@@ -808,7 +809,7 @@ class AsyncImageGenerator:
             title_x = (width - title_width) // 2
             
             # 对标题应用理智崩坏效果
-            if sanity < 30:
+            if sanity < SanityThresholds.MEDIUM:
                 rules_title = self._distort_text(rules_title, sanity)
                 offset_x = random.randint(-5, 5)
                 offset_y = random.randint(-3, 3)
@@ -827,7 +828,7 @@ class AsyncImageGenerator:
                     continue
                 distorted_line = self._distort_text(line, sanity)
                 
-                if sanity < 30 and random.random() < 0.3:
+                if sanity < SanityThresholds.MEDIUM and random.random() < 0.3:
                     offset_x = random.randint(-3, 3)
                     offset_y = random.randint(-2, 2)
                     draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#FF0000', font=font_normal)
@@ -844,7 +845,7 @@ class AsyncImageGenerator:
                 for line in goal_lines:
                     distorted_line = self._distort_text(line, sanity)
                     
-                    if sanity < 30 and random.random() < 0.3:
+                    if sanity < SanityThresholds.MEDIUM and random.random() < 0.3:
                         offset_x = random.randint(-3, 3)
                         offset_y = random.randint(-2, 2)
                         draw.text((margin + offset_x, current_y + offset_y), distorted_line, fill='#DC143C', font=font_normal)
@@ -869,13 +870,13 @@ class AsyncImageGenerator:
         win_condition: str,
         game_mode: str = "单人",
         output_path: str | None = None,
-        sanity: int = 100,
+        sanity: int = SanityThresholds.MAX,
         use_cache: bool = True,
     ) -> str:
         """异步生成规则长图（支持缓存）"""
         # 生成缓存键（不包含sanity，因为理智值变化不应该使用缓存）
         cache_key: str | None = None
-        if sanity == 100:
+        if sanity == SanityThresholds.MAX:
             cache_key = self._get_cache_key(
                 type="rules",
                 # 变更渲染算法时用于自动失效旧缓存
@@ -906,7 +907,7 @@ class AsyncImageGenerator:
         result_path = await loop.run_in_executor(self._executor, func)
         
         # 缓存图片（仅当理智值为100时）
-        if use_cache and sanity == 100 and cache_key is not None:
+        if use_cache and sanity == SanityThresholds.MAX and cache_key is not None:
             self._cache_image(cache_key, result_path)
         
         return result_path
@@ -952,7 +953,7 @@ class AsyncImageGenerator:
         # 理智崩坏模式（sanity=0）：只显示“对话/感受”，隐藏所有状态栏
         # TECHNICAL.md 设计：理智=0 时会出现“直接对话、否认死亡、诱导打破规则”的叙述风格。
         # 因此：即使本次行动判定死亡，也要优先进入理智崩坏展示，而不是只显示“你已死亡”。
-        is_insane_mode = (sanity == 0)
+        is_insane_mode = (sanity == SanityThresholds.LOW)
 
         # 注意：保留 action 参数是为了兼容调用方；行动长图不再复述玩家行动
         _ = action
@@ -1030,7 +1031,7 @@ class AsyncImageGenerator:
             distorted_line = self._distort_text(line, sanity)
 
             # 文字错位效果：只做横向轻微扰动，避免纵向扰动造成重叠
-            if sanity < 30 and sanity > 0 and random.random() < 0.3:
+            if sanity < SanityThresholds.MEDIUM and sanity > SanityThresholds.LOW and random.random() < 0.3:
                 offset_x = random.randint(-3, 3)
                 base_x = margin + offset_x
             else:
@@ -1062,7 +1063,7 @@ class AsyncImageGenerator:
         health: int = 100,
         injury: str = "无",
         fatigue: str = "正常",
-        sanity: int = 100,
+        sanity: int = SanityThresholds.MAX,
         state: str = "正常",
         emotion: str = "平静",
         fear_level: int = 0,

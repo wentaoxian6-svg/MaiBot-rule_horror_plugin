@@ -1,6 +1,6 @@
 # 规则怪谈插件 - 技术文档
 
-本文只描述仓库当前可验证的实现状态，适用版本为 `2.3.0`。
+本文只描述仓库当前可验证的实现状态，适用版本为 `2.4.0`。
 
 ## 目录结构
 
@@ -10,6 +10,8 @@
 rule_horror_plugin-main/
 ├── _manifest.json
 ├── plugin.py
+├── plugin_config.py
+├── config.toml
 ├── README.md
 ├── QUICK_REFERENCE.md
 ├── TECHNICAL.md
@@ -28,13 +30,6 @@ rule_horror_plugin-main/
 ├── typings/
 └── commands/
 ```
-
-当前仓库中不存在这些旧文档曾提到的内容：
-
-- `plugin_old.py`
-- `REFACTORING.md`
-- `INTEGRATION_SUMMARY.md`
-- 插件目录下的 `tests/`
 
 ## 模块职责
 
@@ -60,6 +55,7 @@ rule_horror_plugin-main/
 - `handler.py`: 薄命令装配层，只保留开始、强制开始、身份等少量分发逻辑
 - `runtime_support.py`: 规则载体、NPC 运行时、图片发送、规则笔记、运行时辅助方法
 - `shared_handlers.py`: 状态、规则、线索、提示、行动、存档、剧情等共享命令处理
+- `session_runtime.py`: 会话运行时恢复与绑定（如 `_bind_environment_runtime`、`rehydrate_session_runtime`）
 - `router.py`: 命令名到处理方法的路由表
 
 ### `flows/`
@@ -81,12 +77,10 @@ rule_horror_plugin-main/
 ### `core/llm/`
 
 - `client.py`: 通用 LLM 调用与 JSON 解析
-- `prompt_builder.py`: Prompt 组织逻辑
 
 ### `core/content/`
 
 - `image_generator.py`: 长图渲染、字体解析、缓存相关逻辑
-- `text_formatter.py`: 输出文本格式化
 
 ### `core/services/`
 
@@ -97,22 +91,20 @@ rule_horror_plugin-main/
 - `ending_judge.py`: 结局判定
 - `item_manager.py`: 道具与休息处理
 - `immersive_feedback.py`: 沉浸式反馈
-- `intent_parser.py`: 意图解析
-- `multiplayer_contradiction.py`: 多人矛盾规则相关处理
 - `npc_simulator.py`: 使用独立模型推进 NPC 位置、动作和房间级感知事件
+- `event_bus.py`: 事件总线
+- `factories.py`: 工厂协议与实现，解耦 core 反向依赖
+- `psychological_state.py`: 心理状态服务
+- `pvp_combat.py`: PvP 战斗服务
 
 ### `systems/`
 
 包含独立系统实现，例如：
 
 - `environment_evolution.py`: 开局环境状态生成与保存
-- `environment_state.py`: 环境状态结构
-- `game_time_manager.py`: 时间推进
-- `multiplayer_physics_system.py`: 多人物理存在感
 - `npc_system.py`: NPC 相关
-- `room_topology.py`: 房间级拓扑、可见与可听范围判断
+- `room_topology.py`: 房间级拓扑、可见与可听范围判断（含门状态/声源强度/墙材质/障碍物）
 - `rule_mutation_system.py`: 规则变异
-- `clue_discovery_system.py`: 线索发现
 
 ## 配置事实
 
@@ -133,15 +125,16 @@ rule_horror_plugin-main/
 
 ### 版本口径
 
-当前版本相关文件的目标口径统一为 `2.3.0`：
+当前版本相关文件的目标口径统一为 `2.4.0`：
 
 - `_manifest.json`
 - `config.toml`
 - `core/config/settings.py`
-- `core/game/save_manager.py`
 - 用户文档
 
-当前代码中的配置默认值、文档和清单已经统一到 `2.3.0` 口径。
+注意：`core/game/save_manager.py` 中存档数据结构的 `version` 字段仍为 `2.2.0`（属存档格式版本，与插件版本独立），不在上述统一口径范围内。
+
+当前代码中的配置默认值、文档和清单已经统一到 `2.4.0` 口径。
 
 ## 命令与流程
 
@@ -150,9 +143,10 @@ rule_horror_plugin-main/
 命令由 `plugin.py` 统一装配，随后委托给 `commands/handler.py` 和 `commands/shared_handlers.py`。常见命令包括：
 
 - 开局类：`开始`、`强制开始`、`加入`、`离开`
-- 查询类：`状态`、`剧情`、`规则`、`场景`、`区域`、`身份`、`道具`、`线索`
+- 查询类：`状态`、`剧情`、`规则`、`场景`、`区域`、`身份`、`道具`、`物品栏`、`背包`、`线索`
 - 行为类：`行动`、`推理`、`记录规则`、`提示`、`继续`、`结束`
 - 存档类：`保存`、`读取`、`恢复`、`存档列表`、`清理存档`
+- 辅助类：`帮助`
 
 `/rg 场景` 只组合 `scene_impression` 与玩家当前位置；场景结构中全部楼层区域和特殊区域由 `/rg 区域` 单独以去重列表展示，避免把区域清单混入场景叙述。
 
@@ -190,6 +184,25 @@ rule_horror_plugin-main/
 多人模式下，`game_generator.py` 会优先把模型生成的 `rule_carriers`、`identity_groups`、`shared_visibility_groups` 写入 `session.rule_network["multi_identity"]`。`plugin.py` 初始化运行时时会优先消费这些结构，只有模型缺字段时才会回退到本地默认载体拼装。
 
 `/rg 规则` 的唯一展示来源仍然是 `Player.recorded_rules`。无论单人还是多人，玩家只能看到自己已经记录下来的规则，不会因为其他玩家发现了某个载体而自动同步笔记。
+
+### 智能提示进度推断
+
+`/rg 提示` 当前已经从"按 kind 硬切换"改造为"先推断进度，再选向引导"的流程，核心行为如下：
+
+- 玩家输入参数（"规则"/"线索"）降级为**软偏好**，仅作次要参考；无参数调用时 LLM 完全自主决定引导方向
+- LLM 内部完成"对比玩家规则笔记 ↔ 后台完整规则 ↔ 隐藏真相 → 识别（误解/遗漏/误信/未触及/接近/偏离）→ 选向"三步推理
+- 输出 `guidance_target`（`rule` / `truth`）和 `progress_assessment`（10 字内进度标签），二者**仅写入日志**，不进入玩家可见消息
+- 玩家收到的消息只包含 `hint` + `next_action`，格式为 `**提示（你还剩N次）**\n\n{hint}\n\n下一步建议：{next_action}`
+- 多人模式下，`commands/runtime_support.py` 的 `CarrierService.collect_team_rules_for_hint(session, requester_id)` 会收集所有 `PlayerStatus.ALIVE` 玩家的规则笔记，调用者本人单独标注，其他玩家归入"队友笔记"，LLM 可见全队笔记用于进度推断
+- 单人模式下该收集方法返回与原 `_get_player_rules_for_display` 等价的结构，行为不退化
+
+剧透检测与异常处理遵循 AGENTS.md（不兜底、不静默吞异常）：
+
+- 模块级 `_detect_spoiler(hint_text, next_action, hidden_truth, guidance_target) -> tuple[bool, list[str]]` 同时检测 hidden_truth 前 20 字片段泄露与 truth 方向真相关键词泄露
+- 首次命中剧透检测时丢弃结果并重新调用 LLM 一次（temperature 提升至 0.7，user prompt 末尾追加"上一次生成疑似泄露真相，请严格避免"）
+- 二次仍命中时直接 `raise RuntimeError("提示生成失败：检测到剧透风险")`，记录 error 日志（包含泄露关键词列表），由 `_handle_提示` 外层 except 向玩家发送错误信息
+- LLM 调用本身的异常（网络/非 JSON/解析失败）不在提示模块内部静默吞掉，统一向上抛出
+- 原 `if not hint_text:` 兜底文案分支已彻底删除
 
 ### 行动处理链
 
@@ -271,21 +284,21 @@ NPC 运行时主要保存在：
 - 对 JSON 响应做清洗、Markdown 去壳、片段提取和有限修复
 - 合并 `default_body` 与模型级 `extra_body`
 - 读取模型级或全局 `timeout` 设置请求超时
+- 通过 `asyncio.Semaphore(8)` 做全局并发限流（在 `call` 入口获取信号量，避免多玩家同时行动打爆 API）
 
 主 `LLMClient` 当前没有实现为通用能力的内容：
 
 - 连接池复用
-- `Semaphore` 并发限流
 - 读取 `max_retries` 执行统一自动重试
 
 当前每次调用仍会创建新的 `aiohttp.ClientSession`，尚未做连接池复用。
 
 ### `systems/environment_evolution.py`
 
-环境演化系统中存在独立的 HTTP/重试逻辑，和主 `LLMClient` 并不是一套完全统一的实现。这意味着：
+环境演化系统直接复用主 `LLMClient` 进行 LLM 调用，不包含独立的 HTTP/重试逻辑。这意味着：
 
-- 文档不能把全插件的 LLM 行为简单描述成“所有模块都共用同一个带连接池/限流/重试的客户端”
-- 环境演化虽然会使用主 LLM 配置参数，但不是通过独立 `[environment]` 段来完成配置注入
+- 全插件的 LLM 调用统一走 `LLMClient`，受其 `asyncio.Semaphore(8)` 限流与 `timeout` 配置约束
+- 环境演化使用主 LLM 配置参数，但不是通过独立 `[environment]` 段来完成配置注入
 
 ## 图像与数据
 
@@ -359,13 +372,6 @@ Linux/容器下的实际回退顺序为：
 - `asyncio.Lock` 保护待保存队列
 
 ## 测试事实
-
-当前插件目录下没有自带 `tests/` 目录，且当前工作区里也没有现成的 `rule_horror` 专项 pytest 文件。因此当前更真实的验证方式是：
-
-- 先做编辑器诊断与最小解释器检查
-- 在 MaiBot 中做手动流程验证
-- 结合日志检查开局、行动、身份发送、结局和存档
-- 对单个模块做必要的导入、诊断或运行时冒烟检查
 
 详见 `TESTING_GUIDE.md`。
 
