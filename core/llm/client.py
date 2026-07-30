@@ -1,17 +1,22 @@
 """LLM 客户端模块"""
 from __future__ import annotations
 
-import asyncio
-import json
-import re
 from dataclasses import dataclass
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 from typing import Any, Optional
 
-from ...common.models import JsonObject
-
 import aiohttp
+import asyncio
+import json
 import logging
+import re
 
+from ...common.models import JsonObject
 from ..config import get_config
 
 logger = logging.getLogger(__name__)
@@ -349,12 +354,32 @@ def get_default_max_tokens(config_section: str = "llm") -> int:
         return 8000
 
 
+class _RetryableHTTPError(Exception):
+    """可重试的 HTTP 错误（429/5xx），触发指数退避重试。"""
+
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"HTTP {status_code}: {body}")
+
+
+class _HTTPError(Exception):
+    """不可重试的 HTTP 错误（4xx 等），直接切换下一模型。"""
+
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"HTTP {status_code}: {body}")
+
+
 class LLMClient:
     """LLM 客户端"""
 
     def __init__(self):
-        # 全局并发上限，避免多玩家同时行动打爆 API
-        self._concurrency_sem = asyncio.Semaphore(8)
+        # 并发上限信号量按配置段惰性创建，从对应配置段的 max_concurrent 读取
+        self._concurrency_sems: dict[str, asyncio.Semaphore] = {}
+        # 复用的 aiohttp 连接池，惰性创建，跨调用复用
+        self._session: Optional[aiohttp.ClientSession] = None
 
     @staticmethod
     def _get_section_config(config_obj: Any, config_section: str) -> Any:
@@ -440,6 +465,50 @@ class LLMClient:
                 return getattr(config_obj, "llm"), "llm"
         return section, config_section
 
+    def _get_semaphore(self, config_section: str) -> asyncio.Semaphore:
+        """获取指定配置段的并发信号量（惰性创建，从对应配置段读取 max_concurrent）。"""
+        if config_section not in self._concurrency_sems:
+            config_obj = get_config()
+            section = self._get_section_config(config_obj, config_section)
+            max_concurrent = int(section.max_concurrent)
+            self._concurrency_sems[config_section] = asyncio.Semaphore(max_concurrent)
+        return self._concurrency_sems[config_section]
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """获取复用的 aiohttp.ClientSession（惰性创建，连接池跨调用复用）。"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def _http_post(
+        self,
+        session: aiohttp.ClientSession,
+        api_url: str,
+        headers: dict[str, Any],
+        payload: dict[str, Any],
+        timeout_seconds: int,
+    ) -> Any:
+        """对单个模型发起一次 HTTP POST 请求。
+
+        - 200：返回解析后的 JSON 数据
+        - 429/5xx：抛出 _RetryableHTTPError 触发指数退避重试
+        - 其它非 200：抛出 _HTTPError 直接切换下一模型
+        """
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with session.post(api_url, headers=headers, json=payload, timeout=timeout) as response:
+            logger.info("[规则怪谈] API 响应状态: %s", response.status)
+            if response.status == 200:
+                return await response.json()
+            body = await response.text()
+            if response.status == 429 or 500 <= response.status < 600:
+                logger.warning(
+                    "[规则怪谈] 可重试错误 %s，body: %s",
+                    response.status,
+                    body,
+                )
+                raise _RetryableHTTPError(response.status, body)
+            raise _HTTPError(response.status, body)
+
     async def _call_internal(
         self,
         prompt: str,
@@ -467,6 +536,11 @@ class LLMClient:
 
         final_system_prompt = system_prompt if system_prompt else default_system_prompt
         last_error = None
+
+        # 从配置段读取最大重试次数（语义为"重试次数"，首次调用不计入）
+        max_retries = int(config.max_retries)
+        # 复用连接池，不在每次调用时新建 ClientSession
+        session = self._get_session()
 
         for model_config in model_candidates:
             model = str(model_config.get("name", "") or "").strip()
@@ -502,76 +576,92 @@ class LLMClient:
             timeout_seconds = int(model_config.get("timeout") or config.timeout or 180)
             logger.info("[规则怪谈] 尝试使用 %s 配置段模型 %s", resolved_section, model)
 
+            # 429/5xx 及网络错误先按 max_retries 指数退避重试，重试耗尽再切换下一模型
+            retrying = AsyncRetrying(
+                stop=stop_after_attempt(max_retries + 1),
+                wait=wait_exponential(multiplier=1, min=1, max=60),
+                retry=retry_if_exception_type(
+                    (_RetryableHTTPError, aiohttp.ClientError, asyncio.TimeoutError)
+                ),
+                reraise=True,
+            )
             try:
-                timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    logger.info("[规则怪谈] 调用 LLM API: %s", api_url)
-                    async with session.post(api_url, headers=headers, json=payload) as response:
-                        logger.info("[规则怪谈] API 响应状态: %s", response.status)
-
-                        if response.status == 200:
-                            data = await response.json()
-
-                            if isinstance(data, list):
-                                logger.warning("[规则怪谈] 模型 %s API返回列表格式: %s", model, data)
-                                last_error = "API返回列表格式"
-                                continue
-
-                            if not isinstance(data, dict):
-                                logger.warning("[规则怪谈] 模型 %s API返回非字典格式: %s", model, type(data))
-                                last_error = f"API返回非字典格式: {type(data)}"
-                                continue
-
-                            choices = data.get("choices", [])
-                            if not choices or not isinstance(choices, list):
-                                logger.warning("[规则怪谈] 模型 %s choices字段格式错误: %s", model, choices)
-                                last_error = "choices字段格式错误"
-                                continue
-
-                            first_choice = choices[0]
-                            if not isinstance(first_choice, dict):
-                                logger.warning("[规则怪谈] 模型 %s choices[0]格式错误: %s", model, first_choice)
-                                last_error = "choices[0]格式错误"
-                                continue
-
-                            message = first_choice.get("message", {})
-                            if not isinstance(message, dict):
-                                logger.warning("[规则怪谈] 模型 %s message字段格式错误: %s", model, message)
-                                last_error = "message字段格式错误"
-                                continue
-
-                            content = _extract_message_content(message).strip()
-                            if not content:
-                                raw_content = message.get("content") if isinstance(message, dict) else None
-                                logger.warning(
-                                    "[规则怪谈] 模型 %s content为空/不可用: type=%s, value=%r",
-                                    model,
-                                    type(raw_content),
-                                    raw_content,
-                                )
-                                last_error = "content为空"
-                                continue
-
-                            logger.info("[规则怪谈] 模型 %s 调用成功，生成 %s 字符", model, len(content))
-                            usage = data.get("usage", {})
-                            return LLMResponse(
-                                content=content,
-                                model=model,
-                                usage=usage if isinstance(usage, dict) else {},
-                                raw_response=data,
-                            )
-
-                        error_text = await response.text()
-                        logger.error(
-                            "[规则怪谈] 模型 %s API请求失败: Status %s, Body: %s",
-                            model,
-                            response.status,
-                            error_text,
-                        )
-                        last_error = f"Status {response.status}: {error_text}"
-            except Exception as e:
-                logger.error("[规则怪谈] 模型 %s 调用时发生异常: %s", model, e)
+                logger.info("[规则怪谈] 调用 LLM API: %s", api_url)
+                data = await retrying(
+                    self._http_post,
+                    session,
+                    api_url,
+                    headers,
+                    payload,
+                    timeout_seconds,
+                )
+            except (_RetryableHTTPError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(
+                    "[规则怪谈] 模型 %s 重试 %s 次后仍失败: %s",
+                    model,
+                    max_retries,
+                    e,
+                )
                 last_error = str(e)
+                continue
+            except _HTTPError as e:
+                logger.error(
+                    "[规则怪谈] 模型 %s API请求失败(不可重试): Status %s, Body: %s",
+                    model,
+                    e.status_code,
+                    e.body,
+                )
+                last_error = str(e)
+                continue
+
+            if isinstance(data, list):
+                logger.warning("[规则怪谈] 模型 %s API返回列表格式: %s", model, data)
+                last_error = "API返回列表格式"
+                continue
+
+            if not isinstance(data, dict):
+                logger.warning("[规则怪谈] 模型 %s API返回非字典格式: %s", model, type(data))
+                last_error = f"API返回非字典格式: {type(data)}"
+                continue
+
+            choices = data.get("choices", [])
+            if not choices or not isinstance(choices, list):
+                logger.warning("[规则怪谈] 模型 %s choices字段格式错误: %s", model, choices)
+                last_error = "choices字段格式错误"
+                continue
+
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                logger.warning("[规则怪谈] 模型 %s choices[0]格式错误: %s", model, first_choice)
+                last_error = "choices[0]格式错误"
+                continue
+
+            message = first_choice.get("message", {})
+            if not isinstance(message, dict):
+                logger.warning("[规则怪谈] 模型 %s message字段格式错误: %s", model, message)
+                last_error = "message字段格式错误"
+                continue
+
+            content = _extract_message_content(message).strip()
+            if not content:
+                raw_content = message.get("content") if isinstance(message, dict) else None
+                logger.warning(
+                    "[规则怪谈] 模型 %s content为空/不可用: type=%s, value=%r",
+                    model,
+                    type(raw_content),
+                    raw_content,
+                )
+                last_error = "content为空"
+                continue
+
+            logger.info("[规则怪谈] 模型 %s 调用成功，生成 %s 字符", model, len(content))
+            usage = data.get("usage", {})
+            return LLMResponse(
+                content=content,
+                model=model,
+                usage=usage if isinstance(usage, dict) else {},
+                raw_response=data,
+            )
 
         logger.error(f"[规则怪谈] 所有模型都调用失败，最后错误: {last_error}")
         raise LLMError(f"所有模型都调用失败: {last_error}")
@@ -589,7 +679,7 @@ class LLMClient:
         # 注意：call_main / call_npc_sim / call_with_fallback 等方法内部
         # 均通过 call 进入实际请求，因此只在 call 加 Semaphore 即可，
         # 不在其内部嵌套调用上重复获取，避免 asyncio.Semaphore 不可重入导致的死锁。
-        async with self._concurrency_sem:
+        async with self._get_semaphore(config_section):
             return await self._call_internal(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -630,5 +720,7 @@ class LLMClient:
         return await self.call(prompt, system_prompt, temperature, max_tokens, config_section=config_section)
 
     async def close(self) -> None:
-        """关闭客户端（兼容性方法）"""
-        pass
+        """关闭客户端，释放复用的 aiohttp 连接池。"""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
