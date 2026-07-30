@@ -15,8 +15,33 @@ from pathlib import Path
 from ...common.models import JsonObject
 from .models import GameSession
 from ..config import get_config
+from ...systems.room_topology import normalize_wall_materials_format
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_wall_materials_in_save_data(save_data: dict) -> None:
+    """规范化存档数据中的 wall_materials 格式。
+
+    把旧 tuple-keyed dict 格式（JSON 会把 tuple key 转为字符串或因 WallMaterial
+    枚举值序列化失败）转换为新 ``list[list[str, str]]`` 格式，确保存档可正确
+    JSON 序列化与反序列化。
+
+    修改 ``save_data`` 原地，不返回值。
+    """
+    session = save_data.get("session")
+    if not isinstance(session, dict):
+        return
+    env_state = session.get("environment_state")
+    if not isinstance(env_state, dict):
+        return
+    room_graph = env_state.get("room_graph")
+    if not isinstance(room_graph, dict):
+        return
+    if "wall_materials" in room_graph:
+        room_graph["wall_materials"] = normalize_wall_materials_format(
+            room_graph["wall_materials"]
+        )
 
 
 class SaveManager:
@@ -132,6 +157,10 @@ class SaveManager:
                 "session": session.to_dict(),
             }
 
+            # 规范化 wall_materials 格式：把旧 tuple-keyed dict 转为 list，
+            # 避免 WallMaterial 枚举值或 tuple key 导致 JSON 序列化失败
+            _normalize_wall_materials_in_save_data(save_data)
+
             # 构建文件路径
             save_path = self._get_save_path(group_id)
 
@@ -241,6 +270,8 @@ class SaveManager:
                 with gzip.open(gz_path, "rt", encoding="utf-8") as f:
                     data = json.load(f)
                 logger.debug(f"加载压缩存档: {group_id}")
+                # 规范化旧存档中的 wall_materials 格式（tuple key dict → list）
+                _normalize_wall_materials_in_save_data(data)
                 return GameSession.from_dict(data["session"])
             except Exception as e:
                 logger.error(f"加载压缩存档失败 {group_id}: {e}")
@@ -252,6 +283,8 @@ class SaveManager:
                 with open(json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 logger.debug(f"加载普通存档: {group_id}")
+                # 规范化旧存档中的 wall_materials 格式（tuple key dict → list）
+                _normalize_wall_materials_in_save_data(data)
                 return GameSession.from_dict(data["session"])
             except Exception as e:
                 logger.error(f"加载存档失败 {group_id}: {e}")
@@ -306,6 +339,9 @@ class SaveManager:
                     else:
                         with open(file_path, "r", encoding="utf-8") as f:
                             data = json.load(f)
+
+                    # 规范化旧存档中的 wall_materials 格式（tuple key dict → list）
+                    _normalize_wall_materials_in_save_data(data)
 
                     # 标记为结束状态
                     if "session" in data:
@@ -437,6 +473,9 @@ class SaveManager:
                 "session": session.to_dict(),
             }
 
+            # 规范化 wall_materials 格式，避免序列化失败
+            _normalize_wall_materials_in_save_data(save_data)
+
             # 构建文件路径（Windows/跨平台安全）
             safe_id = "".join(c for c in group_id if c.isalnum() or c in "-_")
             safe_name = "".join(c for c in name if c.isalnum() or c in "-_")
@@ -463,6 +502,8 @@ class SaveManager:
         try:
             with open(save_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # 规范化旧存档中的 wall_materials 格式（tuple key dict → list）
+            _normalize_wall_materials_in_save_data(data)
             return GameSession.from_dict(data["session"])
         except Exception as e:
             logger.error(f"加载命名存档失败 {group_id}/{name}: {e}")

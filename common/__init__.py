@@ -55,6 +55,8 @@ from .models import (
 )
 
 
+from .door_utils import get_door_state_between
+from .sound_utils import infer_sound_intensity
 from .utils import (
     is_dir_writable,
     resolve_data_dir,
@@ -152,6 +154,8 @@ __all__ = [
     "contains_action_keyword",
     "validate_sanity_value",
     "validate_health_value",
+    "get_door_state_between",
+    "infer_sound_intensity",
     # 异常
     "RuleHorrorError",
     "ConfigError",
