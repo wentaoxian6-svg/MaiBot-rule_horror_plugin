@@ -227,6 +227,7 @@ class GameGenerator:
             game_mode=game_mode,
             rules=game_data.get("rules", []),
             win_condition=game_data.get("win_condition", ""),
+            completion_conditions=game_data.get("completion_conditions", {}),
             clues=game_data.get("clues", []),
             core_symbols=game_data.get("core_symbols", []),
             scene_structure=game_data.get("scene_structure", {}),
@@ -1082,13 +1083,29 @@ class GameGenerator:
    - 不使用“并且”“同时”串联多个独立条件；一句里最多一个动作加一个结果
    - 严禁把规则内容塞进 win_condition；规则归规则，通关条件归通关条件
 
-6. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
-7. **显式语义字段**（重要）：
+6. **通关结构化硬门槛（completion_conditions）**：与 win_condition 严格对应、可被代码确定性校验的结构化条件
+   - 这是一个对象，最多包含四个字段，每个字段都可单独省略，但整体对象必须非空
+   - `required_items`：玩家通关时背包必须持有的关键物品名称数组（1-3 个），名称需与线索/物品命名一致，如 `["地下室钥匙", "值班记录本"]`
+   - `required_location`：玩家通关时必须身处（或其名称包含）的最终位置字符串，如 `"一楼出口大厅"`，必须来自场景结构里真实存在的区域名
+   - `required_action`：玩家通关前必须执行过的目标动作短语（动词+宾语），如 `"用钥匙打开出口大门"`，代码会按文本包含匹配玩家行动历史
+   - `required_npc_state`：通关所需的 NPC 态度/状态映射，键为 NPC 的 npc_id 或 name，值为期望的 attitude 或 current_state 关键词，如 `{"guide_0": "友好"}`；不需要时可省略
+   - 这些条件合在一起必须等价于 win_condition 描述的达成状态：当且仅当全部条件满足时才算“结构化通关”
+   - 不要把规则约束写进这里；这里只描述“通关瞬间玩家应当处于的可观测状态”
+
+7. **规则隐藏逻辑**：规则应该有隐藏的逻辑和真相，需要玩家推理
+8. **显式语义字段**（重要）：
    - 用 `condition` 表示触发前提
    - 用 `constraint` 表示玩家需要遵守的行为约束
    - 用 `consequence` 表示违反后的后果
    - 用 `source` 表示规则来源
    - 用 `reliability` 表示这条规则作为玩家可接触信息时的可靠度，范围 0.0~1.0
+9. **结构化违规条件**（Task 20，重要）：为每条规则输出 `conditions` 对象，供运行时确定性匹配判定违规事实
+   - `time_window`：违规时间窗，如 "22:00-04:00"（表示该时段内违反规则才受罚）；无时间约束时填 null
+   - `location`：违规位置（玩家在该位置做某事才违反规则），如 "走廊""地下室"；无位置约束时填 null
+   - `action_keywords`：触发违规的动作关键词数组，如 ["跑", "大声喊叫"]；无动作约束时填空数组 []
+   - `precondition`：违规前置状态，如 "持有手电筒""未穿制服"；无前置状态约束时填 null
+   - 各子字段可省略或填 null/空数组，表示该维度不做约束
+   - 运行时会先用 conditions 做确定性匹配（时间窗/位置/动作关键词/前置状态全部满足才算违规），再让 LLM 叙事化后果
 
 **输出格式：**
 {
@@ -1098,6 +1115,12 @@ class GameGenerator:
       "is_true": true,
       "hidden_meaning": "隐藏含义",
       "condition": "触发条件",
+      "conditions": {
+        "time_window": "22:00-04:00 或 null",
+        "location": "走廊 或 null",
+        "action_keywords": ["跑", "大声"],
+        "precondition": "持有手电筒 或 null"
+      },
       "constraint": "行为约束",
       "consequence": "违反后果",
       "source": "规则来源，如值班守则/NPC口述/广播",
@@ -1108,6 +1131,12 @@ class GameGenerator:
     }
   ],
   "win_condition": "通关条件",
+  "completion_conditions": {
+    "required_items": ["关键物品A"],
+    "required_location": "最终位置名",
+    "required_action": "目标动作短语",
+    "required_npc_state": {"npc_id": "期望态度或状态"}
+  },
   "clues": ["线索1", "线索2", "线索3"]
 }
 
@@ -1116,7 +1145,9 @@ class GameGenerator:
 - 严禁使用emoji表情符号
 - rule_type字段必须填写，即使是null
 - related_npc和opposing_npc如果没有就填null
-- condition、constraint、consequence、source、reliability 必须填写"""
+- condition、constraint、consequence、source、reliability 必须填写
+- conditions 必须填写（可填空对象 {{}}，表示无条件约束，规则文本本身描述约束）
+- `completion_conditions` 必须是非空对象，至少包含 `required_items` / `required_location` / `required_action` / `required_npc_state` 中的一项；不需要的字段可省略，但整体不能为空对象"""
 
         user_prompt = f"""请基于以下信息，生成规则系统。
 
@@ -1141,6 +1172,13 @@ class GameGenerator:
             )
 
             data = response.parse_json()
+            # 通关结构化硬门槛（Task 22）：必须由 LLM 在生成阶段产出，缺失或畸形直接抛错，禁止兜底
+            cc = data.get("completion_conditions")
+            if not isinstance(cc, dict) or not cc:
+                raise RuntimeError("规则系统未生成结构化通关条件 completion_conditions")
+            recognized_keys = {"required_items", "required_location", "required_action", "required_npc_state"}
+            if not any(key in cc for key in recognized_keys):
+                raise RuntimeError("completion_conditions 至少需要包含一项结构化通关条件")
             logger.info(f"规则系统生成成功: {len(data.get('rules', []))}条规则")
             return data
 

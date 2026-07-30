@@ -1,9 +1,6 @@
 """行动处理服务 - 处理玩家行动并生成反馈"""
 from __future__ import annotations
 
-import asyncio
-import copy
-import difflib
 import json
 import logging
 import re
@@ -19,54 +16,40 @@ from ...common.constants import (
     HealthThresholds,
     StressThresholds,
 )
+from ...common.door_utils import get_door_state_between
 from ...common.models import JsonObject, JsonValue
+from ...common.sound_utils import infer_sound_intensity
 from ...systems.environment_evolution import DoorState
-from ...systems.npc_system import NPCMemory, NPCAttitude
+from ...systems.npc_system import NPCMemory
 from ...systems.room_topology import (
-    SoundIntensity,
     WallMaterial,
     build_room_graph,
     can_hear_between_rooms,
     find_shortest_path,
     get_audible_npcs,
+    get_coop_action_bonus,
     get_obstacles_for_room,
     get_visible_npcs,
     get_wall_material,
     is_adjacent_room,
+    is_dual_player_coop_eligible,
     is_same_room,
+    _normalize_area,
 )
 from ..config import get_config
 from ..llm.client import LLMClient, get_default_max_tokens
 
 from ..game.models import GameSession, GameStatus, Player, PlayerStatus, Rule
 from .item_manager import ItemManager
+from .npc_interaction import NPCInteractionService
+from .npc_simulator import NPCSimulator
+from .player_interaction import PlayerInteractionService
 from .psychological_state import PsychologicalStateService
 from .pvp_combat import PvPCombatService
+from .rule_mutation import RuleMutationService
+from .violation_consequence import ViolationConsequenceService
 
 logger = logging.getLogger(__name__)
-
-
-# 声源强度关键词：用于从行动文本推断 SoundIntensity 档位
-_LOUD_KEYWORDS = ("喊", "大叫", "呼救", "咆哮", "尖叫", "怒吼", "嘶吼")
-_QUIET_KEYWORDS = ("蹑手蹑脚", "悄声", "低语", "轻手轻脚", "屏息")
-
-
-def _infer_sound_intensity(action_text: str) -> SoundIntensity:
-    """从行动文本推断声源强度。
-
-    匹配逻辑：
-    - 命中 LOUD 关键词（喊/大叫/呼救/咆哮/尖叫/怒吼/嘶吼）→ LOUD
-    - 命中 QUIET 关键词（蹑手蹑脚/悄声/低语/轻手轻脚/屏息）→ QUIET
-    - 其余 → NORMAL
-    """
-    text = action_text or ""
-    for kw in _LOUD_KEYWORDS:
-        if kw in text:
-            return SoundIntensity.LOUD
-    for kw in _QUIET_KEYWORDS:
-        if kw in text:
-            return SoundIntensity.QUIET
-    return SoundIntensity.NORMAL
 
 
 class ActionResult:
@@ -110,10 +93,26 @@ class ActionProcessor:
         # 心理状态与 PVP 战斗计算服务（facade 模式：委托调用，避免本类膨胀）
         self._psych_state: PsychologicalStateService = PsychologicalStateService()
         self._pvp: PvPCombatService = PvPCombatService()
+        # Task 13：NPC 对话改走 LLM，复用 NPCSimulator 的 generate_dialogue_llm
+        self._npc_simulator: NPCSimulator = NPCSimulator(self.llm_client)
+        # Task 27：从 action_processor 抽离的四个服务（facade 模式：委托调用，避免本类膨胀）
+        self._npc_interaction: NPCInteractionService = NPCInteractionService(
+            self._npc_simulator, psych_state=self._psych_state,
+        )
+        self._player_interaction: PlayerInteractionService = PlayerInteractionService(self._pvp)
+        self._violation: ViolationConsequenceService = ViolationConsequenceService(
+            llm_client=self.llm_client,
+            message_sender=self._message_sender,
+            session_saver=self._session_saver,
+            find_runtime_npc=self._find_runtime_npc,
+            get_runtime_npc_memory=self._get_runtime_npc_memory,
+        )
+        self._rule_mutation: RuleMutationService = RuleMutationService(self.llm_client)
 
     @staticmethod
     def _normalize_rule_text_for_dedup(text: str) -> str:
-        return re.sub(r"\s+", "", str(text or "").strip()).lower()
+        """规则文本归一化（委托给 ``NPCInteractionService``）。"""
+        return NPCInteractionService.normalize_rule_text_for_dedup(text)
 
     @staticmethod
     def _clamp_ratio(value: object, default: float) -> float:
@@ -131,32 +130,9 @@ class ActionProcessor:
     def _get_session_rule_objects(self, session: GameSession) -> list[Rule]:
         return [Rule.from_dict(rule, index) for index, rule in enumerate(session.rules or [])]
 
-    def _get_runtime_npc_profile(self, npc: JsonObject) -> JsonObject:
-        return {
-            "knowledge_reliability": self._clamp_ratio(npc.get("knowledge_reliability"), 0.75),
-            "deception_tendency": self._clamp_ratio(npc.get("deception_tendency"), 0.1),
-            "corruption_level": self._clamp_ratio(npc.get("corruption_level"), 0.0),
-            "current_state": str(npc.get("current_state", "稳定") or "稳定").strip(),
-            "bias_tags": [str(item).strip() for item in npc.get("bias_tags", []) if str(item).strip()] if isinstance(npc.get("bias_tags", []), list) else [],
-            "known_rule_ids": [str(item).strip() for item in npc.get("known_rule_ids", []) if str(item).strip()] if isinstance(npc.get("known_rule_ids", []), list) else [],
-        }
-
     def _record_rule_texts(self, player: Player, rule_texts: list[str]) -> int:
-        merged_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
-        seen = {self._normalize_rule_text_for_dedup(text) for text in merged_rules if text}
-        added_count = 0
-
-        for raw_text in rule_texts:
-            text = str(raw_text or "").strip()
-            key = self._normalize_rule_text_for_dedup(text)
-            if not text or not key or key in seen:
-                continue
-            merged_rules.append(text)
-            seen.add(key)
-            added_count += 1
-
-        player.recorded_rules = merged_rules
-        return added_count
+        """规则文本去重写入玩家笔记（委托给 ``NPCInteractionService``）。"""
+        return self._npc_interaction.record_rule_texts(player, rule_texts)
 
     @staticmethod
     def _normalize_item_name(text: object) -> str:
@@ -178,33 +154,8 @@ class ActionProcessor:
         return True
 
     def _apply_feedback_state_updates(self, player: Player, updates: Mapping[str, Any]) -> None:
-        """应用沉浸式反馈带来的额外状态变化。"""
-        sanity_delta = updates.get("sanity")
-        if isinstance(sanity_delta, int):
-            player.sanity = max(SanityThresholds.MIN, min(SanityThresholds.MAX, player.sanity + sanity_delta))
-
-        health_delta = updates.get("health")
-        if isinstance(health_delta, int):
-            player.health = max(HealthThresholds.MIN, min(HealthThresholds.MAX, player.health + health_delta))
-
-        fear_delta = updates.get("fear_level")
-        if isinstance(fear_delta, int):
-            player.fear_level = max(FearThresholds.MIN, min(FearThresholds.MAX, player.fear_level + fear_delta))
-
-        anxiety_delta = updates.get("anxiety_level")
-        if isinstance(anxiety_delta, int):
-            player.anxiety_level = max(AnxietyThresholds.MIN, min(AnxietyThresholds.MAX, player.anxiety_level + anxiety_delta))
-
-        stress_delta = updates.get("stress_level")
-        if isinstance(stress_delta, int):
-            player.stress_level = max(StressThresholds.MIN, min(StressThresholds.MAX, player.stress_level + stress_delta))
-
-        location = updates.get("location")
-        if isinstance(location, str) and location.strip():
-            player.location = location.strip()
-
-        if player.health <= 0:
-            player.status = PlayerStatus.DEAD
+        """应用沉浸式反馈带来的额外状态变化（委托给 ``ViolationConsequenceService``）。"""
+        self._violation.apply_feedback_state_updates(player, updates)
 
     @staticmethod
     def _infer_action_time_cost(action: str) -> int:
@@ -327,33 +278,50 @@ class ActionProcessor:
         Returns:
             ActionResult 对象
         """
-        # 触发到期的延迟反馈：先按当前 elapsed_minutes 筛出已到期与未到期，未到期留待后续行动检查
+        # 记录玩家行动的现实时间戳，供 NPC tick 按"最长无行动时长"折算补时（Task 10）
+        session.last_action_real_time = datetime.now()
+
+        # 触发到期的延迟反馈：按当前 elapsed_minutes 筛出已到期，再按 target_player_id 过滤
+        # Task 8：不属于当前行动者的到期反馈必须留回 pending_feedbacks 队列，不能丢弃
         time_manager = session.time_manager if isinstance(session.time_manager, dict) else {}
         current_elapsed = int(time_manager.get("elapsed_minutes", 0) or 0)
-        triggered: list[dict[str, Any]] = []
+        triggered_matching: list[dict[str, Any]] = []
+        triggered_other: list[dict[str, Any]] = []
         remaining: list[dict[str, Any]] = []
         for fb in session.pending_feedbacks:
             if not isinstance(fb, dict):
                 continue
             if fb.get("trigger_at_elapsed", 0) <= current_elapsed:
-                triggered.append(fb)
+                # 到期反馈：按 target_player_id 过滤，不属于当前行动者的留回队列
+                target_player_id = fb.get("target_player_id")
+                if not target_player_id or target_player_id == player.player_id:
+                    triggered_matching.append(fb)
+                else:
+                    triggered_other.append(fb)
             else:
                 remaining.append(fb)
-        session.pending_feedbacks = remaining
+        # 未到期 + 到期但不属于当前玩家的反馈都留回队列，避免丢失
+        session.pending_feedbacks = remaining + triggered_other
 
         # 统一出口：先演化环境（时间/理智/事件），再执行行动主流程，最后追加感官描写（嗅觉/听觉/触觉）
         await self._evolve_environment(session)
+        # 记录追杀状态机是否在行动前已激活（Task 19）：触发追杀的本次行动不计入逃脱回合
+        hunt_was_active = bool(
+            isinstance(session.hunt_state, dict) and session.hunt_state.get("active")
+        )
         result = await self._process_action_impl(action, player, session, group_id)
+        # 追杀状态机推进（Task 19）：仅在行动前已激活时递减回合/检查逃脱条件
+        if hunt_was_active:
+            self._tick_hunt_state(player, session, result)
 
-        # 把触发的延迟反馈追加到本次行动结果（按目标玩家过滤：未指定目标则对所有人生效）
-        for fb in triggered:
-            target_player_id = fb.get("target_player_id")
-            if not target_player_id or target_player_id == player.player_id:
-                content = str(fb.get("content", "")).strip()
-                if content:
-                    result.description = f"{result.description}\n\n[延迟反馈] {content}"
+        # 把触发的延迟反馈追加到本次行动结果（仅匹配当前行动者的到期反馈）
+        for fb in triggered_matching:
+            content = str(fb.get("content", "")).strip()
+            if content:
+                result.description = f"{result.description}\n\n[延迟反馈] {content}"
 
-        await self._append_sensory_description(result, action, player, session)
+        # Task 17：感官描写已合并进 _judge_action 的判定 prompt（一次 LLM 调用），
+        # 不再单独调用 _append_sensory_description 进行第二次 LLM 调用
         return result
 
     async def _evolve_environment(self, session: GameSession) -> None:
@@ -444,7 +412,7 @@ class ActionProcessor:
             logger.info(f"行动消耗游戏时间 {action_time_cost} 分钟，累计 {elapsed_minutes} 分钟")
 
         # NPC交互：按"是否在场 + 态度/记忆 + 玩家语气/行为"做动态判定
-        npc_result = self._maybe_handle_npc_interaction(action, player, session)
+        npc_result = await self._maybe_handle_npc_interaction(action, player, session)
         if npc_result is not None:
             # 应用状态变化（包括疲劳和心理状态）
             self._apply_changes(player, npc_result, action)
@@ -456,9 +424,16 @@ class ActionProcessor:
             return player_interaction
 
 
+        # Task 20：先做确定性违规匹配，再让 LLM 叙事化后果
+        # 同一行为多次执行判定一致（不会这次罚下次不罚），LLM 仅负责叙事化后果
+        deterministic_violations = self._check_structured_violations(action, player, session)
+
         # 构建上下文
         context = self._build_context(player, session)
-        
+        # Task 20：注入确定性违规匹配结果，供 _judge_action 在叙事中体现违规后果
+        if deterministic_violations:
+            context["deterministic_violations"] = deterministic_violations
+
         # 调用LLM判定行动结果
         result_data = await self._judge_action(action, context)
         if not isinstance(result_data, dict):
@@ -482,7 +457,15 @@ class ActionProcessor:
         result_data["sanity_change"] = _to_int(result_data.get("sanity_change", 0), 0)
         result_data["health_change"] = _to_int(result_data.get("health_change", 0), 0)
 
-        
+        # Task 20：确定性违规匹配结果优先于 LLM 判断
+        # 结构化条件全部满足即判定为违规，LLM 仅负责叙事化后果，不能推翻违规事实
+        if deterministic_violations:
+            first_violation = deterministic_violations[0]
+            result_data["violated_rule"] = first_violation["surface_text"]
+            # 确保违规惩罚（理智值下降）：LLM 若未给负值则强制设为 -10
+            if result_data["sanity_change"] >= 0:
+                result_data["sanity_change"] = -10
+
         # 检查是否发现关键物品
         key_item_found = False
         found_items = result_data.get("found_items", [])
@@ -538,6 +521,15 @@ class ActionProcessor:
                 player.location = actual_location
                 result_data["new_location"] = actual_location
                 logger.info(f"玩家 {player.name} 移动到新位置: {player.location}")
+                # 记录位置访问，供"多次访问特殊位置"变异条件检查
+                # _rule_mutation_system 由 flow/session_runtime 在初始化时挂载，缺失即视为初始化缺陷，直接抛出
+                session._rule_mutation_system.record_location_visit(actual_location, player.player_id)
+                # Task 18：玩家落点为「安全区」（场景结构 special_areas）时小额回复理智
+                # 强化「回到安全区」的正反馈，让理智曲线有起伏
+                if self._is_safe_zone(session, actual_location):
+                    recovery = self._psych_state.recover_sanity_for_safe_zone(player)
+                    if recovery > 0:
+                        logger.info(f"玩家 {player.name} 进入安全区 {actual_location}，理智回复 {recovery}")
             # 房间级模型下 player.location 即为权威位置，不再需要同步坐标级物理系统
 
         # 创建行动结果
@@ -564,6 +556,10 @@ class ActionProcessor:
         
         # 处理违规后果（如果有）
         if result.violated_rule:
+            # 记录规则违反，供"连续违反规则"变异条件检查
+            # rule_id 取违反的规则文本（与 _build_mutation_game_state 中 rules 列表项一致）
+            # _rule_mutation_system 由 flow/session_runtime 在初始化时挂载，缺失即视为初始化缺陷，直接抛出
+            session._rule_mutation_system.record_violation(result.violated_rule, player.player_id)
             await self._handle_violation_consequences(
                 player=player,
                 session=session,
@@ -571,7 +567,26 @@ class ActionProcessor:
                     action=action,
                     group_id=group_id,
             )
-        
+        else:
+            # Task 18：玩家本次行动未违反任何规则，给予小额理智回复
+            # 让「崩坏」成为玩家选择的结果而非必然趋势
+            recovery = self._psych_state.recover_sanity_for_rule_obedience(player)
+            if recovery > 0:
+                logger.info(f"玩家 {player.name} 遵守规则，理智回复 {recovery}")
+            # Task 3.3：同房间双人协作的安抚加成（同伴在身边的安抚效果）
+            # 协作加成系数 * 10 折算为理智回复，仅对非违规行动生效
+            coop_bonus_value = float(context.get("coop_bonus", 0.0) or 0.0)
+            if coop_bonus_value > 0.0:
+                comfort_recovery = int(round(coop_bonus_value * 10))
+                if comfort_recovery > 0:
+                    player.sanity = max(
+                        SanityThresholds.MIN,
+                        min(SanityThresholds.MAX, player.sanity + comfort_recovery),
+                    )
+                    logger.info(
+                        f"玩家 {player.name} 同房间有队友协作，安抚理智 +{comfort_recovery}"
+                    )
+
         # 更新环境记忆
         self._update_environment_memory(action, player, session)
         
@@ -581,237 +596,14 @@ class ActionProcessor:
         logger.info(f"行动处理完成: 理智{result.sanity_change:+d}, 体力{result.health_change:+d}, 关键物品={key_item_found}")
         return result
 
-    def _maybe_handle_npc_interaction(self, action: str, player: Player, session: GameSession) -> ActionResult | None:
-        """尝试处理 NPC 交互。
+    async def _maybe_handle_npc_interaction(
+        self, action: str, player: Player, session: GameSession,
+    ) -> ActionResult | None:
+        """尝试处理 NPC 交互（委托给 ``NPCInteractionService``）。
 
-        目标：
-        - 不再“硬编码 NPC 永远回答/永远知道一切”。
-        - NPC 是否回应、回应多少、是否回避，取决于：在场性 + 态度/记忆 + 玩家语气。
-        - 玩家通过互动获得的信息会写入 `player.recorded_rules`，不再依赖旧的全局已知规则索引。
+        Task 13：改走 LLM 生成对话；Task 14：说谎一致性。
         """
-        if not action.strip():
-            return None
-
-        # 注意：不要用单字“问”做简单包含匹配，否则“问题/问号/提问”等名词短语会误触发“搭话”分支，
-        # 进而把“前往/检查/搜索”等真实行动直接短路掉。
-        talk_patterns = [
-            r"询问",
-            r"打听",
-            r"请教",
-            r"搭话",
-            r"对话",
-            r"交谈",
-            r"叫住",
-            r"招呼",
-            # “问”只在其后不是“题”时才按动词对待（避免误匹配“问题”）
-            r"问(?!题)",
-            # “喊”保持兼容（常见：喊住/喊他/喊一声…）
-            r"喊",
-        ]
-        if not any(re.search(p, action) for p in talk_patterns):
-            return None
-
-        env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
-        npcs = env_state.get("npcs", []) if isinstance(env_state.get("npcs", []), list) else []
-        if not npcs:
-            return None
-
-        player_loc = str(player.location or "")
-
-        def npc_loc(npc: Mapping[str, JsonValue]) -> str:
-            return str(npc.get("current_location") or npc.get("location") or npc.get("home_location") or "")
-
-        # 如果行动里有明显“移动/检查/探索”等强动作意图，默认不要被 NPC 搭话短路
-        # （除非玩家明确点名某个 NPC）
-        non_talk_keywords = [
-            "前往", "去", "到", "进入", "离开", "返回", "回到",
-            "检查", "查看", "调查", "搜索", "探索", "翻找",
-            "打开", "关闭", "使用", "拿起", "放下", "触摸", "推", "拉", "按",
-        ]
-        has_non_talk_intent = any(k in action for k in non_talk_keywords)
-
-        # 选择目标NPC：优先匹配名字，其次取同地点的第一个
-        target: JsonObject | None = None
-        mentioned_name = False
-        for npc in npcs:
-            if not isinstance(npc, dict):
-                continue
-            name = str(npc.get("name") or "")
-            if name and name in action:
-                target = npc
-                mentioned_name = True
-                break
-
-        if target is None:
-            same_place = [npc for npc in npcs if isinstance(npc, dict) and npc_loc(npc) == player_loc]
-            target = same_place[0] if same_place else None
-
-        # 未点名 + 行动包含强动作意图：交给正常行动判定流程处理
-        if has_non_talk_intent and not mentioned_name:
-            return None
-
-        if target is None:
-            # 玩家在聊天但附近没有任何NPC
-            return None
-
-        name = str(target.get("name") or session.npc_guidance.get("npc_name") or "NPC")
-        target_loc = npc_loc(target).strip()
-        loc = target_loc or "未知位置"
-
-        # 位置未知：不允许“隔空对话”，给出符合直觉的反馈
-        if player_loc and not target_loc:
-            return ActionResult(description=f"你压低声音叫了叫{name}，但你看不见他，也无法确定他是否在{player_loc}附近。")
-
-        # 不在场：允许玩家“喊人”，但给出符合直觉的反馈
-        if player_loc and target_loc and target_loc != player_loc:
-            return ActionResult(description=f"你朝{loc}的方向叫了叫{name}，回应只有回声。你此刻在{player_loc}，而他不在这里。")
-
-        # 载入/初始化记忆
-        mem = NPCMemory.from_dict(target.get("memory", {}) if isinstance(target.get("memory"), dict) else {})
-        npc_profile = self._get_runtime_npc_profile(target)
-        pid = str(player.player_id)
-        mem.initialize_attitude_vector(pid)
-
-        # 语气/方式对态度的即时影响
-        polite = any(k in action for k in ["请", "麻烦", "您好", "劳驾", "拜托", "求"]) 
-        aggressive = any(k in action for k in ["滚", "闭嘴", "威胁", "砸", "杀", "打", "逼", "掐"]) 
-
-        # 计算帮助意愿
-        vec = mem.get_attitude_vector(pid)
-        affection = float(vec.get("affection", 50.0))
-        trust = float(vec.get("trust", 50.0))
-        suspicion = float(vec.get("suspicion", 0.0))
-        hostility = float(vec.get("hostility", 0.0))
-        fear = float(vec.get("fear", 0.0))
-
-        score = (affection + trust) - (suspicion + hostility * 1.2 + fear * 0.8)
-        if polite:
-            score += 8
-        if aggressive:
-            score -= 25
-
-        attitude = mem.get_attitude(pid)
-
-        # 是否在问规则
-        ask_rule_keywords = ["规则", "规矩", "守则", "注意事项", "剩下", "其他", "还有", "没说完", "补充"]
-        asking_rules = any(k in action for k in ask_rule_keywords)
-
-        # 根据分数决定：0=拒绝/回避，1=少量，2=中等，3=较多
-        if hostility >= 60 or score < -20 or attitude in {NPCAttitude.HOSTILE}:
-            help_level = 0
-        elif suspicion >= 70 or score < 10 or attitude in {NPCAttitude.SUSPICIOUS}:
-            help_level = 0
-        elif score < 45:
-            help_level = 1
-        elif score < 85:
-            help_level = 2
-        else:
-            help_level = 3
-
-        # 更新态度向量（记录这次互动带来的变化）
-        if aggressive:
-            mem.update_attitude_vector(pid, hostility_delta=10, trust_delta=-10, suspicion_delta=8)
-        elif polite:
-            mem.update_attitude_vector(pid, trust_delta=5, affection_delta=3, suspicion_delta=-2)
-        else:
-            # 中性互动：轻微降低陌生感
-            mem.update_attitude_vector(pid, trust_delta=1)
-
-        # 记录互动
-        game_time = 0
-        if isinstance(session.time_manager, dict):
-            game_time = int(session.time_manager.get("elapsed_minutes", 0) or 0)
-        mem.record_interaction(pid, "talk", {"action": action, "location": player_loc}, game_time)
-
-        # 写回 NPC 记忆
-        target["memory"] = mem.to_dict()
-
-        if not asking_rules:
-            return None
-
-        # 询问规则：把“愿不愿意说”和“说得靠不靠谱”分开处理
-        recorded_rules = [str(rule).strip() for rule in getattr(player, "recorded_rules", []) if str(rule).strip()]
-        recorded_rule_keys = {self._normalize_rule_text_for_dedup(rule) for rule in recorded_rules if rule}
-        unknown_rules = [
-            rule
-            for rule in self._get_session_rule_objects(session)
-            if self._normalize_rule_text_for_dedup(rule.surface_text) not in recorded_rule_keys
-        ]
-        known_rule_ids = {str(rule_id).strip() for rule_id in npc_profile.get("known_rule_ids", []) if str(rule_id).strip()}
-        if known_rule_ids:
-            prioritized = [rule for rule in unknown_rules if rule.rule_id in known_rule_ids]
-            remaining = [rule for rule in unknown_rules if rule.rule_id not in known_rule_ids]
-            unknown_rules = prioritized + remaining
-
-        if help_level == 0 or not unknown_rules:
-            if attitude == NPCAttitude.HOSTILE:
-                text = f"你压低声音向{loc}的{name}问起规矩。他的手指停在台面上，冷冷地敲了两下：『我没义务教你。』"
-            elif attitude == NPCAttitude.SUSPICIOUS:
-                text = f"你压低声音向{loc}的{name}问起规矩。他盯着你看了几秒：『你先把刚才那几条记牢。问太多，容易出事。』"
-            else:
-                text = f"你压低声音向{loc}的{name}问起规矩。他摇了摇头：『现在不方便。』"
-            return ActionResult(description=text)
-
-        reliability = float(npc_profile.get("knowledge_reliability", 0.75) or 0.75)
-        deception = float(npc_profile.get("deception_tendency", 0.1) or 0.1)
-        corruption = float(npc_profile.get("corruption_level", 0.0) or 0.0)
-        truthfulness = max(0.0, min(1.0, reliability * (1.0 - deception * 0.7) * (1.0 - corruption * 0.8)))
-
-        false_rules = [rule for rule in unknown_rules if rule.truth_status == "false" or rule.is_authentic is False]
-        true_rules = [rule for rule in unknown_rules if rule not in false_rules]
-        if not true_rules:
-            true_rules = unknown_rules
-
-        reveal_count = min(help_level, len(true_rules))
-        recordable_rule_texts: list[str] = []
-        spoken_parts: list[str] = []
-        source_hint = ""
-        bias_tags = npc_profile.get("bias_tags", [])
-        if isinstance(bias_tags, list) and bias_tags:
-            source_hint = f"带着明显的{'、'.join(str(tag) for tag in bias_tags[:2])}口吻，"
-
-        def cn_num(n: int) -> str:
-            table = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
-            return table[n - 1] if 1 <= n <= len(table) else str(n)
-
-        if truthfulness >= 0.72:
-            for j, rule in enumerate(true_rules[:reveal_count], 1):
-                if rule.surface_text:
-                    spoken_parts.append(f"第{cn_num(j)}，{rule.surface_text}")
-                    recordable_rule_texts.append(rule.surface_text)
-        elif truthfulness >= 0.45:
-            if true_rules:
-                rule = true_rules[0]
-                spoken_parts.append(f"我记得比较像是“{rule.surface_text}”，但你最好再找纸面记录核对一遍")
-            if false_rules and (deception >= 0.35 or corruption >= 0.35):
-                spoken_parts.append(f"也有人说过“{false_rules[0].surface_text}”，不过我不保证")
-        else:
-            rumor_pool = false_rules or unknown_rules
-            if rumor_pool:
-                rumor_rule = rumor_pool[0]
-                spoken_parts.append(f"他压低声音，{source_hint}只丢给你一句：『{rumor_rule.surface_text}』")
-
-        if not spoken_parts:
-            text = f"你压低声音向{loc}的{name}问起规矩。他皱了皱眉：『我现在也说不准，你最好自己去核对留下来的记录。』"
-            return ActionResult(description=text)
-
-        if recordable_rule_texts:
-            self._record_rule_texts(player, recordable_rule_texts)
-
-        prefix = "你压低声音向{loc}的{name}问起剩下的规矩。".format(loc=loc, name=name)
-        if recordable_rule_texts and help_level >= 3:
-            mid = "他像是权衡了几秒，终于把话说得更明白："
-        elif recordable_rule_texts and help_level == 2:
-            mid = "他不耐烦地叹了口气，还是补了两句："
-        elif truthfulness >= 0.45:
-            mid = "他迟疑了很久，说出来的话像是在回忆，也像是在自我纠正："
-        else:
-            mid = "他神色古怪地看了你一眼，只吐出一句听上去并不那么可靠的话："
-
-        text = f"{prefix}{mid}『{'；'.join(spoken_parts)}』"
-        if not recordable_rule_texts:
-            text += " 这更像一条口头情报，你觉得还需要再找别的来源确认。"
-        return ActionResult(description=text)
+        return await self._npc_interaction.handle_npc_interaction(action, player, session)
 
     def _maybe_handle_player_interaction(
         self,
@@ -819,34 +611,11 @@ class ActionProcessor:
         player: Player,
         session: GameSession,
     ) -> "ActionResult | None":
-        """检测玩家之间的直接交互（给物品、喊话、攻击）。
+        """检测玩家之间的直接交互（委托给 ``PlayerInteractionService``）。
 
         仅多人模式生效。返回 None 表示不是玩家交互，交给常规 LLM 判定。
-        房间级模型下，可见性 = 同房间；声音可听性由 room_topology.can_hear_between_rooms 判定。
         """
-        if session.game_mode != GameModes.MULTI.value:
-            return None
-
-        # 1) 检测是否针对某玩家
-        target_player = self._find_target_player_in_action(action, session, player)
-        if target_player is None:
-            return None
-
-        # 2) 检查可见性：房间级模型下同房间即可见
-        can_see_target = is_same_room(player.location, target_player.location)
-
-        if not can_see_target:
-            return ActionResult(
-                description=f"你看不见{target_player.name}，无法对他执行该行动。"
-            )
-
-        # 3) 分类处理
-        if self._is_give_action(action):
-            return self._handle_give_item(player, target_player, action)
-        if self._is_attack_action(action):
-            return self._handle_pvp(player, target_player, action, session)
-
-        return None  # 交给常规 LLM 判定
+        return self._player_interaction.maybe_handle_player_interaction(action, player, session)
 
     def _find_target_player_in_action(
         self,
@@ -854,21 +623,16 @@ class ActionProcessor:
         session: GameSession,
         player: Player,
     ) -> Player | None:
-        """从行动文本里匹配目标玩家名字。"""
-        for other in session.players.values():
-            if other.player_id == player.player_id:
-                continue
-            if other.name and other.name in action:
-                return other
-        return None
+        """从行动文本里匹配目标玩家名字（委托给 ``PlayerInteractionService``）。"""
+        return self._player_interaction.find_target_player_in_action(action, session, player)
 
     def _is_give_action(self, action: str) -> bool:
-        """检测是否是给物品的行动。"""
-        return any(k in action for k in ["给", "递给", "交给", "塞给", "扔给"])
+        """检测是否是给物品的行动（委托给 ``PlayerInteractionService``）。"""
+        return self._player_interaction.is_give_action(action)
 
     def _is_attack_action(self, action: str) -> bool:
-        """检测是否是攻击行动。"""
-        return any(k in action for k in ["攻击", "打", "推", "掐", "刺", "砸"])
+        """检测是否是攻击行动（委托给 ``PlayerInteractionService``）。"""
+        return self._player_interaction.is_attack_action(action)
 
     def _handle_give_item(
         self,
@@ -876,34 +640,11 @@ class ActionProcessor:
         receiver: Player,
         action: str,
     ) -> "ActionResult":
-        """处理物品转移。
+        """处理物品转移（委托给 ``PlayerInteractionService``）。
 
-        P5 阶段不实现异步通知接收方（receiver 是 session 里的对象，不是真实聊天会话）。
-        通知由 P2 的事件广播系统处理。本方法只修改 inventory 并返回描述。
+        Task 9：用双方背包名词匹配提取物品。
         """
-        # 从 action 里提取物品名（简化：用"给"之后的词）
-        match = re.search(r"给(?:.+?)(?:[，,])?\s*(.+)", action)
-        item_name = match.group(1).strip() if match else ""
-        if not item_name:
-            return ActionResult(description=f"你想给{receiver.name}什么？请说明物品。")
-
-        # 在 giver.inventory 里查找物品
-        item = None
-        for inv_item in giver.inventory:
-            if not isinstance(inv_item, dict):
-                continue
-            inv_name = str(inv_item.get("name", "")).strip()
-            if inv_name == item_name or item_name in inv_name:
-                item = inv_item
-                break
-
-        if not item:
-            return ActionResult(description=f"你没有 {item_name}。")
-
-        giver.inventory.remove(item)
-        receiver.inventory.append(item)
-
-        return ActionResult(description=f"你把 {item_name} 递给了 {receiver.name}。")
+        return self._player_interaction.handle_give_item(giver, receiver, action)
 
     def _handle_pvp(
         self,
@@ -912,14 +653,14 @@ class ActionProcessor:
         action: str,
         session: GameSession,
     ) -> "ActionResult":
-        """处理 PVP 攻击（委托给 ``PvPCombatService``，保留签名以兼容调用点）。
+        """处理 PVP 攻击（委托给 ``PlayerInteractionService`` → ``PvPCombatService``）。
 
         详见 ``core/services/pvp_combat.py`` 中 ``PvPCombatService.handle_pvp`` 的实现：
         - 伤害公式：基础伤害 + 武器加成 + 力量修正 - 防御修正，再乘以 (1 - 距离衰减)
         - 伤情根据最终伤害值分段判定
         - 房间级模型下 can_sneak 恒为 False
         """
-        return self._pvp.handle_pvp(attacker, target, action, session)
+        return self._player_interaction.handle_pvp(attacker, target, action, session)
 
     # ------------------------------------------------------------------
     # PVP 伤害修正公式相关辅助方法（委托给 ``PvPCombatService``）
@@ -972,83 +713,15 @@ class ActionProcessor:
         result: ActionResult,
         key_item_found: bool = False,
     ) -> None:
-        """检查是否需要规则变异（条件+LLM评估混合模式）"""
-        # 如果理智崩坏，不触发规则变异
-        if player.sanity == SanityThresholds.LOW:
-            return
-        
-        trigger_reasons: list[str] = []
-        satisfied_conditions: list[str] = []
-        
-        # 1. 检查关键物品
-        if key_item_found:
-            trigger_reasons.append("关键物品")
-        
-        # 2. 检查预设条件
-        from ...systems.rule_mutation_system import RuleMutationSystem
-        game_state = self._build_mutation_game_state(session, player)
-        game_time = 0
-        if isinstance(session.time_manager, dict):
-            game_time = int(session.time_manager.get("elapsed_minutes", 0) or 0)
-        
-        # 获取规则变异系统实例（从plugin通过session传递）
-        mutation_system = getattr(session, '_rule_mutation_system', None)
-        if mutation_system and isinstance(mutation_system, RuleMutationSystem):
-            conditions = mutation_system.check_conditions(game_state, action, game_time)
-            for condition in conditions:
-                condition_desc = condition.description
-                satisfied_conditions.append(condition_desc)
-                trigger_reasons.append(f"条件触发：{condition_desc}")
-                # 记录条件已触发
-                mutation_system.triggered_conditions.add(
-                    f"{condition.condition_type.value}_{condition.description}"
-                )
-        
-        # 3. 如果有触发原因，调用LLM评估
-        if trigger_reasons:
-            await self._trigger_rule_mutation(
-                session, player, 
-                trigger_reason="；".join(trigger_reasons),
-                satisfied_conditions=satisfied_conditions
-            )
+        """检查是否需要规则变异（委托给 ``RuleMutationService``）。
+
+        Task 29：变异成功后调用 trigger_mutation 更新冷却（不再绕过）。
+        """
+        await self._rule_mutation.check_rule_mutation(action, player, session, result, key_item_found)
     
     def _build_mutation_game_state(self, session: GameSession, player: Player) -> JsonObject:
-        """构建规则变异系统需要的游戏状态字典"""
-        game_time = 0
-        if isinstance(session.time_manager, dict):
-            game_time = int(session.time_manager.get("elapsed_minutes", 0) or 0)
-        
-        # 构建玩家数据
-        player_data: JsonObject = {
-            "location": player.location,
-            "action_history": [
-                {"action": a.get("action", ""), "timestamp": a.get("timestamp", 0)}
-                for a in player.action_history[-20:]  # 只取最近20条
-            ],
-            "inventory": player.inventory,
-        }
-        
-        # 获取已访问位置记录
-        visited_locations: dict[str, int] = {}
-        for record in player.action_history:
-            loc = record.get("location") if isinstance(record, dict) else None
-            if loc:
-                visited_locations[str(loc)] = visited_locations.get(str(loc), 0) + 1
-        player_data["visited_locations"] = visited_locations
-        
-        return {
-            "scene_name": session.scene_name,
-            "scene_structure": session.scene_structure or {},
-            "rules": [r.get("text", str(r)) for r in (session.rules or [])],
-            "time_system": {"elapsed_minutes": game_time},
-            "players": {str(player.player_id): player_data},
-            "key_clues": list(getattr(session, 'discovered_clues', [])),
-            "key_items_found": {
-                item.get("name", ""): {"location": player.location, "timestamp": game_time}
-                for item in player.inventory
-                if isinstance(item, dict) and item.get("is_key_item")
-            },
-        }
+        """构建规则变异系统需要的游戏状态字典（委托给 ``RuleMutationService``）。"""
+        return self._rule_mutation.build_mutation_game_state(session, player)
     
     async def _trigger_rule_mutation(
         self,
@@ -1056,213 +729,15 @@ class ActionProcessor:
         player: Player,
         trigger_reason: str = "随机",
         satisfied_conditions: list[str] | None = None,
+        satisfied_condition_objects: list[Any] | None = None,
     ) -> JsonObject:
-        """触发规则变异（条件+LLM评估混合模式）
+        """触发规则变异（委托给 ``RuleMutationService``）。
 
-        Args:
-            session: 游戏会话
-            player: 当前玩家
-            trigger_reason: 触发原因描述
-            satisfied_conditions: 满足的条件列表（条件触发模式）
-        
-        Returns:
-            包含变异信息的字典，如果不需要变异则返回空字典
+        Task 21：变异时同步更新结构化元数据；Task 29：更新冷却。
         """
-        if not session.rules:
-            return {}
-        
-        # 收集所有玩家的行动和推理历史
-        all_actions = []
-        all_reasoning = []
-        for p in session.players.values():
-            all_actions.extend([a.get("action", "") for a in p.action_history])
-            all_reasoning.extend(p.reasoning_history)
-        
-        # 构建条件提示文本
-        conditions_text = ""
-        if satisfied_conditions:
-            conditions_text = "\n**已满足的条件**（这些条件表明可能需要规则变异）：\n" + "\n".join(f"- {c}" for c in satisfied_conditions)
-        
-        # 第一步：评估是否需要规则变异
-        evaluation_prompt = f"""
-你是规则怪谈的裁判。请根据以下信息，判断是否需要让规则发生变化。
-
-触发原因：{trigger_reason}{conditions_text}
-场景：{session.scene_name}
-原始规则：{[r.get("text", str(r)) for r in session.rules]}
-隐藏真相：{session.hidden_truth}
-通关条件：{session.win_condition}
-玩家行动记录：{all_actions[-10:] if len(all_actions) > 10 else all_actions}
-玩家推理记录：{all_reasoning[-10:] if len(all_reasoning) > 10 else all_reasoning}
-
-判断标准（根据剧情推进来判断是否需要规则变化）：
-1. **贴合剧情推进**：规则变化应该与当前的剧情发展相匹配，在合适的时机出现
-2. **发现的合理性**：玩家发现的物品、信息或触发的事件应该能够自然地引出规则变化
-3. **增强紧张感**：规则变化应该能够增强游戏的紧张感和悬疑感，让玩家感到不安
-
-**特别注意**：
-- 仅仅发现普通物品（如笔记本、钥匙、工具等）不足以触发规则变化，除非这些物品包含了重要信息
-- 仅仅进入新房间或新区域不足以触发规则变化，除非这个区域有特殊意义
-- 仅仅进行常规探索或观察不足以触发规则变化
-- 规则变化应该让玩家感到"原来如此"或"事情不对劲"，而非"怎么又变了"
-- 规则变化不是必须的，如果当前剧情不需要规则变化，就不要强行变化
-- **规则变化与玩家是否推理出规则的影响无关，玩家没推理出来就没推理出来，不要为了引导玩家而变化规则**
-
-如果规则变化是必要的，请详细说明原因；如果不需要变化，请详细说明为什么当前不需要变化。
-
-请返回JSON格式：
-{{
-  "should_mutate": "是/否",
-  "reason": "详细说明是否需要规则变化的原因，必须具体说明玩家的行动或推理如何与剧情推进相关",
-  "mutation_type": "如果需要变化，说明变化的类型（如：增加新规则/修改现有规则/规则冲突）"
-}}
-
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
-        """
-        
-        try:
-            evaluation_response = await self.llm_client.call(
-                prompt=evaluation_prompt,
-                temperature=0.7,
-                max_tokens=get_default_max_tokens(),
-            )
-            evaluation_data = evaluation_response.parse_json()
-        except Exception as e:
-            logger.error(f"规则变异评估失败: {e}")
-            return {}
-        
-        if evaluation_data.get("should_mutate") != "是":
-            logger.info(f"评估结果：不需要规则变化 - {evaluation_data.get('reason', '')}")
-            return {}
-        
-        logger.info(f"评估结果：需要规则变化 - {evaluation_data.get('reason', '')}")
-        
-        # 第二步：生成变异后的规则
-        mutation_prompt = f"""
-基于以下原始规则和玩家至今的行动记录，模拟'场景意识'对玩家行为的反应，对其中1-2条规则进行细微但令人不安的篡改或增添一条'补充条款'，使其看起来像是早已存在但被忽视了。
-
-触发原因：{trigger_reason}
-变异类型：{evaluation_data.get('mutation_type', '未知')}
-原始规则：{[r.get("text", str(r)) for r in session.rules]}
-玩家行动记录：{all_actions[-5:] if len(all_actions) > 5 else all_actions}
-玩家推理记录：{all_reasoning[-5:] if len(all_reasoning) > 5 else all_reasoning}
-
-要求：
-1. 对1-2条规则进行细微的篡改或补充
-2. 篡改应该令人不安，暗示规则本身是有意识的、会学习的
-3. 篡改后的规则应该看起来像是原本就存在，只是之前被玩家忽视了
-4. **规则变化方式**：
-   - 可以让新规则与原本的旧规则冲突（如：原本说"禁止进入404室"，现在改为"必须进入404室"）
-   - 可以更改条件（如：原本"禁止在22:00-06:00期间离开房间"，现在改为"禁止在24:00-08:00期间离开房间"）
-   - 可以增加新的限制或放宽限制
-   - 要贴合剧情推进，让玩家感到规则在根据他们的行为调整
-5. **新规则必须简洁、直接，每条规则严格控制在30-50字之间**
-6. **只说明禁止、允许或要求做的行为，不解释原因**
-7. **使用标准格式：禁止XX / 当XX时，必须XX / 只有XX时才能XX / 必须XX / 严禁XX**
-8. **严禁在规则中包含"如果"、"鉴于"、"因为"、"所以"等解释性词语**
-9. **严禁在规则中包含多个句子或分号，每条规则只能是一个简单句**
-10. **严禁在规则中添加背景故事或额外说明**
-11. 返回格式：{{"mutated_rules": ["新规则文本"], "hint": "一句暗示规则已变的低语（如：墙上的文字似乎更潦草了）"}}
-
-请仅返回JSON，不要包含任何其他文字。**重要：不要使用任何emoji表情符号。**
-        """
-        
-        try:
-            mutation_response = await self.llm_client.call(
-                prompt=mutation_prompt,
-                temperature=0.8,
-                max_tokens=get_default_max_tokens(),
-            )
-            mutation_data = mutation_response.parse_json()
-            
-            mutated_rules = mutation_data.get("mutated_rules", [])
-            hint = mutation_data.get("hint", "")
-
-            if mutated_rules:
-                # 旧规则深拷贝写入规则历史，保留完整结构化字段（rule_type/related_npc/hidden_meaning/version 等）
-                old_rules_dicts = [Rule.from_dict(rule, idx).to_dict() for idx, rule in enumerate(session.rules)]
-                session.rule_history.append({
-                    "time": datetime.now().isoformat(),
-                    "reason": trigger_reason,
-                    "rules": copy.deepcopy(old_rules_dicts),
-                })
-
-                old_rules = [r.get("text", str(r)) for r in session.rules]
-
-                # 变异只更新 text 字段，保留 rule_type/related_npc/hidden_meaning 等所有结构化字段
-                # LLM 可能返回完整规则列表或仅返回被变异的规则，通过文本相似度匹配旧规则以保留结构化信息
-                new_rules_list: list[JsonObject] = []
-                used_old_indices: set[int] = set()
-
-                for mutated_text in mutated_rules:
-                    mutated_text = str(mutated_text).strip()
-                    if not mutated_text:
-                        continue
-
-                    # 在未匹配的旧规则中寻找最相似的一条
-                    best_idx = -1
-                    best_ratio = 0.0
-                    for idx, old_rule_dict in enumerate(old_rules_dicts):
-                        if idx in used_old_indices:
-                            continue
-                        old_text = str(old_rule_dict.get("text", ""))
-                        ratio = difflib.SequenceMatcher(None, old_text, mutated_text).ratio()
-                        if ratio > best_ratio:
-                            best_ratio = ratio
-                            best_idx = idx
-
-                    # 相似度 >= 0.3 视为对旧规则的变异；否则视为新增"补充条款"规则
-                    if best_idx >= 0 and best_ratio >= 0.3:
-                        used_old_indices.add(best_idx)
-                        old_rule = old_rules_dicts[best_idx]
-                        # 浅拷贝即可：规则字典内均为基本类型值，保留全部结构化字段
-                        new_rule = dict(old_rule)
-                        # 仅更新文本相关字段
-                        new_rule["text"] = mutated_text
-                        new_rule["surface_text"] = mutated_text
-                        new_rule["constraint"] = mutated_text
-                        # version 递增：旧规则无 version（0）则新版本从 1 开始
-                        old_version = old_rule.get("version", 0)
-                        if isinstance(old_version, (int, float)) and not isinstance(old_version, bool):
-                            new_rule["version"] = int(old_version) + 1
-                        else:
-                            new_rule["version"] = 1
-                        new_rules_list.append(new_rule)
-                    else:
-                        # 新增"补充条款"规则：结构化字段初始化，version 从 1 开始
-                        new_rules_list.append({
-                            "rule_id": f"rule_mutated_{len(new_rules_list)}",
-                            "surface_text": mutated_text,
-                            "text": mutated_text,
-                            "constraint": mutated_text,
-                            "source": "mutation",
-                            "source_type": "mutation",
-                            "truth_status": "mutated",
-                            "version": 1,
-                        })
-
-                # 统一通过 Rule 归一化，确保结构化字段完整
-                session.rules = [Rule.from_dict(rule, idx).to_dict() for idx, rule in enumerate(new_rules_list)]
-
-                # 记录变异
-                session.add_rule_mutation(
-                    old_rule=str(old_rules),
-                    new_rule=str(mutated_rules),
-                    reason=trigger_reason,
-                )
-
-                logger.info(f"规则变异成功: {old_rules} -> {mutated_rules}")
-
-                return {
-                    "hint": hint,
-                    "old_rules": old_rules,
-                    "new_rules": mutated_rules,
-                }
-            
-        except Exception as e:
-            logger.error(f"规则变异生成失败: {e}")
-
-        return {}
+        return await self._rule_mutation.trigger_rule_mutation(
+            session, player, trigger_reason, satisfied_conditions, satisfied_condition_objects
+        )
 
     def _describe_apparent_state(self, player: Player) -> str:
         """根据 injury/state/emotion 生成玩家外表状态描述。"""
@@ -1338,7 +813,19 @@ class ActionProcessor:
             )
 
         audible_npcs: list[JsonObject] = []
-        for npc in get_audible_npcs(room_graph, npcs_list, player.location, hearing_radius=hearing_radius):
+        # 与 audible_events/audible_players 保持一致：传入 session/hearing_radius/
+        # door_state/sound_intensity/wall_material 四参数，由 get_audible_npcs 在
+        # 参数为 None 时逐 NPC 解析门状态/声源强度/墙材质，避免三入口结果不一致
+        for npc in get_audible_npcs(
+            room_graph,
+            npcs_list,
+            player.location,
+            hearing_radius=hearing_radius,
+            session=session,
+            door_state=None,
+            sound_intensity=None,
+            wall_material=None,
+        ):
             audible_npcs.append(
                 {
                     "name": npc.get("name", ""),
@@ -1358,8 +845,8 @@ class ActionProcessor:
                 if not (room_name and event_text):
                     continue
                 # 补全门状态/声源强度/墙材质，使四步修正生效
-                door_state = self._get_door_state_between(session, player.location, room_name)
-                sound_intensity = _infer_sound_intensity(event_text)
+                door_state = get_door_state_between(session, player.location, room_name)
+                sound_intensity = infer_sound_intensity(event_text)
                 wall_material = get_wall_material(room_graph, player.location, room_name)
                 if can_hear_between_rooms(
                     room_graph,
@@ -1467,8 +954,8 @@ class ActionProcessor:
                 other_last_action = (
                     other.action_history[-1].get("action", "") if other.action_history else ""
                 )
-                door_state = self._get_door_state_between(session, player.location, other.location)
-                sound_intensity = _infer_sound_intensity(other_last_action)
+                door_state = get_door_state_between(session, player.location, other.location)
+                sound_intensity = infer_sound_intensity(other_last_action)
                 wall_material = get_wall_material(room_graph, player.location, other.location)
                 can_hear = can_hear_between_rooms(
                     room_graph,
@@ -1501,6 +988,18 @@ class ActionProcessor:
                         "heard_cue": self._describe_audible_cue(other),
                         "quality": round(hearing_quality, 2),
                     })
+
+        # Task 3.3：同房间双人协作判定——基于存活玩家位置映射计算协作资格与行动加成
+        players_locations: dict[str, str] = {
+            p.player_id: str(p.location or "").strip()
+            for p in session.players.values()
+            if p.status == PlayerStatus.ALIVE
+        }
+        coop_eligible = is_dual_player_coop_eligible(players_locations, player.location)
+        coop_bonus = (
+            get_coop_action_bonus(players_locations, player.location)
+            if coop_eligible else 0.0
+        )
 
         return {
             "game_mode": session.game_mode,
@@ -1539,10 +1038,118 @@ class ActionProcessor:
                 "atmosphere": env_state.get("atmosphere", ""),
                 "entropy_level": env_state.get("entropy_level", 0),
             },
+            # 追杀状态机上下文（Task 19）：激活时注入追杀者/剩余回合/逃脱条件
+            "hunt_context": self._build_hunt_context(session),
+            # Task 17：上次 NPC 模拟结果（后台异步执行，本次读到的是上次的快照）
+            # 供 _judge_action 在叙事中体现 NPC 上一步行动，增强连贯性
+            "last_npc_sim_result": (
+                session.world_flags.get("last_npc_sim_result")
+                if isinstance(session.world_flags, dict)
+                else None
+            ),
+            # Task 3.3：同房间双人协作上下文（供 _judge_action 注入 prompt 与机械加成）
+            "coop_eligible": coop_eligible,
+            "coop_bonus": coop_bonus,
         }
 
+    def _build_hunt_context(self, session: GameSession) -> JsonObject | None:
+        """构建追杀状态机上下文（Task 19）。
 
+        从 session.hunt_state 读取激活状态/追杀者 npc_id/剩余回合/逃脱条件，
+        并把 npc_id 解析为可读名称，供 _judge_action 注入 prompt。
+        未激活时返回 None。
+        """
+        hunt_state = session.hunt_state
+        if not isinstance(hunt_state, dict) or not hunt_state.get("active"):
+            return None
+        pursuer_npc_id = str(hunt_state.get("pursuer_npc_id", "") or "").strip()
+        pursuer_name = pursuer_npc_id
+        if pursuer_npc_id:
+            pursuer_npc = self._find_runtime_npc(session, pursuer_npc_id)
+            if pursuer_npc is not None:
+                pursuer_name = str(pursuer_npc.get("name", "") or pursuer_npc_id) or pursuer_npc_id
+        # remaining_turns 必须是有效整数，否则视为状态损坏，直接抛错（不兜底）
+        remaining_turns = int(hunt_state.get("remaining_turns", 0))
+        escape_conditions_raw = hunt_state.get("escape_conditions", [])
+        escape_conditions: list[str] = []
+        if isinstance(escape_conditions_raw, list):
+            escape_conditions = [str(c) for c in escape_conditions_raw if isinstance(c, (str, int, float))]
+        return {
+            "pursuer_name": pursuer_name,
+            "pursuer_npc_id": pursuer_npc_id,
+            "remaining_turns": remaining_turns,
+            "escape_conditions": escape_conditions,
+        }
 
+    def _tick_hunt_state(self, player: Player, session: GameSession, result: ActionResult) -> None:
+        """追杀状态机推进（Task 19）：检查逃脱条件、递减剩余回合。
+
+        仅在本次行动前 hunt_state 已激活时由 process_action 调用，
+        避免触发追杀的本次行动被计入逃脱回合。
+        逃脱条件按位置/物品做子串匹配：玩家当前位置或持有物品出现在条件文本中即视为达成。
+        """
+        hunt_state = session.hunt_state
+        if not isinstance(hunt_state, dict) or not hunt_state.get("active"):
+            return
+
+        # 检查逃脱条件：位置匹配或物品匹配
+        escape_conditions = hunt_state.get("escape_conditions", [])
+        if isinstance(escape_conditions, list) and escape_conditions:
+            player_location = str(player.location or "").strip()
+            inventory_names = [
+                str(item.get("name", "") or "").strip()
+                for item in (player.inventory if isinstance(player.inventory, list) else [])
+                if isinstance(item, dict)
+            ]
+            for cond in escape_conditions:
+                cond_text = str(cond or "").strip()
+                if not cond_text:
+                    continue
+                # 位置匹配：玩家当前位置出现在逃脱条件文本中
+                if player_location and player_location in cond_text:
+                    session.hunt_state = {}
+                    logger.info(f"追杀状态机：玩家 {player.name} 达成逃脱条件「{cond_text}」，追杀解除")
+                    return
+                # 物品匹配：玩家持有的某物品名出现在逃脱条件文本中
+                for item_name in inventory_names:
+                    if item_name and item_name in cond_text:
+                        session.hunt_state = {}
+                        logger.info(
+                            f"追杀状态机：玩家 {player.name} 持有「{item_name}」"
+                            f"达成逃脱条件「{cond_text}」，追杀解除"
+                        )
+                        return
+
+        # 递减剩余回合；remaining_turns 非整数视为状态损坏，直接抛错（不兜底）
+        remaining = int(hunt_state.get("remaining_turns", 0))
+        remaining -= 1
+        if remaining <= 0:
+            # 逃脱窗口耗尽，追杀事件结束（逃脱失败或已在叙事中结算）
+            session.hunt_state = {}
+            logger.info(f"追杀状态机：玩家 {player.name} 逃脱窗口耗尽，追杀事件结束")
+        else:
+            hunt_state["remaining_turns"] = remaining
+            logger.info(f"追杀状态机：玩家 {player.name} 剩余逃脱回合 {remaining}")
+
+    # ------------------------------------------------------------------
+    # Task 20：结构化违规条件确定性匹配
+    # ------------------------------------------------------------------
+
+    def _check_structured_violations(
+        self, action: str, player: Player, session: GameSession
+    ) -> list[dict[str, Any]]:
+        """Task 20：基于规则的结构化条件做确定性违规匹配（委托给 ``ViolationConsequenceService``）。"""
+        return self._violation.check_structured_violations(action, player, session)
+
+    @staticmethod
+    def _is_in_time_window(current_hour: float, time_window: str) -> bool:
+        """检查当前小时是否落在时间窗内（委托给 ``ViolationConsequenceService``）。"""
+        return ViolationConsequenceService.is_in_time_window(current_hour, time_window)
+
+    @staticmethod
+    def _check_precondition(player: Player, precondition: str) -> bool:
+        """检查玩家是否满足前置状态（委托给 ``ViolationConsequenceService``）。"""
+        return ViolationConsequenceService.check_precondition(player, precondition)
 
     async def _judge_action(self, action: str, context: Mapping[str, JsonValue]) -> JsonObject:
         """使用LLM判定行动结果（支持理智值动态描述和关键物品系统）"""
@@ -1628,6 +1235,15 @@ class ActionProcessor:
 5. 营造恐怖和不安的氛围
 6. **根据玩家当前理智值（{sanity}/100）调整描述风格**
 7. 不要把后台完整规则当成玩家已经知道的事实；玩家视角只能基于其当前可感知信息、任务、独有信息和规则笔记
+
+**四感分层描写要求（Task 17 合并，必须包含）**：
+description 字段必须自然融入以下四感分层描写（不要出现分节标题或感官标签，全部融合进一段连贯叙事中）：
+- 视觉：基于「当前环境」中的光照状况。黑暗时弱化视觉（"几乎看不见""只能凭借触觉摸索"），明亮时清晰描写物体细节。
+- 听觉：基于「当前环境」中的声音列表，捕捉环境中的声响（滴水声、脚步声、远处的低语）。
+- 嗅觉：基于「当前环境」中的气味列表，描写闻到的气味（腐臭、霉味、血腥味）。
+- 触觉：基于「当前环境」中的温度，描写体感温度与空气触感（阴冷、闷热、潮湿）。
+每感 1-2 句，自然融合进场景描述，不要单独成段或加"视觉：""听觉："等标签。
+理智值越低，感官描写越不可靠——出现幻觉、扭曲的感知、不存在的声音。
 
 **环境状态联动**：
 - 黑暗中的行动应弱化视觉描写、强化听觉/触觉反馈
@@ -1723,6 +1339,71 @@ class ActionProcessor:
                 context["audible_players"], ensure_ascii=False, indent=2
             )
 
+        # 追杀状态机上下文（Task 19）：激活时告知 LLM 玩家正被追杀，影响行动判定
+        hunt_block = ""
+        hunt_context = context.get("hunt_context")
+        if isinstance(hunt_context, dict) and hunt_context:
+            pursuer_name = str(hunt_context.get("pursuer_name", "") or "")
+            remaining = int(hunt_context.get("remaining_turns", 0) or 0)
+            escape_conds = hunt_context.get("escape_conditions", [])
+            if isinstance(escape_conds, list):
+                escape_text = "；".join(str(c) for c in escape_conds if str(c).strip())
+            else:
+                escape_text = ""
+            hunt_block = (
+                f"\n\n**【追杀中】你正在被{pursuer_name}追杀！**\n"
+                f"- 剩余逃脱回合：{remaining}\n"
+                f"- 逃脱条件：{escape_text or '（未指定）'}\n"
+                f"- 判定行动结果时必须考虑追杀者的威胁：逃跑/躲避/达成逃脱条件可能改变结局，"
+                f"原地逗留或无视追杀者将面临受伤甚至死亡风险"
+            )
+
+        # Task 17：上次 NPC 模拟结果（后台异步执行，本次读到的是上次快照）
+        # 让 LLM 在叙事中体现 NPC 上一步行动，增强连贯性
+        last_npc_sim_block = ""
+        last_npc_sim = context.get("last_npc_sim_result")
+        if isinstance(last_npc_sim, dict) and last_npc_sim:
+            npc_updates = last_npc_sim.get("npc_updates", [])
+            room_events = last_npc_sim.get("room_events", [])
+            if (isinstance(npc_updates, list) and npc_updates) or (isinstance(room_events, list) and room_events):
+                last_npc_sim_block = (
+                    "\n\n**上次 NPC 行动回顾（供叙事参考，不要直接复述）**：\n"
+                    f"- 上次行动者：{last_npc_sim.get('acting_player_name', '')}\n"
+                    f"- 上次行动：{last_npc_sim.get('action_text', '')}\n"
+                    f"- NPC 更新：{json.dumps(npc_updates, ensure_ascii=False) if isinstance(npc_updates, list) else '无'}\n"
+                    f"- 房间事件：{json.dumps(room_events, ensure_ascii=False) if isinstance(room_events, list) else '无'}\n"
+                    "请在场景描述中自然体现这些 NPC 动态的余波（如远处的脚步声、隔壁的动静），不要直接罗列。"
+                )
+
+        # Task 20：确定性违规匹配结果（运行时已判定违规事实，LLM 仅负责叙事化后果）
+        deterministic_violation_block = ""
+        det_violations = context.get("deterministic_violations")
+        if isinstance(det_violations, list) and det_violations:
+            violation_lines = "\n".join(
+                f"- 规则：{v.get('surface_text', '')}（条件：{v.get('condition_desc', '')}）"
+                for v in det_violations
+                if isinstance(v, dict)
+            )
+            deterministic_violation_block = (
+                "\n\n**【确定性违规】系统已判定该行动违反以下规则，你不得推翻此判定**：\n"
+                f"{violation_lines}\n"
+                "- 必须在 `violated_rule` 字段填写违反的规则文本\n"
+                "- 必须在 `description` 中叙事化违规后果（恐怖氛围、惩罚细节）\n"
+                "- `sanity_change` 必须为负值（违反规则扣理智）\n"
+                "- 不要试图为玩家开脱或判定未违规"
+            )
+
+        # Task 3.3：同房间双人协作上下文——告知 LLM 队友在场，行动更有效率
+        coop_block = ""
+        coop_bonus_value = context.get("coop_bonus", 0.0)
+        if isinstance(coop_bonus_value, (int, float)) and float(coop_bonus_value) > 0.0:
+            coop_block = (
+                "\n\n**【同房间协作】你的队友也在这个房间，你们的协作让行动更有效率**\n"
+                "- 行动判定时倾向于给予正面结果（更高的成功率、更清晰的感知）\n"
+                "- 同伴在身边带来安抚效果，可适当减少恐惧/焦虑\n"
+                "- 在描述中自然体现队友的存在与协作，但不要让玩家凭空获得未行动的物品"
+            )
+
         # 提取环境状态摘要，供 user_prompt 的「当前环境」区块使用
         environment_summary = context.get("environment_summary", {})
         if not isinstance(environment_summary, dict):
@@ -1774,6 +1455,7 @@ class ActionProcessor:
 
 最近行动：
 {chr(10).join(f"- {a}" for a in context['recent_actions']) if context['recent_actions'] else "无"}
+{hunt_block}{last_npc_sim_block}{deterministic_violation_block}{coop_block}
 
 玩家行动：{action}
 
@@ -1824,49 +1506,8 @@ class ActionProcessor:
         player: Player,
         session: GameSession,
     ) -> None:
-        """为行动结果追加感官描写（嗅觉/听觉/触觉）。
-
-        调用 ImmersiveFeedback.generate_sensory_description 生成多感官叙事，
-        拼接到 result.description 末尾，增强沉浸感。生成失败时由
-        immersive_feedback 内部兜底返回默认文本（尊重其既有错误处理约定），
-        此处不再额外 try/except 掩盖错误。
-        """
-        from ..services.immersive_feedback import ImmersiveFeedback
-
-        # 感官描写聚焦于玩家所在场景；位置缺失时回退到行动文本本身
-        target: str = player.location or action
-
-        # 从 environment_state 抽取感官相关字段，缺失则给空值占位
-        # 字段含义：lighting(光照) / sounds(声音列表) / smells(气味列表) /
-        #           temperature(温度) / atmosphere(氛围)
-        env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
-        environment_state_summary: dict[str, Any] = {
-            "lighting": env_state.get("lighting", ""),
-            "sounds": env_state.get("sounds", []) if isinstance(env_state.get("sounds", []), list) else [],
-            "smells": env_state.get("smells", []) if isinstance(env_state.get("smells", []), list) else [],
-            "temperature": env_state.get("temperature", ""),
-            "atmosphere": env_state.get("atmosphere", ""),
-        }
-
-        game_state: dict[str, Any] = {
-            "scene_name": session.scene_name,
-            "background": session.background,
-            "player_status": {
-                "sanity": player.sanity,
-                "health": player.health,
-                "location": player.location,
-            },
-            # 注入环境状态与理智值，供 generate_sensory_description 做四感分层与幻觉模式判定
-            "environment_state": environment_state_summary,
-            "sanity": player.sanity,
-        }
-
-        feedback_system = ImmersiveFeedback(self.llm_client)
-        sensory = await feedback_system.generate_sensory_description(target, game_state)
-
-        # 仅在生成非空文本时拼接，避免出现末尾空行
-        if sensory and sensory.strip():
-            result.description = f"{result.description}\n\n{sensory.strip()}"
+        """Task 17：感官描写已合并进 _judge_action 的判定 prompt，本方法保留为空实现以兼容外部调用。"""
+        return
 
     def _build_psychological_narrative(self, player: Player, sanity: int | None = None) -> str:
         """根据玩家心理状态阈值构建分段叙事片段（委托给 ``PsychologicalStateService``）。
@@ -1877,69 +1518,6 @@ class ActionProcessor:
         若传入 sanity，则追加理智分档叙事（幻觉/不安/敏锐感知）。
         """
         return self._psych_state.build_psychological_narrative(player, sanity)
-
-    def _get_door_state_between(
-        self,
-        session: GameSession,
-        room_a: str,
-        room_b: str,
-    ) -> DoorState | None:
-        """查询两个房间之间的门状态。
-
-        从 ``session.environment_state.doors`` 查询连接 room_a 与 room_b 的门。
-        支持两种 doors 字段格式：
-        - 列表格式：``[{"rooms": ["A", "B"], "state": "CLOSED"}, ...]``
-        - 字典格式：``{"A-B": "CLOSED", ...}``（旧版 EnvironmentState 序列化格式）
-
-        Args:
-            session: 游戏会话
-            room_a: 房间 A 名称
-            room_b: 房间 B 名称
-
-        Returns:
-            DoorState 枚举值；若无门或字段缺失则返回 None
-        """
-        env_state = session.environment_state if isinstance(session.environment_state, dict) else {}
-        doors = env_state.get("doors", [])
-        if not doors:
-            return None
-
-        ra = str(room_a or "").strip()
-        rb = str(room_b or "").strip()
-        if not ra or not rb or ra == rb:
-            return None
-
-        # 列表格式：[{"rooms": ["A", "B"], "state": "CLOSED"}, ...]
-        if isinstance(doors, list):
-            for door in doors:
-                if not isinstance(door, dict):
-                    continue
-                rooms = door.get("rooms", [])
-                if not isinstance(rooms, list) or len(rooms) < 2:
-                    continue
-                room_set = {str(r).strip() for r in rooms}
-                if ra in room_set and rb in room_set:
-                    state_str = str(door.get("state", "")).strip()
-                    try:
-                        return DoorState(state_str)
-                    except ValueError:
-                        return None
-            return None
-
-        # 字典格式：{"A-B": "CLOSED", ...}（旧版兼容）
-        if isinstance(doors, dict):
-            for door_key, state_str in doors.items():
-                parts = re.split(r"[-|,]", str(door_key))
-                if len(parts) == 2:
-                    p1, p2 = parts[0].strip(), parts[1].strip()
-                    if {p1, p2} == {ra, rb}:
-                        try:
-                            return DoorState(str(state_str))
-                        except ValueError:
-                            return None
-            return None
-
-        return None
 
     def _build_effective_room_graph(
         self,
@@ -1961,7 +1539,7 @@ class ActionProcessor:
                 continue
             filtered = []
             for neighbor in neighbors:
-                door_state = self._get_door_state_between(session, room, neighbor)
+                door_state = get_door_state_between(session, room, neighbor)
                 if door_state == DoorState.LOCKED:
                     continue  # LOCKED 门视为不连通
                 filtered.append(neighbor)
@@ -2031,7 +1609,7 @@ class ActionProcessor:
 
         if is_adjacent_room(effective_graph, current, target) or is_same_room(current, target):
             # 直接相邻：检查门状态以确定后果
-            door_state = self._get_door_state_between(session, current, target)
+            door_state = get_door_state_between(session, current, target)
             if door_state == DoorState.LOCKED:
                 # 理论上 effective_graph 已排除 LOCKED，此处为防御性检查
                 return current, f"门是锁着的，无法从{current}到达{target}。"
@@ -2043,7 +1621,7 @@ class ActionProcessor:
         if len(path) >= 3:
             next_node = path[1]
             # 检查第一段边的门状态以确定后果
-            door_state = self._get_door_state_between(session, current, next_node)
+            door_state = get_door_state_between(session, current, next_node)
             hint = self._build_door_movement_hint(door_state, current, next_node, player)
             if hint:
                 return next_node, f"无法直接到达{target}，你先移动到了{next_node}。\n{hint}"
@@ -2107,7 +1685,28 @@ class ActionProcessor:
         if result.is_fatal or player.health <= 0:
             from ..game.models import PlayerStatus
             player.status = PlayerStatus.DEAD
-    
+
+    @staticmethod
+    def _is_safe_zone(session: GameSession, location: str) -> bool:
+        """判断房间是否为「安全区」（Task 18 理智回复用）。
+
+        以场景结构 ``special_areas`` 作为安全区 designation：这些是场景中
+        显式列出的特殊区域（如存档点/休息室），与 ``violation_consequence``
+        中 ``is_special_location`` 的判定口径一致。
+        """
+        ss = session.scene_structure if isinstance(session.scene_structure, dict) else {}
+        special_areas = ss.get("special_areas", [])
+        if not isinstance(special_areas, list):
+            return False
+        loc = str(location or "").strip()
+        if not loc:
+            return False
+        for area in special_areas:
+            area_name = _normalize_area(area)
+            if area_name and area_name == loc:
+                return True
+        return False
+
     def _infer_new_location(
         self,
         action: str,
@@ -2140,27 +1739,18 @@ class ActionProcessor:
             for key in ("areas", "rooms"):
                 arr = fl.get(key)
                 if isinstance(arr, list):
+                    # 复用 _normalize_area 统一处理字符串/字典两种形态，避免 str(dict) 污染房间名
                     for x in arr:
-                        if isinstance(x, str) and x.strip():
-                            candidates.append(x.strip())
-                        elif isinstance(x, dict):
-                            for name_key in ("name", "title", "location"):
-                                raw_name = x.get(name_key)
-                                if isinstance(raw_name, str) and raw_name.strip():
-                                    candidates.append(raw_name.strip())
-                                    break
+                        name = _normalize_area(x)
+                        if name:
+                            candidates.append(name)
 
         sp = ss.get("special_areas")
         if isinstance(sp, list):
             for x in sp:
-                if isinstance(x, str) and x.strip():
-                    candidates.append(x.strip())
-                elif isinstance(x, dict):
-                    for name_key in ("name", "title", "location"):
-                        raw_name = x.get(name_key)
-                        if isinstance(raw_name, str) and raw_name.strip():
-                            candidates.append(raw_name.strip())
-                            break
+                name = _normalize_area(x)
+                if name:
+                    candidates.append(name)
 
         # 去重并按长度降序（优先长匹配）
         uniq = sorted({c for c in candidates if c}, key=len, reverse=True)
@@ -2242,38 +1832,10 @@ class ActionProcessor:
         action: str,
         group_id: str = "",
     ) -> None:
-        """统一处理违规后果
-
-        根据规则类型和剧情上下文，调用不同的处理系统：
-        - 区域违规：调用 EnvironmentEvolutionSystem
-        - 一般违规：调用 ImmersiveFeedback
-        - 同时更新NPC态度
-        """
-        logger.info(f"处理违规后果: 玩家={player.name}, 规则={violated_rule}")
-
-        try:
-            # 1. 收集违规上下文
-            violation_context = self._build_violation_context(
-                player, session, violated_rule, action
-            )
-
-            await self._handle_general_violation(player, session, violation_context, group_id)
-
-            await self._update_npc_attitudes(player, session, violation_context)
-
-            await self._check_hunt_trigger(player, session, violation_context)
-
-            rule_info = violation_context.get("rule_info")
-            if isinstance(rule_info, dict) and rule_info.get("rule_type") == "double_edged":
-                await self._handle_double_edged_violation(
-                    player, session, violation_context["rule_text"]
-                )
-
-            logger.info(f"违规后果处理完成: {player.name}")
-
-        except Exception as e:
-            logger.error(f"处理违规后果时出错: {e}", exc_info=True)
-            # 错误不应影响主流程
+        """统一处理违规后果（委托给 ``ViolationConsequenceService``）。"""
+        await self._violation.handle_violation_consequences(
+            player, session, violated_rule, action, group_id
+        )
 
     def _build_violation_context(
         self,
@@ -2282,41 +1844,10 @@ class ActionProcessor:
         violated_rule: str,
         action: str
     ) -> dict[str, Any]:
-        """构建违规上下文"""
-        # 获取规则信息
-        rule_info = None
-        for rule in session.rules:
-            if isinstance(rule, dict) and rule.get("text") == violated_rule:
-                rule_info = rule
-                break
-
-        # 计算近期违规次数
-        recent_violations = 0
-        for act in player.action_history[-10:]:
-            if isinstance(act, dict) and act.get("violated_rule"):
-                recent_violations += 1
-
-        # 判断是否为特殊位置
-        is_special = False
-        scene_structure = session.scene_structure or {}
-        special_areas = scene_structure.get("special_areas", []) if isinstance(scene_structure, dict) else []
-        if isinstance(special_areas, list):
-            for area in special_areas:
-                if isinstance(area, str) and area in player.location:
-                    is_special = True
-                    break
-
-        return {
-            "rule_text": violated_rule,
-            "rule_info": rule_info,
-            "action_description": action,
-            "player_health": player.health,
-            "player_sanity": player.sanity,
-            "player_location": player.location,
-            "recent_violations": recent_violations,
-            "is_special_location": is_special,
-            "scene_name": session.scene_name,
-        }
+        """构建违规上下文（委托给 ``ViolationConsequenceService``）。"""
+        return self._violation.build_violation_context(
+            player, session, violated_rule, action
+        )
 
     async def _handle_general_violation(
         self,
@@ -2325,52 +1856,10 @@ class ActionProcessor:
         violation_context: dict[str, Any],
         group_id: str = "",
     ) -> None:
-        """处理一般违规 - 调用 ImmersiveFeedback"""
-        try:
-            from ..services.immersive_feedback import ImmersiveFeedback, FeedbackType
-
-            feedback_system = ImmersiveFeedback(self.llm_client)
-
-            # 构建action和game_state
-            action = {
-                "action_type": "violation",
-                "target": player.location,
-                "description": violation_context["action_description"],
-                "violates_rule": True,
-                "violated_rule": violation_context["rule_text"],
-                "risk_level": 0.8,
-            }
-
-            game_state = {
-                "scene_name": session.scene_name,
-                "background": session.background,
-                "player_status": {
-                    "sanity": player.sanity,
-                    "health": player.health,
-                    "location": player.location,
-                }
-            }
-
-            # 生成即时反馈
-            response = await feedback_system.respond(action, game_state)
-
-            # 如果有延迟反馈，安排延迟发送
-            if response.feedback_type == FeedbackType.DELAYED and response.delay_seconds > 0:
-                import asyncio
-                asyncio.create_task(
-                    self._schedule_delayed_feedback(
-                        player, session, action, game_state, response.delay_seconds, group_id
-                    )
-                )
-
-            # 应用状态更新
-            if response.should_update_state and response.state_updates:
-                self._apply_feedback_state_updates(player, response.state_updates)
-
-            logger.info(f"一般违规反馈生成成功: {player.name}, 类型={response.feedback_type.value}")
-
-        except Exception as e:
-            logger.error(f"一般违规处理失败: {e}")
+        """处理一般违规（委托给 ``ViolationConsequenceService``）。"""
+        await self._violation.handle_general_violation(
+            player, session, violation_context, group_id
+        )
 
     async def _schedule_delayed_feedback(
         self,
@@ -2381,66 +1870,13 @@ class ActionProcessor:
         delay_seconds: int,
         group_id: str,
     ) -> None:
-        """安排延迟反馈 - 写入 session.pending_feedbacks 队列，由 process_action 在到期时触发。
+        """安排延迟反馈（委托给 ``ViolationConsequenceService``）。
 
-        延迟为 0 时立即生成并应用反馈（保留原即时触发语义）；
-        否则按"当前 elapsed_minutes + 延迟分钟数"计算触发时间点，
-        将反馈内容与目标玩家写入队列，等待后续行动检查时追加到结果。
+        Task 8：不匹配 target_player_id 的到期反馈保留在队列，不被丢弃。
         """
-        try:
-            from ..services.immersive_feedback import ImmersiveFeedback
-
-            # 构造当前玩家状态快照，用于生成延迟反馈内容
-            current_state = {
-                "scene_name": session.scene_name,
-                "background": session.background,
-                "player_status": {
-                    "sanity": player.sanity,
-                    "health": player.health,
-                    "location": player.location,
-                }
-            }
-
-            feedback_system = ImmersiveFeedback(self.llm_client)
-            delayed_response = await feedback_system.generate_delayed_feedback(
-                action, current_state
-            )
-
-            # 应用即时状态更新（若有）
-            if delayed_response.should_update_state and delayed_response.state_updates:
-                self._apply_feedback_state_updates(player, delayed_response.state_updates)
-
-            content = delayed_response.content.strip()
-
-            # 立即触发（延迟为 0）：直接发送消息并保存会话，保留原即时语义
-            if delay_seconds <= 0:
-                if self._message_sender and content:
-                    await self._message_sender(f"**异样回响**\n\n{content}")
-                if self._session_saver and group_id:
-                    await self._session_saver(group_id, session)
-                logger.info(f"延迟反馈已生成（立即触发）: {player.name}")
-                return
-
-            # 计算触发时间点：当前 elapsed_minutes + 延迟分钟数
-            time_manager = session.time_manager if isinstance(session.time_manager, dict) else {}
-            current_elapsed = int(time_manager.get("elapsed_minutes", 0) or 0)
-            trigger_at_elapsed = current_elapsed + delay_seconds / 60
-
-            # 写入待触发队列，由 process_action 在到期时追加到行动结果
-            session.pending_feedbacks.append({
-                "trigger_at_elapsed": trigger_at_elapsed,
-                "content": content,
-                "target_player_id": player.player_id,
-            })
-
-            # 保存会话以持久化队列与状态更新
-            if self._session_saver and group_id:
-                await self._session_saver(group_id, session)
-
-            logger.info(f"延迟反馈已入队: {player.name}, 触发时间={trigger_at_elapsed}分钟")
-
-        except Exception as e:
-            logger.error(f"延迟反馈生成失败: {e}")
+        await self._violation.schedule_delayed_feedback(
+            player, session, action, game_state, delay_seconds, group_id
+        )
 
     async def _update_npc_attitudes(
         self,
@@ -2448,43 +1884,8 @@ class ActionProcessor:
         session: GameSession,
         violation_context: dict[str, Any]
     ) -> None:
-        """更新NPC态度 - 利用 npc_system.py"""
-        rule_info = violation_context.get("rule_info")
-        if not isinstance(rule_info, dict):
-            return
-
-        related_npc_name = rule_info.get("related_npc")
-        opposing_npc_name = rule_info.get("opposing_npc")
-
-        if not related_npc_name:
-            return
-
-        try:
-            npc_entry, memory = self._get_runtime_npc_memory(session, related_npc_name)
-            if npc_entry is None or memory is None:
-                return
-            memory.update_attitude_vector(
-                player.player_id,
-                hostility_delta=20,
-                trust_delta=-15
-            )
-            npc_entry["memory"] = memory.to_dict()
-            logger.debug(f"NPC {related_npc_name} 对玩家 {player.name} 态度恶化")
-
-            # 更新对抗NPC态度（变好）
-            if opposing_npc_name:
-                opp_entry, opp_memory = self._get_runtime_npc_memory(session, opposing_npc_name)
-                if opp_entry is None or opp_memory is None:
-                    return
-                opp_memory.update_attitude_vector(
-                    player.player_id,
-                    affection_delta=10
-                )
-                opp_entry["memory"] = opp_memory.to_dict()
-                logger.debug(f"NPC {opposing_npc_name} 对玩家 {player.name} 态度改善")
-
-        except Exception as e:
-            logger.error(f"更新NPC态度失败: {e}")
+        """更新 NPC 态度（委托给 ``ViolationConsequenceService``）。"""
+        await self._violation.update_npc_attitudes(player, session, violation_context)
 
     async def _check_hunt_trigger(
         self,
@@ -2492,33 +1893,11 @@ class ActionProcessor:
         session: GameSession,
         violation_context: dict[str, Any]
     ) -> None:
-        """检查是否触发追杀事件（简单事件触发机制）"""
-        rule_info = violation_context.get("rule_info")
-        if not isinstance(rule_info, dict):
-            return
+        """检查是否触发追杀事件（委托给 ``ViolationConsequenceService``）。
 
-        related_npc = rule_info.get("related_npc")
-        if not related_npc or not isinstance(related_npc, str):
-            return
-
-        # 检查NPC敌意度
-        _npc_entry, memory = self._get_runtime_npc_memory(session, related_npc)
-        if memory is None:
-            return
-
-        attitude_vector = memory.get_attitude_vector(player.player_id)
-        hostility = attitude_vector.get("hostility", 0)
-
-        # 敌意度>70时，概率触发追杀
-        if hostility > 70:
-            is_special = violation_context.get("is_special_location", False)
-            base_chance = 0.3 if is_special else 0.15
-            recent_violations = violation_context.get("recent_violations", 0)
-            chance = min(0.8, base_chance + (recent_violations * 0.1))
-
-            import random
-            if random.random() < chance:
-                await self._trigger_hunt_event(player, session, related_npc)
+        Task 19：触发追杀时写入 hunt_state 状态机。
+        """
+        await self._violation.check_hunt_trigger(player, session, violation_context)
 
     async def _trigger_hunt_event(
         self,
@@ -2526,62 +1905,11 @@ class ActionProcessor:
         session: GameSession,
         npc_name: str
     ) -> None:
-        """触发追杀事件 - 通过LLM生成场景"""
-        try:
-            hunt_prompt = f"""玩家 {player.name} 在 {player.location} 被 {npc_name} 追杀。
+        """触发追杀事件（委托给 ``ViolationConsequenceService``）。
 
-场景：{session.scene_name}
-玩家状态：体力{player.health}/100，理智{player.sanity}/100
-
-请生成追杀场景描述，要求：
-1. 描述NPC如何出现并追杀玩家
-2. 给玩家逃脱或反抗的选择
-3. 根据玩家状态调整难度（虚弱玩家更难逃脱）
-
-返回JSON：
-{{
-    "scene_description": "追杀场景描述",
-    "npc_action": "NPC的追杀行动",
-    "player_options": ["选项1", "选项2", "选项3"],
-    "escape_difficulty": "逃脱难度描述"
-}}"""
-
-            response = await self.llm_client.call(
-                prompt=hunt_prompt,
-                temperature=0.9,
-                max_tokens=get_default_max_tokens(),
-            )
-
-            result = response.parse_json()
-            logger.info(f"追杀事件已生成: {player.name} 被 {npc_name} 追杀")
-
-            # 推送追杀场景给玩家
-            if self._message_sender is None:
-                logger.warning("未配置 message_sender，追杀场景未推送给玩家")
-            else:
-                scene_description = result.get("scene_description", "")
-                npc_action = result.get("npc_action", "")
-                player_options = result.get("player_options") or []
-
-                lines = [f"【追杀事件】{npc_name} 正在追杀你！"]
-                if scene_description:
-                    lines.append(f"\n场景：{scene_description}")
-                if npc_action:
-                    lines.append(f"\n追杀行动：{npc_action}")
-                if player_options:
-                    options_text = "\n".join(
-                        f"  {i + 1}. {opt}" for i, opt in enumerate(player_options)
-                    )
-                    lines.append(f"\n可选行动：\n{options_text}")
-                message = "\n".join(lines)
-
-                try:
-                    await self._message_sender(message)
-                except Exception as send_err:
-                    logger.error(f"推送追杀场景给玩家失败: {send_err}")
-
-        except Exception as e:
-            logger.error(f"生成追杀事件失败: {e}")
+        Task 19：通过 LLM 生成追杀场景并写入 hunt_state。
+        """
+        await self._violation.trigger_hunt_event(player, session, npc_name)
 
     async def _handle_double_edged_violation(
         self,
@@ -2589,78 +1917,10 @@ class ActionProcessor:
         session: GameSession,
         violated_rule: str
     ) -> dict[str, Any] | None:
-        """处理双刃剑规则违规 - 风险与收益并存
-
-        Returns:
-            包含收益信息的字典，如果处理失败返回None
-        """
-        try:
-            de_prompt = f"""玩家触发了双刃剑规则。
-
-规则：{violated_rule}
-场景：{session.scene_name}
-隐藏真相：{session.hidden_truth}
-玩家状态：体力{player.health}，理智{player.sanity}
-
-请生成双刃剑后果，要求：
-1. 必须有明确的惩罚（风险）
-2. 必须有明确的收益（可能是线索、NPC帮助、关键物品等）
-3. 收益必须与剧情真相相关
-4. 根据玩家当前状态调整风险-收益平衡
-
-返回JSON：
-{{
-    "risk_description": "风险/惩罚描述",
-    "risk_effects": {{"sanity": -10, "health": -5}},
-    "reward_description": "收益描述",
-    "reward_type": "线索/NPC帮助/物品/信息",
-    "reward_content": "具体收益内容",
-    "story_impact": "对剧情的影响"
-}}"""
-
-            response = await self.llm_client.call(
-                prompt=de_prompt,
-                temperature=0.85,
-                max_tokens=get_default_max_tokens(),
-            )
-
-            result = response.parse_json()
-
-            # 应用惩罚
-            risk_effects = result.get("risk_effects", {})
-            sanity_delta = risk_effects.get("sanity", 0)
-            health_delta = risk_effects.get("health", 0)
-
-            if isinstance(sanity_delta, int):
-                player.sanity = max(SanityThresholds.MIN, min(SanityThresholds.MAX, player.sanity + sanity_delta))
-            if isinstance(health_delta, int):
-                player.health = max(HealthThresholds.MIN, min(HealthThresholds.MAX, player.health + health_delta))
-
-            # 给予收益
-            reward_type = result.get("reward_type", "")
-            reward_content = result.get("reward_content", "")
-
-            if "线索" in reward_type and reward_content:
-                # 添加线索到玩家背包
-                player.inventory.append({
-                    "type": "clue",
-                    "name": "关键线索",
-                    "description": reward_content,
-                })
-            elif "物品" in reward_type and reward_content:
-                # 添加物品
-                player.inventory.append({
-                    "type": "item",
-                    "name": reward_content,
-                    "description": "双刃剑规则获得的物品",
-                })
-
-            logger.info(f"双刃剑规则处理完成: {player.name}, 收益={reward_type}")
-            return result
-
-        except Exception as e:
-            logger.error(f"处理双刃剑规则失败: {e}")
-            return None
+        """处理双刃剑规则违规（委托给 ``ViolationConsequenceService``）。"""
+        return await self._violation.handle_double_edged_violation(
+            player, session, violated_rule
+        )
 
     def _update_mental_state(self, player: Player, result_data: JsonObject) -> None:
         """更新玩家的情绪、心理状态和受伤情况（从LLM响应中解析）
