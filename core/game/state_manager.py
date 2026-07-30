@@ -133,8 +133,12 @@ class GameState:
     async def _npc_tick_loop(self, factories: RuntimeFactories) -> None:
         """NPC tick 循环：每 60 秒持世界锁推进 NPC，把事件发布到 event_bus。
 
-        每次 tick 同时推进游戏内时间（tick 一次 = 游戏内 15 分钟），
-        并在 NPC 推进后调用 EnvironmentEvolutionSystem.evolve() 让环境随之演化。
+        每次 tick 按"最长无行动时长"折算游戏内补时（Task 10 修复）：
+        - 玩家活跃（无行动时长 < 阈值）→ 补时 0，仅推进 NPC 模拟
+        - 玩家空闲（无行动时长 ≥ 阈值）→ 按比例折算补时，封顶 max_minutes_per_tick
+        - last_action_real_time 缺失 → 抛 RuntimeError，由循环异常处理器记录
+
+        NPC 推进后调用 EnvironmentEvolutionSystem.evolve() 让环境随之演化。
 
         Args:
             factories: 运行时工厂集合，用于获取 NPC 模拟器与事件总线
@@ -151,9 +155,10 @@ class GameState:
                     if self.session is None:
                         continue
 
-                    # tick 一次推进游戏内 15 分钟，让 NPC 作息与环境演化都能基于新时间
-                    if isinstance(self.session.time_manager, dict):
-                        elapsed_minutes = int(self.session.time_manager.get("elapsed_minutes", 0) or 0) + 15
+                    # 按玩家无行动时长折算游戏内补时（替代原固定 +15 分钟）
+                    added_minutes = self._compute_idle_scaled_minutes()
+                    if added_minutes > 0 and isinstance(self.session.time_manager, dict):
+                        elapsed_minutes = int(self.session.time_manager.get("elapsed_minutes", 0) or 0) + added_minutes
                         self.session.time_manager["elapsed_minutes"] = elapsed_minutes
 
                     npc_simulator = factories.get_or_create_npc_simulator()
@@ -182,6 +187,44 @@ class GameState:
                 break
             except Exception as exc:
                 logger.error("NPC tick 失败: %s", exc, exc_info=True)
+
+    def _compute_idle_scaled_minutes(self) -> int:
+        """按"最长无行动时长"折算本 tick 应补的游戏内分钟数（Task 10）。
+
+        公式：
+        - idle < threshold_seconds → 0（玩家活跃，不补时）
+        - idle ≥ threshold_seconds → min(idle_minutes * scale_factor, max_minutes_per_tick)
+
+        last_action_real_time 为 None 时抛 RuntimeError（不兜底为"now"，
+        符合 AGENTS.md "不兜底"规范；由 _npc_tick_loop 的异常处理器捕获记录）。
+
+        Returns:
+            本 tick 应追加的游戏内分钟数（≥ 0）
+        """
+        if self.session is None:
+            return 0
+
+        last_action_real_time = self.session.last_action_real_time
+        if last_action_real_time is None:
+            raise RuntimeError(
+                f"session.last_action_real_time 未设置 (group_id={self.group_id})，"
+                "无法计算无行动时长；请确认行动处理路径已写入该字段"
+            )
+
+        from ..config import get_config
+        npc_sim_cfg = get_config().npc_sim
+        threshold_seconds = npc_sim_cfg.tick_idle_threshold_seconds
+        scale_factor = npc_sim_cfg.tick_idle_scale_factor
+        max_minutes = npc_sim_cfg.tick_max_minutes_per_tick
+
+        idle_seconds = (datetime.now() - last_action_real_time).total_seconds()
+        if idle_seconds < threshold_seconds:
+            return 0
+
+        # 按比例折算：每现实分钟 × scale_factor = 游戏内分钟，封顶 max_minutes
+        idle_minutes = idle_seconds / 60.0
+        scaled = int(idle_minutes * scale_factor)
+        return max(0, min(scaled, max_minutes))
 
 
 class GameStateManager:

@@ -112,13 +112,19 @@ class NPCSimConfig(ModelSectionConfig):
     trigger_on_every_action: bool = Field(default=True, description="是否在每次有效行动后触发 NPC 模拟")
     room_hearing_radius: int = Field(default=1, ge=0, le=3, description="房间级听觉传播半径")
     max_event_history: int = Field(default=20, ge=5, le=100, description="保留的事件历史数量")
+    # NPC tick 补时配置（Task 10）：仅在玩家长时间无行动时按无行动时长折算补时
+    tick_idle_threshold_seconds: int = Field(default=60, ge=0, description="玩家无行动时长阈值(秒)，低于此值 NPC tick 不补游戏内时间")
+    tick_idle_scale_factor: float = Field(default=1.0, ge=0.0, description="无行动时长折算倍率（每现实分钟×倍率=游戏内分钟）")
+    tick_max_minutes_per_tick: int = Field(default=15, ge=0, le=60, description="单次 NPC tick 最多补时的游戏内分钟数")
+    # NPC INTERACT 冷却（Task 11）：防止 NPC 被同房间玩家粘住，冷却期内不再强制互动
+    npc_interact_cooldown_seconds: int = Field(default=180, ge=0, description="NPC INTERACT 冷却时长(秒)，冷却期内即使玩家在同房间也不会触发互动")
 
 
 class PluginConfig(BaseModel):
     """插件基础配置。"""
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.4.0", description="配置文件版本")
+    config_version: str = Field(default="2.7.0", description="配置文件版本")
     auto_save_interval: int = Field(default=30, ge=10, le=300, description="自动保存间隔(秒)")
     font_path: str = Field(default="", description="图片渲染使用的字体文件路径（留空自动选择）")
 

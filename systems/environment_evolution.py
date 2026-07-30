@@ -3,9 +3,11 @@
 环境状态 dict schema：
 {
     "lighting": str,              # 光照描述
-    "sounds": list[str],          # 声音列表
+    "sounds": list[str],          # 声音列表（时段基底音 + 场景专属音叠加）
+    "scene_sounds": list[str],   # 场景专属音快照（开局 LLM 生成，演化时保留）
     "smells": list[str],          # 气味列表
-    "temperature": float,         # 温度（摄氏度）
+    "temperature": float,         # 温度（摄氏度），向时段目标温度收敛
+    "base_temperature": float,    # 场景初始温度，作为时段目标温度的基准
     "atmosphere": str,            # 氛围描述
     "entropy_level": int,         # 混乱度
     "doors": list[dict],          # 门列表 [{"rooms": [A, B], "state": DoorState}]
@@ -54,43 +56,54 @@ class LightState(Enum):
 class EnvironmentEvolutionSystem:
     """生成并保存开局环境信息，并让环境随时间/理智值/事件演化。"""
 
-    # 时段预设规则表：避免每次行动都调 LLM，直接按 elapsed_minutes 分段覆盖
+    # 时段预设规则表：避免每次行动都调 LLM，直接按 elapsed_minutes 分段叠加
+    # 时段划分：
     # - opening:    < MIDNIGHT(60)                    开场氛围
     # - midnight:   MIDNIGHT(60) <= t < DAWN(180)     深夜，灯光变暗、声音减少
     # - deep_night: DAWN(180) <= t < EARLY_MORNING(300)  午夜，氛围更压抑
     # - pre_dawn:   >= EARLY_MORNING(300)             黎明前，极度压抑
+    # 字段语义：
+    # - lighting/atmosphere: 时段层直接覆盖
+    # - sounds: 仅作为基底层，与场景专属音（scene_sounds）叠加，不整体替换
+    # - target_temperature: 该时段的目标温度（以 22℃ 室内基准计算），运行时按场景
+    #   初始温度 base_temperature 平移：实际 target = base + (target_temperature - 22)
+    # - scene_sound_distortion: 时段对场景专属音的扭曲前缀，越深夜扭曲越强
     TIME_PHASE_RULES: dict[str, dict[str, object]] = {
         "opening": {
             "lighting": "灯光正常，白炽灯管稳定亮着",
             "sounds": ["远处的键盘敲击声", "通风管的低频嗡鸣"],
             "atmosphere": "一切看起来正常，但有种说不清的违和感",
-            "temperature_delta": 0,
+            "target_temperature": 22.0,
             "smells": ["淡淡的消毒水味"],
             "light_flicker_chance": 0.0,
+            "scene_sound_distortion": "",
         },
         "midnight": {
             "lighting": "灯光开始闪烁，偶尔熄灭几秒",
             "sounds": ["不存在的脚步声", "远处门轴的吱呀声"],
             "atmosphere": "空气变得沉重，温度似乎下降了几度",
-            "temperature_delta": -3,
+            "target_temperature": 19.0,
             "smells": ["霉味"],
             "light_flicker_chance": 0.1,
+            "scene_sound_distortion": "远处传来的",
         },
         "deep_night": {
             "lighting": "灯光大部分时间熄灭，只剩应急灯的微弱红光",
             "sounds": ["墙壁深处的抓挠声", "自己心跳的回响"],
             "atmosphere": "黑暗像有实体，压在皮肤上",
-            "temperature_delta": -5,
+            "target_temperature": 17.0,
             "smells": ["铁锈味"],
             "light_flicker_chance": 0.3,
+            "scene_sound_distortion": "隐约的",
         },
         "pre_dawn": {
             "lighting": "黑暗中开始出现不自然的微光",
             "sounds": ["所有声音都消失了，只剩耳鸣", "似乎有人在耳边低语"],
             "atmosphere": "现实感开始瓦解，时间变得粘稠",
-            "temperature_delta": -4,
+            "target_temperature": 18.0,
             "smells": ["潮湿气息"],
             "light_flicker_chance": 0.2,
+            "scene_sound_distortion": "扭曲的",
         },
     }
 
@@ -225,6 +238,8 @@ class EnvironmentEvolutionSystem:
             defaults = self._default_environment_state()
             for field, value in defaults.items():
                 result.setdefault(field, value)
+            # 把 LLM 生成的初始温度固化为场景基准温度，供时段目标温度计算使用
+            result["base_temperature"] = result["temperature"]
             return result
         except Exception as exc:
             logger.error("[环境演化] 使用LLM生成环境失败: %s", exc)
@@ -283,22 +298,52 @@ class EnvironmentEvolutionSystem:
         return "pre_dawn"
 
     def _apply_time_phase(self, env_state: dict[str, object], phase_key: str) -> None:
-        """按时段预设表覆盖 lighting/sounds/atmosphere 字段，并演化 temperature/smells/lights。"""
+        """按时段预设表演化 lighting/atmosphere/sounds/temperature/smells/lights。
+
+        与旧版的区别：
+        - sounds 不再整体替换为时段基底音，而是以时段基底音 + 场景专属音叠加，
+          场景专属音按时段扭曲前缀降权保留。
+        - temperature 不再每次累加 delta，而是向时段目标温度收敛。
+        """
         rules = self.TIME_PHASE_RULES.get(phase_key)
         if not rules:
             return
         env_state["lighting"] = rules["lighting"]
-        # sounds 整体替换为该时段的环境音；幻觉元素由 _apply_sanity_effects 追加
-        # 拷贝列表，避免后续 append 污染类级预设表
-        phase_sounds = rules["sounds"]
-        env_state["sounds"] = list(phase_sounds) if isinstance(phase_sounds, list) else []
         env_state["atmosphere"] = rules["atmosphere"]
 
-        # 温度演化：累加时段温差（字段缺失或类型不符时初始化为常温 22℃）
-        current_temp = env_state.get("temperature")
-        if not isinstance(current_temp, (int, float)):
-            current_temp = 22.0
-        env_state["temperature"] = current_temp + rules["temperature_delta"]
+        # 场景专属音保留：开局 LLM 生成的 sounds 在首次演化时快照到 scene_sounds
+        # 后续演化以 scene_sounds 为场景层、TIME_PHASE_RULES.sounds 为时段基底叠加
+        # 幻觉元素由 _apply_sanity_effects 追加
+        if "scene_sounds" not in env_state:
+            current_sounds = env_state["sounds"]  # 缺失直接抛 KeyError
+            env_state["scene_sounds"] = (
+                list(current_sounds) if isinstance(current_sounds, list) else []
+            )
+        scene_sounds = env_state["scene_sounds"]
+
+        # 时段基底音（拷贝避免污染类级预设表）
+        phase_sounds = rules["sounds"]
+        phase_sounds_list = list(phase_sounds) if isinstance(phase_sounds, list) else []
+
+        # 叠加场景专属音：按时段扭曲描述符降权，不整体替换
+        scene_sound_distortion = rules["scene_sound_distortion"]
+        merged_sounds = list(phase_sounds_list)
+        for sound in scene_sounds:
+            if sound in merged_sounds:
+                continue
+            if scene_sound_distortion:
+                merged_sounds.append(f"{scene_sound_distortion}{sound}")
+            else:
+                merged_sounds.append(sound)
+        env_state["sounds"] = merged_sounds
+
+        # 温度演化：向时段目标温度收敛（target = base + delta），不再累加 delta
+        # 避免多次行动后温度跌至零下几十度
+        base_temp = env_state["base_temperature"]  # 缺失直接抛 KeyError
+        # 时段目标温度 = 场景初始温度 + 时段相对 22℃ 基准的偏移
+        target_temp = base_temp + (rules["target_temperature"] - 22.0)
+        current_temp = env_state["temperature"]  # 缺失直接抛 KeyError
+        env_state["temperature"] = current_temp + (target_temp - current_temp) * 0.5
 
         # 嗅觉演化：追加该时段的环境嗅觉（去重，避免重复堆叠）
         smells = env_state.get("smells")
@@ -398,6 +443,8 @@ class EnvironmentEvolutionSystem:
         return {
             "lighting": "未特别记录",
             "temperature": 22.0,
+            # 场景初始温度，作为时段目标温度计算的基准（target = base + 相对偏移）
+            "base_temperature": 22.0,
             "sounds": [],
             "smells": [],
             "atmosphere": "未特别记录",
