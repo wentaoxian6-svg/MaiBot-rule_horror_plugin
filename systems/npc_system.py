@@ -125,6 +125,11 @@ class NPCMemory:
         self.last_seen_time: dict[str, int | None] = {}
         self.last_seen_location: dict[str, str | None] = {}
         self.total_interactions: int = 0
+
+        # Task 14：NPC 说谎一致性——记录该 NPC 对各规则说过哪个版本
+        # 键：rule_id，值：版本类型（"truth"/"rumor"/"lie"/"refused"）
+        # LLM 生成对白前读取此记录，说谎者保持一致，玩家可通过多次试探识别骗子
+        self.rule_versions: dict[str, str] = {}
     
     def initialize_attitude_vector(self, player_id: str):
         """初始化玩家的态度向量（初始值：好感度50、信任度50、其他0）"""
@@ -291,24 +296,6 @@ class NPCMemory:
             "timestamp": datetime.now().isoformat()
         })
     
-    def update_attitude(self, player_id: str, delta_attitude: float):
-        """更新对玩家的态度"""
-        if player_id not in self.player_attitudes:
-            self.player_attitudes[player_id] = NPCAttitude.NEUTRAL
-
-        if delta_attitude > 0.3:
-            new_attitude = NPCAttitude.FRIENDLY
-        elif delta_attitude > 0.1:
-            new_attitude = NPCAttitude.NEUTRAL
-        elif delta_attitude > -0.1:
-            new_attitude = NPCAttitude.SUSPICIOUS
-        elif delta_attitude > -0.3:
-            new_attitude = NPCAttitude.HOSTILE
-        else:
-            new_attitude = NPCAttitude.FEARFUL
-        
-        self.player_attitudes[player_id] = new_attitude
-    
     def update_trust_level(self, player_id: str, delta_trust: float):
         """更新对玩家的信任度"""
         if player_id not in self.player_trust_levels:
@@ -389,7 +376,8 @@ class NPCMemory:
             "player_suspicion_levels": self.player_suspicion_levels,
             "last_seen_time": self.last_seen_time,
             "last_seen_location": self.last_seen_location,
-            "total_interactions": self.total_interactions
+            "total_interactions": self.total_interactions,
+            "rule_versions": self.rule_versions
         }
 
     @classmethod
@@ -416,7 +404,11 @@ class NPCMemory:
         memory.last_seen_time = data.get("last_seen_time", {})
         memory.last_seen_location = data.get("last_seen_location", {})
         memory.total_interactions = data.get("total_interactions", 0)
-        
+
+        # Task 14：反序列化说谎一致性记录，兼容旧存档（无该字段时为空 dict）
+        rule_versions_raw = data.get("rule_versions", {})
+        memory.rule_versions = rule_versions_raw if isinstance(rule_versions_raw, dict) else {}
+
         return memory
 
 
@@ -460,6 +452,8 @@ class NPC:
         self.max_dialogue_history: int = 50  # 最大对话历史记录数
         self.target_location: str | None = None
         self.current_behavior: BehaviorType | None = None
+        # INTERACT 冷却（Task 11）：记录上次互动的现实时间，冷却期内不再强制互动
+        self.last_interact_time: datetime | None = None
         # 需求系统 (0-100)：驱动 NPC 主动行为，每 tick 衰减/增长
         self.hunger: float = 30.0       # 饥饿度：递增，>80 触发找食物
         self.fatigue: float = 20.0      # 疲劳度：工作时递增、休息时递减，>90 触发找休息处
@@ -556,21 +550,42 @@ class NPC:
         return False
 
     def _should_escape(self, _npc: "NPC", _game_state: GameStateDict) -> bool:
-        """判断是否应该逃跑"""
-        for _player_id, fear_level in self.memory.player_fear_levels.items():
-            if fear_level > 0.7:
+        """判断是否应该逃跑
+
+        Task 12 修复：改读新六维态度向量的 player_fear（0-100），
+        不再读旧版 player_fear_levels（0-1）。
+        """
+        for _player_id, fear_level in self.memory.player_fear.items():
+            if fear_level > 70:
                 return True
         return False
 
     def _should_attack(self, _npc: "NPC", _game_state: GameStateDict) -> bool:
-        """判断是否应该攻击"""
-        for _player_id, attitude in self.memory.player_attitudes.items():
-            if attitude == NPCAttitude.HOSTILE:
+        """判断是否应该攻击
+
+        Task 12 修复：改读新六维态度向量的 player_hostility（0-100），
+        不再读旧版 player_attitudes（NPCAttitude 枚举，update_attitude 已删除）。
+        阈值与 decide_intent step 2 的 hostility>80 对齐。
+        """
+        for _player_id, hostility_level in self.memory.player_hostility.items():
+            if hostility_level > 80:
                 return True
         return False
 
     def _should_interact(self, _npc: "NPC", game_state: GameStateDict) -> bool:
-        """判断是否应该互动"""
+        """判断是否应该互动
+
+        Task 11 修复：加入冷却机制，近 N 秒已互动过则跳过，
+        避免 NPC 被同房间玩家粘住后每 tick 强制互动。
+        """
+        # 冷却判定：上次互动时间在冷却期内则不再触发
+        if self.last_interact_time is not None:
+            from ..core.config import get_config
+            cooldown_seconds = get_config().npc_sim.npc_interact_cooldown_seconds
+            elapsed = (datetime.now() - self.last_interact_time).total_seconds()
+            if elapsed < cooldown_seconds:
+                return False
+
         players = game_state.get("players", {})
         for _player_id, player_data in players.items():
             if player_data.get("location") == self.current_location:
@@ -607,10 +622,14 @@ class NPC:
         }
 
     def _attack_player(self, _npc: "NPC", game_state: GameStateDict) -> BehaviorResultDict:
-        """攻击玩家"""
+        """攻击玩家
+
+        Task 12 修复：目标选择改用 player_hostility（0-100），
+        不再读旧版 player_attitudes 枚举。
+        """
         hostile_players = [
-            pid for pid, attitude in self.memory.player_attitudes.items()
-            if attitude == NPCAttitude.HOSTILE
+            pid for pid, hostility in self.memory.player_hostility.items()
+            if hostility > 80
         ]
 
         if hostile_players:
@@ -636,6 +655,8 @@ class NPC:
         if nearby_players:
             player_id, player_data = nearby_players[0]
             attitude = self.memory.get_attitude(player_id)
+            # Task 11：记录互动现实时间，用于冷却判定
+            self.last_interact_time = datetime.now()
 
             return {
                 "action": "互动",
@@ -743,6 +764,9 @@ class NPC:
             for node in sorted(self.behavior_tree.children, key=lambda n: n.priority):
                 if node.evaluate(self, game_state):
                     self.current_behavior = node.behavior_type
+                    # Task 11：INTERACT 意图触发时记录现实时间，用于冷却判定
+                    if node.behavior_type == BehaviorType.INTERACT:
+                        self.last_interact_time = datetime.now()
                     return node.behavior_type
 
         # 2. 态度向量极端值（6维向量，补充行为树未覆盖的情况）
@@ -799,41 +823,6 @@ class NPC:
         """
         self.relationships[other_npc_id] = attitude
 
-    def generate_dialogue(self, player_id: str, context: str) -> str:
-        """生成对话内容"""
-        attitude = self.memory.get_attitude(player_id)
-
-        dialogue_prompts = {
-            NPCAttitude.FRIENDLY: [
-                f"【{self.name}露出微笑，向你走近一步】你好，{context}。",
-                f"【{self.name}拍了拍你的肩膀，语气轻松】很高兴见到你，{context}。",
-                f"【{self.name}歪着头，眼神温和】有什么我可以帮助你的吗？{context}"
-            ],
-            NPCAttitude.NEUTRAL: [
-                f"【{self.name}面无表情地看着你】嗯，{context}。",
-                f"【{self.name}点了点头，但眼神飘忽】我知道了，{context}。",
-                f"【{self.name}双手抱胸，保持一定距离】好吧，{context}。"
-            ],
-            NPCAttitude.SUSPICIOUS: [
-                f"【{self.name}眯起眼睛打量你，手悄悄移向口袋】你确定吗？{context}。",
-                f"【{self.name}后退半步，眼神警惕】我有点怀疑，{context}。",
-                f"【{self.name}压低声音，环顾四周】你为什么要问这个？{context}"
-            ],
-            NPCAttitude.HOSTILE: [
-                f"【{self.name}瞪大眼睛，拳头紧握】滚开！{context}。",
-                f"【{self.name}冷笑一声，身体前倾】我不相信你，{context}。",
-                f"【{self.name}举起手，做出驱赶的动作】别靠近我！{context}"
-            ],
-            NPCAttitude.FEARFUL: [
-                f"【{self.name}颤抖着后退，声音发颤】别...别过来...{context}。",
-                f"【{self.name}抱紧双臂，眼神躲闪】我...我不知道...{context}。",
-                f"【{self.name}几乎要哭出来，双手合十】求求你...{context}。"
-            ]
-        }
-        
-        prompts = dialogue_prompts.get(attitude, dialogue_prompts[NPCAttitude.NEUTRAL])
-        return random.choice(prompts)
-    
     def to_dict(self) -> JsonObject:
         """序列化为字典"""
         return {
@@ -867,6 +856,7 @@ class NPC:
             "dialogue_history": self.dialogue_history,
             "target_location": self.target_location,
             "current_behavior": self.current_behavior.value if self.current_behavior else None,
+            "last_interact_time": self.last_interact_time.isoformat() if self.last_interact_time else None,
             "hunger": self.hunger,
             "fatigue": self.fatigue,
             "curiosity": self.curiosity,
@@ -944,6 +934,14 @@ class NPC:
         behavior_str = data.get("current_behavior")
         if behavior_str:
             npc.current_behavior = BehaviorType(behavior_str)
+
+        # Task 11：反序列化 INTERACT 冷却时间戳
+        last_interact_raw = data.get("last_interact_time")
+        if isinstance(last_interact_raw, str) and last_interact_raw:
+            try:
+                npc.last_interact_time = datetime.fromisoformat(last_interact_raw)
+            except (TypeError, ValueError):
+                npc.last_interact_time = None
 
         # 需求系统 (0-100)
         npc.hunger = _clamp_0_100(data.get("hunger"), 30.0)

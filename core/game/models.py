@@ -35,6 +35,11 @@ class Rule:
     surface_text: str
     deep_meaning: str = ""
     condition: str = ""
+    # Task 20：结构化违规条件，供运行时确定性匹配（时间窗/位置/动作关键词/前置状态）
+    # 形如 {"time_window": "22:00-04:00", "location": "走廊",
+    #       "action_keywords": ["跑", "大声"], "precondition": "持有手电筒"}
+    # 每个子字段可省略（None/空），表示该维度不做约束
+    conditions: JsonObject = field(default_factory=dict)
     constraint: str = ""
     consequence: str = ""
     source: str = ""
@@ -103,6 +108,7 @@ class Rule:
             "deep_meaning": self.deep_meaning,
             "hidden_meaning": self.deep_meaning,
             "condition": self.condition,
+            "conditions": self.conditions if isinstance(self.conditions, dict) else {},
             "constraint": self.constraint or self.surface_text,
             "consequence": self.consequence,
             "source": self.source,
@@ -143,6 +149,10 @@ class Rule:
         source_type = cls._as_str(data.get("source_type"), "system") or "system"
         source_id = cls._as_str(data.get("source_id")) or None
 
+        # Task 20：读取结构化违规条件（time_window/location/action_keywords/precondition）
+        conditions_raw = data.get("conditions")
+        conditions = conditions_raw if isinstance(conditions_raw, dict) else {}
+
         is_authentic_raw = data.get("is_authentic")
         if isinstance(is_authentic_raw, bool):
             is_authentic: bool | None = is_authentic_raw
@@ -168,6 +178,7 @@ class Rule:
             surface_text=surface_text,
             deep_meaning=deep_meaning,
             condition=condition,
+            conditions=conditions,
             constraint=constraint,
             consequence=consequence,
             source=source,
@@ -217,6 +228,9 @@ class Player:
     initial_observations: list[str] = field(default_factory=list)  # 初始观察信息
     unique_rules: list[JsonObject] = field(default_factory=list)  # 该身份特有的规则
     exclusive_info: str | None = None  # 该身份独有的信息
+    # 心理叙事追踪（Task 16）：记录各状态上次档位/连续命中次数/上次选取的变体
+    # 键形如 "fear_last_tier" / "fear_consecutive_hits" / "fear_last_narrative"
+    psych_tracking: JsonObject = field(default_factory=dict)
 
     def to_dict(self) -> JsonObject:
         """转换为字典"""
@@ -248,6 +262,7 @@ class Player:
             "initial_observations": self.initial_observations,
             "unique_rules": self.unique_rules,
             "exclusive_info": self.exclusive_info,
+            "psych_tracking": self.psych_tracking,
         }
 
     @classmethod
@@ -345,6 +360,10 @@ class Player:
         excl = data.get("exclusive_info")
         player.exclusive_info = str(excl) if isinstance(excl, str) and excl else None
 
+        # 加载心理叙事追踪字典（Task 16）：旧存档无该字段时默认为空 dict
+        pt = data.get("psych_tracking", {})
+        player.psych_tracking = pt if isinstance(pt, dict) else {}
+
         return player
 
 
@@ -361,6 +380,9 @@ class GameSession:
     players: dict[str, Player] = field(default_factory=dict)
     rules: list[JsonObject] = field(default_factory=list)
     win_condition: str = ""
+    # 通关结构化硬门槛（Task 22）：LLM 仅判定叙事等级，是否"通关"由该字段确定性校验
+    # 形如 {"required_items": [...], "required_location": "...", "required_action": "...", "required_npc_state": {...}}
+    completion_conditions: JsonObject = field(default_factory=dict)
     clues: list[JsonObject] = field(default_factory=list)
     core_symbols: list[JsonObject] = field(default_factory=list)
     environment_state: JsonObject = field(default_factory=dict)
@@ -393,6 +415,12 @@ class GameSession:
     image_paths: list[str] = field(default_factory=list)
     # 待触发的延迟反馈队列：每项含 trigger_at_elapsed/content/target_player_id
     pending_feedbacks: list[JsonObject] = field(default_factory=list)
+    # 最近一次玩家行动的现实时间戳（Task 10）：用于 NPC tick 按"最长无行动时长"折算补时
+    last_action_real_time: datetime | None = None
+    # 追杀事件状态机（Task 19）：空 dict 表示未激活；激活时含
+    # {active: bool, pursuer_npc_id: str, remaining_turns: int,
+    #  escape_conditions: list[str], triggered_at: str(ISO)}
+    hunt_state: JsonObject = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """统一规则结构，避免旧存档和新生成数据混用时分叉。"""
@@ -505,6 +533,7 @@ class GameSession:
             "players": {pid: p.to_dict() for pid, p in self.players.items()},
             "rules": [rule.to_dict() for rule in self.get_rule_objects()],
             "win_condition": self.win_condition,
+            "completion_conditions": self.completion_conditions,
             "clues": self.clues,
             "core_symbols": self.core_symbols,
             "environment_state": self.environment_state,
@@ -525,6 +554,8 @@ class GameSession:
             "world_version": self.world_version,
             "image_paths": list(self.image_paths),
             "pending_feedbacks": self.pending_feedbacks,
+            "last_action_real_time": self.last_action_real_time.isoformat() if self.last_action_real_time else None,
+            "hunt_state": self.hunt_state,
         }
 
     @classmethod
@@ -595,6 +626,10 @@ class GameSession:
 
         session.win_condition = str(data.get("win_condition", "") or "")
 
+        # 加载通关结构化硬门槛（Task 22），兼容旧存档（无该字段时为空 dict，由结局判定层兜底校验）
+        cc = data.get("completion_conditions", {})
+        session.completion_conditions = cc if isinstance(cc, dict) else {}
+
         clues_raw = data.get("clues", [])
         session.clues = [x for x in clues_raw if isinstance(x, dict)] if isinstance(clues_raw, list) else []
 
@@ -664,6 +699,13 @@ class GameSession:
         # 加载待触发的延迟反馈队列，兼容旧存档（无该字段时为空列表）
         pf = data.get("pending_feedbacks", [])
         session.pending_feedbacks = [x for x in pf if isinstance(x, dict)] if isinstance(pf, list) else []
+
+        # 加载最近一次玩家行动的现实时间戳（Task 10），兼容旧存档（无该字段时为 None）
+        session.last_action_real_time = _to_dt(data.get("last_action_real_time"))
+
+        # 加载追杀事件状态机（Task 19），兼容旧存档（无该字段时为空 dict，表示未激活）
+        hs = data.get("hunt_state", {})
+        session.hunt_state = hs if isinstance(hs, dict) else {}
 
         # 兼容旧版全局已知规则字段：迁移到玩家个人规则笔记后清理旧键。
         if session.players and isinstance(session.environment_state, dict):
