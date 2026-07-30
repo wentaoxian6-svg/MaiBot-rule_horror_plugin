@@ -44,6 +44,7 @@ class RuleHorrorCommand(SessionRuntimeMixin, RuntimeSupportMixin, SharedCommandH
         "/rg 状态 - 查看游戏状态\n"
         "/rg 剧情 - 查看剧情导入\n"
         "/rg 规则 - 查看你记录下来的规则\n"
+        "/rg 对比规则 @某人 - 双方互发对方规则版本到私聊，核对差异\n"
         "/rg 场景 - 查看场景整体印象和当前位置\n"
         "/rg 区域 - 查看场景中的所有区域\n"
         "/rg 道具 [道具名称] - 查看道具列表或详情\n"

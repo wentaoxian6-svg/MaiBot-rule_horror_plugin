@@ -233,6 +233,132 @@ class SharedCommandHandlersMixin:
         finally:
             state.release_world()
 
+    async def _handle_对比规则(
+        self,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        rest_input: str,
+    ) -> tuple[bool, str | None, int]:
+        """处理对比规则命令：双方互发对方规则版本到私聊，机制化版本不一致恐惧。
+
+        请求者收到的是被 @ 玩家的规则版本，被 @ 玩家收到的是请求者的规则版本。
+        这样双方都能立刻对照自己的规则与对方的规则，发现可能的版本差异。
+        """
+        # 解析 @某人：QQ 侧 process_at_component 会把 at 片段转为 "@昵称" 或 "@用户ID" 纯文本
+        raw_target = str(rest_input or "").strip()
+        if not raw_target:
+            await self.send_text("请 @ 一名同局玩家。用法：`/rg 对比规则 @某人`")
+            return False, "缺少对比目标", 2
+
+        # 去掉前导 @（可能存在多个，逐个剥离）
+        target_identifier = raw_target
+        while target_identifier.startswith("@"):
+            target_identifier = target_identifier[1:].strip()
+
+        if not target_identifier:
+            await self.send_text("请 @ 一名同局玩家。用法：`/rg 对比规则 @某人`")
+            return False, "缺少对比目标", 2
+
+        state_manager = GameStateManager()
+        state = await state_manager.get_world(group_id)
+        if not state or not state.session:
+            await self.send_text("当前没有正在进行的游戏。")
+            return False, "无游戏", 2
+
+        try:
+            session = state.session
+            if not await self._ensure_active_game_session(session):
+                return False, "游戏未开始", 2
+
+            # 请求者必须在游戏中
+            requester = session.players.get(user_id)
+            if not requester:
+                await self.send_text("你不在游戏中。")
+                return False, "不在游戏中", 2
+
+            # 查找目标玩家：先按 player_id 精确匹配，再按 name 精确匹配
+            target_player = session.players.get(target_identifier)
+            target_pid: str | None = target_identifier if target_player is not None else None
+            if target_player is None:
+                for pid, p in session.players.items():
+                    if p.name == target_identifier:
+                        target_player = p
+                        target_pid = pid
+                        break
+
+            if target_player is None:
+                await self.send_text(
+                    f"未在对局中找到玩家「{target_identifier}」。"
+                    "请确认目标已加入当前游戏，并使用 `/rg 对比规则 @某人` 重新发起。"
+                )
+                return False, "目标不在游戏中", 2
+
+            if target_pid == user_id:
+                await self.send_text("不能与自己对比规则。请 @ 一名其他玩家。")
+                return False, "目标与请求者相同", 2
+
+            # 取双方各自的规则笔记
+            requester_rules = self._get_player_recorded_rules(requester)
+            target_rules = self._get_player_recorded_rules(target_player)
+
+            # 构造发给请求者的私聊正文（内容为目标玩家的规则版本）
+            requester_content = self._build_compare_rules_brief(
+                owner_name=target_player.name,
+                owner_rules=target_rules,
+                peer_name=requester.name,
+            )
+            # 构造发给目标玩家的私聊正文（内容为请求者的规则版本）
+            target_content = self._build_compare_rules_brief(
+                owner_name=requester.name,
+                owner_rules=requester_rules,
+                peer_name=target_player.name,
+            )
+
+            # 双方各发对方规则到私聊
+            ok_requester = await self._send_private_text(user_id, requester.name, requester_content)
+            ok_target = await self._send_private_text(str(target_pid), target_player.name, target_content)
+
+            if ok_requester and ok_target:
+                await self.send_text(
+                    f"已将 {requester.name} 与 {target_player.name} 双方的规则版本"
+                    "分别私聊发送给对方，请各自核对差异。"
+                )
+                return True, "对比规则已下发", 2
+
+            # 私聊失败时在群内显式提示，不泄露正文
+            failed_names: list[str] = []
+            if not ok_requester:
+                failed_names.append(requester.name)
+            if not ok_target:
+                failed_names.append(target_player.name)
+            await self.send_text(
+                f"以下玩家的规则版本未能通过私聊送达：{'、'.join(failed_names)}。\n"
+                "请先添加机器人为好友或检查私聊权限，然后重新使用 `/rg 对比规则 @某人`。"
+            )
+            return False, "私聊下发失败", 2
+        finally:
+            state.release_world()
+
+    def _build_compare_rules_brief(
+        self,
+        owner_name: str,
+        owner_rules: list[str],
+        peer_name: str,
+    ) -> str:
+        """构造对比规则私聊正文：展示 owner 的规则版本，发给 peer 供对照。"""
+        lines = [f"这是 {owner_name} 当前记录的规则版本，供你与自己的规则对照：", ""]
+        if not owner_rules:
+            lines.append("（对方暂时还没有整理出可确认的规则。）")
+        else:
+            for index, text in enumerate(owner_rules, start=1):
+                lines.append(f"{index}. {text}")
+        lines.extend([
+            "",
+            "注意：规则在不同玩家之间可能存在差异，请自行判断哪一条才真正可信。",
+        ])
+        return "\n".join(lines)
+
     async def _handle_线索(
         self,
         group_id: str,
@@ -1132,6 +1258,7 @@ class SharedCommandHandlersMixin:
             "- `/rg 状态` - 查看当前状态\n"
             "- `/rg 剧情` - 重发剧情导入\n"
             "- `/rg 规则` - 查看你的规则笔记\n"
+            "- `/rg 对比规则 @某人` - 双方互发对方规则版本到私聊，核对差异\n"
             "- `/rg 记录规则 <内容>` - 手动记录规则笔记\n"
             "- `/rg 场景` - 查看场景整体印象和当前位置\n"
             "- `/rg 区域` - 查看场景中的全部区域\n"
@@ -1615,6 +1742,7 @@ class SharedCommandHandlersMixin:
     _handle_leave = _handle_离开
     _handle_status = _handle_状态
     _handle_rules = _handle_规则
+    _handle_compare_rules = _handle_对比规则
     _handle_clues = _handle_线索
     _handle_hint = _handle_提示
     _handle_reason = _handle_推理

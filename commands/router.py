@@ -25,6 +25,7 @@ _COMMAND_MAP: dict[str, str] = {
     GameCommands.STATUS.value: "_handle_状态",
     GameCommands.PLOT.value: "_handle_剧情",
     GameCommands.RULES.value: "_handle_规则",
+    "对比规则": "_handle_对比规则",
     GameCommands.SCENE.value: "_handle_场景",
     GameCommands.AREAS.value: "_handle_区域",
     GameCommands.ITEMS.value: "_handle_道具",
